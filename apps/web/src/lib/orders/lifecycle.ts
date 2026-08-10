@@ -44,6 +44,7 @@ export function validateOrderFulfilment(input: {
   orderType: OrderType;
   diningTableId?: number | null;
   deliveryAddress?: string | null;
+  customerId?: number | null;
 }): void {
   const hasTable = input.diningTableId != null;
   const hasAddress = Boolean(input.deliveryAddress?.trim());
@@ -56,5 +57,8 @@ export function validateOrderFulfilment(input: {
   }
   if (input.orderType === "delivery" && (hasTable || !hasAddress)) {
     throw new Error("Delivery orders require an address and cannot have a table");
+  }
+  if (input.orderType === "delivery" && input.customerId == null) {
+    throw new Error("Delivery orders require customer information");
   }
 }

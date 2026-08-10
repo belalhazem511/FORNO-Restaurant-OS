@@ -5,15 +5,16 @@ import {
   ORDER_TYPES,
   branches,
   customers,
+  menuItems,
+  orderItemModifiers,
   orderItems,
   orders,
   orderStatusHistory,
   restaurantTables,
-  transactions,
   type OrderStatus,
   type OrderType,
 } from "@/lib/db/schema";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod/v4";
 import { protectedProcedure, router } from "../init";
 
@@ -49,6 +50,15 @@ const orderDetailSchema = orderWithCustomerSchema.extend({
     price: z.number(),
     notes: z.string().nullable(),
     product: z.object({ name: z.string(), category: z.string().nullable() }).nullable(),
+    menuItem: z.object({ name_en: z.string(), name_ar: z.string() }).nullable(),
+    variant: z.object({ name_en: z.string(), name_ar: z.string() }).nullable(),
+    modifiers: z.array(z.object({
+      id: z.number(),
+      modifier_option_id: z.number(),
+      name_en: z.string(),
+      name_ar: z.string(),
+      price_delta: z.number(),
+    })),
   })),
   statusHistory: z.array(z.object({
     id: z.number(),
@@ -60,14 +70,6 @@ const orderDetailSchema = orderWithCustomerSchema.extend({
   })),
 });
 
-async function defaultBranchId(): Promise<number | null> {
-  const branch = await db.query.branches.findFirst({
-    where: eq(branches.is_active, true),
-    columns: { id: true },
-  });
-  return branch?.id ?? null;
-}
-
 export const ordersRouter = router({
   get: protectedProcedure
     .meta({ openapi: { method: "GET", path: "/orders/{id}", tags: ["Orders"], summary: "Get order details" } })
@@ -78,7 +80,12 @@ export const ordersRouter = router({
         where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)),
         with: {
           customer: { columns: { name: true } },
-          orderItems: { with: { product: { columns: { name: true, category: true } } } },
+          orderItems: { with: {
+            product: { columns: { name: true, category: true } },
+            menuItem: { columns: { name_en: true, name_ar: true } },
+            variant: { columns: { name_en: true, name_ar: true } },
+            modifiers: true,
+          } },
           statusHistory: true,
         },
       });
@@ -95,82 +102,199 @@ export const ordersRouter = router({
     })),
 
   create: protectedProcedure
-    .meta({ openapi: { method: "POST", path: "/orders", tags: ["Orders"], summary: "Create a paid order with items" } })
+    .meta({ openapi: { method: "POST", path: "/orders", tags: ["Orders"], summary: "Create a POS order" } })
     .input(z.object({
-      branchId: z.number().int().positive().optional(),
-      customerId: z.number().int().positive(),
-      paymentMethodId: z.number().int().positive(),
+      branchId: z.number().int().positive(),
+      customerId: z.number().int().positive().nullable().optional(),
       orderType: orderTypeSchema.default("takeaway"),
       diningTableId: z.number().int().positive().nullable().optional(),
       deliveryAddress: z.string().trim().min(1).nullable().optional(),
-      clientRequestId: z.string().trim().min(1).max(80).optional(),
-      products: z.array(z.object({
-        id: z.number(),
+      clientRequestId: z.string().trim().min(8).max(80),
+      items: z.array(z.object({
+        menuItemId: z.number().int().positive(),
+        variantId: z.number().int().positive().nullable().optional(),
+        modifierOptionIds: z.array(z.number().int().positive()).default([]),
         quantity: z.number().int().positive(),
-        price: z.number().int().nonnegative(),
+        notes: z.string().trim().max(500).optional(),
       })).min(1),
-      total: z.number().int().nonnegative(),
     }))
     .output(orderWithCustomerSchema)
     .mutation(async ({ ctx, input }) => {
+      const existing = await db.query.orders.findFirst({
+        where: eq(orders.client_request_id, input.clientRequestId),
+        with: { customer: { columns: { name: true } } },
+      });
+      if (existing) {
+        if (existing.user_uid !== ctx.user.id) throw new Error("Client request ID is already in use");
+        return existing;
+      }
+
       validateOrderFulfilment({
         orderType: input.orderType,
         diningTableId: input.diningTableId,
         deliveryAddress: input.deliveryAddress,
+        customerId: input.customerId,
       });
-      const branchId = input.branchId ?? await defaultBranchId();
+      const branch = await db.query.branches.findFirst({
+        where: and(eq(branches.id, input.branchId), eq(branches.is_active, true)),
+      });
+      if (!branch) throw new Error("Active restaurant branch not found");
+
+      if (input.customerId) {
+        const customer = await db.query.customers.findFirst({
+          where: and(eq(customers.id, input.customerId), eq(customers.user_uid, ctx.user.id)),
+        });
+        if (!customer) throw new Error("Customer not found");
+      }
+
       if (input.diningTableId) {
         const table = await db.query.restaurantTables.findFirst({
           where: eq(restaurantTables.id, input.diningTableId),
           with: { diningArea: { columns: { branch_id: true } } },
         });
         if (!table) throw new Error("Restaurant table not found");
-        if (branchId != null && table.diningArea.branch_id !== branchId) {
+        if (!table.is_active || table.status !== "available") throw new Error("Restaurant table is not available");
+        if (table.diningArea.branch_id !== input.branchId) {
           throw new Error("Restaurant table does not belong to the order branch");
         }
       }
 
+      const preparedItems: Array<{
+        requestedItem: (typeof input.items)[number];
+        menuItemId: number;
+        productId: number | null;
+        selectedVariantId: number | null;
+        selectedModifiers: Array<{ id: number; name_en: string; name_ar: string; price_delta: number }>;
+        basePrice: number;
+        modifierTotal: number;
+      }> = [];
+      for (const requestedItem of input.items) {
+        const menuItem = await db.query.menuItems.findFirst({
+          where: eq(menuItems.id, requestedItem.menuItemId),
+          with: {
+            category: true,
+            kitchenStation: true,
+            variants: true,
+            modifierGroups: { with: { modifierGroup: { with: { options: true } } } },
+          },
+        });
+        if (!menuItem || menuItem.category.branch_id !== input.branchId) throw new Error("Menu item not found in this branch");
+        if (!menuItem.is_available || !menuItem.category.is_active || !menuItem.kitchenStation.is_active) {
+          throw new Error(`Menu item ${menuItem.code} is unavailable`);
+        }
+
+        const availableVariants = menuItem.variants.filter((variant) => variant.is_available);
+        let selectedVariant = requestedItem.variantId
+          ? availableVariants.find((variant) => variant.id === requestedItem.variantId) ?? null
+          : null;
+        if (requestedItem.variantId && !selectedVariant) throw new Error("Selected variant does not belong to this menu item");
+        if (!selectedVariant && availableVariants.length === 1) selectedVariant = availableVariants[0];
+        if (!selectedVariant && availableVariants.length > 1) throw new Error("A variant selection is required");
+
+        const uniqueOptionIds = [...new Set(requestedItem.modifierOptionIds)];
+        if (uniqueOptionIds.length !== requestedItem.modifierOptionIds.length) throw new Error("Duplicate modifier options are not allowed");
+        const selectedModifiers: Array<{ id: number; name_en: string; name_ar: string; price_delta: number }> = [];
+        const allowedOptionIds = new Set<number>();
+        for (const link of menuItem.modifierGroups) {
+          const group = link.modifierGroup;
+          if (!group.is_active) continue;
+          const availableOptions = group.options.filter((option) => option.is_available);
+          for (const option of availableOptions) allowedOptionIds.add(option.id);
+          const selected = availableOptions.filter((option) => uniqueOptionIds.includes(option.id));
+          if (selected.length < group.min_selections || selected.length > group.max_selections) {
+            throw new Error(`Modifier group ${group.code} requires ${group.min_selections}-${group.max_selections} selections`);
+          }
+          selectedModifiers.push(...selected.map((option) => ({
+            id: option.id,
+            name_en: option.name_en,
+            name_ar: option.name_ar,
+            price_delta: option.price_delta,
+          })));
+        }
+        if (uniqueOptionIds.some((id) => !allowedOptionIds.has(id))) {
+          throw new Error("Selected modifier does not belong to this menu item");
+        }
+
+        const basePrice = selectedVariant?.price ?? menuItem.base_price;
+        const modifierTotal = selectedModifiers.reduce((sum, modifier) => sum + modifier.price_delta, 0);
+        preparedItems.push({
+          requestedItem,
+          menuItemId: menuItem.id,
+          productId: menuItem.product_id,
+          selectedVariantId: selectedVariant?.id ?? null,
+          selectedModifiers,
+          basePrice,
+          modifierTotal,
+        });
+      }
+      const totalAmount = preparedItems.reduce(
+        (sum, item) => sum + (item.basePrice + item.modifierTotal) * item.requestedItem.quantity,
+        0,
+      );
+
       return db.transaction(async (tx) => {
         const [orderData] = await tx.insert(orders).values({
-          branch_id: branchId,
-          customer_id: input.customerId,
+          branch_id: input.branchId,
+          customer_id: input.customerId ?? null,
           dining_table_id: input.diningTableId ?? null,
           client_request_id: input.clientRequestId,
           order_type: input.orderType,
-          total_amount: input.total,
+          total_amount: totalAmount,
           delivery_address: input.deliveryAddress ?? null,
           user_uid: ctx.user.id,
-          status: "completed",
-        }).returning();
+          status: "pending",
+        }).onConflictDoNothing({ target: orders.client_request_id }).returning();
 
-        await tx.insert(orderItems).values(input.products.map((product) => ({
-          order_id: orderData.id,
-          product_id: product.id,
-          quantity: product.quantity,
-          price: product.price,
-        })));
+        if (!orderData) {
+          const duplicate = await tx.query.orders.findFirst({
+            where: and(eq(orders.client_request_id, input.clientRequestId), eq(orders.user_uid, ctx.user.id)),
+            with: { customer: { columns: { name: true } } },
+          });
+          if (!duplicate) throw new Error("Client request ID is already in use");
+          return duplicate;
+        }
+
+        if (input.diningTableId) {
+          const [claimedTable] = await tx.update(restaurantTables).set({ status: "occupied" })
+            .where(and(
+              eq(restaurantTables.id, input.diningTableId),
+              eq(restaurantTables.status, "available"),
+              eq(restaurantTables.is_active, true),
+            )).returning({ id: restaurantTables.id });
+          if (!claimedTable) throw new Error("Restaurant table is no longer available");
+        }
+
+        for (const item of preparedItems) {
+          const [createdItem] = await tx.insert(orderItems).values({
+            order_id: orderData.id,
+            product_id: item.productId,
+            menu_item_id: item.menuItemId,
+            variant_id: item.selectedVariantId,
+            quantity: item.requestedItem.quantity,
+            price: item.basePrice,
+            notes: item.requestedItem.notes || null,
+          }).returning();
+          if (item.selectedModifiers.length > 0) {
+            await tx.insert(orderItemModifiers).values(item.selectedModifiers.map((modifier) => ({
+              order_item_id: createdItem.id,
+              modifier_option_id: modifier.id,
+              name_en: modifier.name_en,
+              name_ar: modifier.name_ar,
+              price_delta: modifier.price_delta,
+            })));
+          }
+        }
         await tx.insert(orderStatusHistory).values({
           order_id: orderData.id,
           from_status: null,
-          to_status: "completed",
+          to_status: "pending",
           changed_by: ctx.user.id,
-          note: "Paid POS order",
-        });
-        await tx.insert(transactions).values({
-          order_id: orderData.id,
-          payment_method_id: input.paymentMethodId,
-          amount: input.total,
-          user_uid: ctx.user.id,
-          status: "completed",
-          category: "selling",
-          type: "income",
-          description: `Payment for order #${orderData.id}`,
+          note: "POS order created",
         });
 
-        const customer = await tx.query.customers.findFirst({
-          where: eq(customers.id, input.customerId),
-          columns: { name: true },
-        });
+        const customer = input.customerId ? await tx.query.customers.findFirst({
+          where: eq(customers.id, input.customerId), columns: { name: true },
+        }) : null;
         return { ...orderData, customer: customer ?? null };
       });
     }),
@@ -207,6 +331,10 @@ export const ordersRouter = router({
           changed_by: ctx.user.id,
           note: input.note,
         });
+        if (["completed", "cancelled"].includes(input.status) && current.dining_table_id) {
+          await tx.update(restaurantTables).set({ status: "available" })
+            .where(eq(restaurantTables.id, current.dining_table_id));
+        }
       }
       const customer = updated.customer_id
         ? await tx.query.customers.findFirst({ where: eq(customers.id, updated.customer_id), columns: { name: true } })
@@ -233,6 +361,10 @@ export const ordersRouter = router({
         changed_by: ctx.user.id,
         note: input.note,
       });
+      if (["completed", "cancelled"].includes(input.status) && current.dining_table_id) {
+        await tx.update(restaurantTables).set({ status: "available" })
+          .where(eq(restaurantTables.id, current.dining_table_id));
+      }
       const customer = updated.customer_id
         ? await tx.query.customers.findFirst({ where: eq(customers.id, updated.customer_id), columns: { name: true } })
         : null;
@@ -245,9 +377,24 @@ export const ordersRouter = router({
     .output(z.object({ success: z.boolean() }))
     .mutation(async ({ ctx, input }) => {
       await db.transaction(async (tx) => {
+        const current = await tx.query.orders.findFirst({
+          where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)),
+        });
+        const itemIds = await tx.select({ id: orderItems.id }).from(orderItems)
+          .where(eq(orderItems.order_id, input.id));
+        if (itemIds.length > 0) {
+          await tx.delete(orderItemModifiers).where(inArray(
+            orderItemModifiers.order_item_id,
+            itemIds.map((item) => item.id),
+          ));
+        }
         await tx.delete(orderStatusHistory).where(eq(orderStatusHistory.order_id, input.id));
         await tx.delete(orderItems).where(eq(orderItems.order_id, input.id));
         await tx.delete(orders).where(and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)));
+        if (current?.dining_table_id) {
+          await tx.update(restaurantTables).set({ status: "available" })
+            .where(eq(restaurantTables.id, current.dining_table_id));
+        }
       });
       return { success: true };
     }),

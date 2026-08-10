@@ -1,4 +1,4 @@
-import { mock, describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { eq } from "drizzle-orm";
 import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 
@@ -7,251 +7,223 @@ mock.module("@/lib/db", () => ({ db, pglite: pg }));
 
 const { ordersRouter } = await import("../orders");
 const { createCallerFactory } = await import("../../init");
-const { customers, products, paymentMethods, transactions, orderItems, orders, orderStatusHistory } =
-  await import("@/lib/db/schema");
+const {
+  branches,
+  customers,
+  diningAreas,
+  kitchenStations,
+  menuCategories,
+  menuItemModifierGroups,
+  menuItems,
+  menuItemVariants,
+  modifierGroups,
+  modifierOptions,
+  orderItemModifiers,
+  orderItems,
+  orders,
+  orderStatusHistory,
+  products,
+  restaurantTables,
+  transactions,
+} = await import("@/lib/db/schema");
 
 const caller = createCallerFactory(ordersRouter)({ user: makeUser("user-1") });
-const callerAs = (uid: string) =>
-  createCallerFactory(ordersRouter)({ user: makeUser(uid) });
+const callerAs = (uid: string) => createCallerFactory(ordersRouter)({ user: makeUser(uid) });
 
+let branchId: number;
+let tableId: number;
 let customerId: number;
-let productId: number;
-let paymentMethodId: number;
+let pizzaId: number;
+let donerId: number;
+let smallVariantId: number;
+let largeVariantId: number;
+let foreignVariantId: number;
+let mozzarellaId: number;
+let cheddarId: number;
+let olivesId: number;
+let mushroomsId: number;
+let foreignModifierId: number;
+let requestSequence = 0;
+
+const requestId = (label: string) => `orders-test-${label}-${++requestSequence}`;
+const pizzaLine = (overrides: Partial<{
+  menuItemId: number;
+  variantId: number | null;
+  modifierOptionIds: number[];
+  quantity: number;
+  notes: string;
+}> = {}) => ({
+  menuItemId: pizzaId,
+  variantId: smallVariantId,
+  modifierOptionIds: [mozzarellaId],
+  quantity: 1,
+  ...overrides,
+});
 
 beforeAll(async () => {
   await pg.exec(SCHEMA_DDL);
 
-  const [cust] = await db
-    .insert(customers)
-    .values({ name: "Test Customer", email: "order-test@t.com", user_uid: "user-1" })
-    .returning();
-  customerId = cust.id;
+  const [branch] = await db.insert(branches).values({
+    code: "TEST", name_en: "Test Branch", name_ar: "فرع الاختبار",
+    currency: "EGP", timezone: "Africa/Cairo", is_active: true,
+  }).returning();
+  branchId = branch.id;
 
-  const [prod] = await db
-    .insert(products)
-    .values({ name: "Test Product", price: 1000, in_stock: 50, user_uid: "user-1" })
-    .returning();
-  productId = prod.id;
+  const [area] = await db.insert(diningAreas).values({
+    branch_id: branchId, code: "MAIN", name_en: "Main", name_ar: "الرئيسية",
+    sort_order: 1, is_active: true,
+  }).returning();
+  const [table] = await db.insert(restaurantTables).values({
+    dining_area_id: area.id, code: "T1", name_en: "Table 1", name_ar: "طاولة ١",
+    capacity: 4, status: "available", is_active: true,
+  }).returning();
+  tableId = table.id;
 
-  const [pm] = await db
-    .insert(paymentMethods)
-    .values({ name: "Cash-OrderTest" })
-    .returning();
-  paymentMethodId = pm.id;
+  const [station] = await db.insert(kitchenStations).values({
+    branch_id: branchId, code: "PIZZA", name_en: "Pizza", name_ar: "بيتزا", is_active: true,
+  }).returning();
+  const [category] = await db.insert(menuCategories).values({
+    branch_id: branchId, code: "PIZZA", name_en: "Pizza", name_ar: "بيتزا",
+    sort_order: 1, is_active: true,
+  }).returning();
+
+  const [pizzaProduct, donerProduct] = await db.insert(products).values([
+    { name: "Test Pizza", price: 10000, in_stock: 100, user_uid: "user-1", category: "pizza" },
+    { name: "Test Doner", price: 9000, in_stock: 100, user_uid: "user-1", category: "doner" },
+  ]).returning();
+  const [pizza, doner] = await db.insert(menuItems).values([
+    {
+      category_id: category.id, kitchen_station_id: station.id, product_id: pizzaProduct.id,
+      code: "TEST-PIZZA", name_en: "Test Pizza", name_ar: "بيتزا اختبار",
+      base_price: 10000, is_available: true, sort_order: 1,
+    },
+    {
+      category_id: category.id, kitchen_station_id: station.id, product_id: donerProduct.id,
+      code: "TEST-DONER", name_en: "Test Doner", name_ar: "دونر اختبار",
+      base_price: 9000, is_available: true, sort_order: 2,
+    },
+  ]).returning();
+  pizzaId = pizza.id;
+  donerId = doner.id;
+
+  const variants = await db.insert(menuItemVariants).values([
+    { menu_item_id: pizzaId, code: "S", name_en: "Small", name_ar: "صغير", price: 10000, is_default: true, is_available: true, sort_order: 1 },
+    { menu_item_id: pizzaId, code: "L", name_en: "Large", name_ar: "كبير", price: 15000, is_default: false, is_available: true, sort_order: 2 },
+    { menu_item_id: donerId, code: "ONLY", name_en: "Regular", name_ar: "عادي", price: 9000, is_default: true, is_available: true, sort_order: 1 },
+  ]).returning();
+  smallVariantId = variants[0].id;
+  largeVariantId = variants[1].id;
+  foreignVariantId = variants[2].id;
+
+  const [cheeseGroup, extrasGroup, foreignGroup] = await db.insert(modifierGroups).values([
+    { branch_id: branchId, code: "CHEESE", name_en: "Cheese", name_ar: "الجبن", min_selections: 1, max_selections: 1, sort_order: 1, is_active: true },
+    { branch_id: branchId, code: "EXTRAS", name_en: "Extras", name_ar: "إضافات", min_selections: 0, max_selections: 2, sort_order: 2, is_active: true },
+    { branch_id: branchId, code: "SAUCE", name_en: "Sauce", name_ar: "الصوص", min_selections: 0, max_selections: 1, sort_order: 1, is_active: true },
+  ]).returning();
+  const options = await db.insert(modifierOptions).values([
+    { modifier_group_id: cheeseGroup.id, code: "MOZZ", name_en: "Mozzarella", name_ar: "موزاريلا", price_delta: 0, is_default: true, is_available: true, sort_order: 1 },
+    { modifier_group_id: cheeseGroup.id, code: "CHEDDAR", name_en: "Cheddar", name_ar: "شيدر", price_delta: 2000, is_default: false, is_available: true, sort_order: 2 },
+    { modifier_group_id: extrasGroup.id, code: "OLIVES", name_en: "Olives", name_ar: "زيتون", price_delta: 1000, is_default: false, is_available: true, sort_order: 1 },
+    { modifier_group_id: extrasGroup.id, code: "MUSHROOM", name_en: "Mushrooms", name_ar: "مشروم", price_delta: 1500, is_default: false, is_available: true, sort_order: 2 },
+    { modifier_group_id: foreignGroup.id, code: "GARLIC", name_en: "Garlic", name_ar: "ثوم", price_delta: 500, is_default: false, is_available: true, sort_order: 1 },
+  ]).returning();
+  [mozzarellaId, cheddarId, olivesId, mushroomsId, foreignModifierId] = options.map((option) => option.id);
+  await db.insert(menuItemModifierGroups).values([
+    { menu_item_id: pizzaId, modifier_group_id: cheeseGroup.id, sort_order: 1 },
+    { menu_item_id: pizzaId, modifier_group_id: extrasGroup.id, sort_order: 2 },
+    { menu_item_id: donerId, modifier_group_id: foreignGroup.id, sort_order: 1 },
+  ]);
+
+  const [customer] = await db.insert(customers).values({
+    name: "Delivery Customer", email: "delivery@example.test", phone: "01000000000",
+    user_uid: "user-1", status: "active",
+  }).returning();
+  customerId = customer.id;
 });
 
 afterAll(async () => { await pg.close(); });
 
-describe("orders.list", () => {
-  it("returns empty array initially", async () => {
-    const list = await caller.list();
-    expect(list).toEqual([]);
-    expect(list.length).toBe(0);
-  });
-
-  it("returns order with nested customer after create", async () => {
-    await caller.create({
-      customerId,
-      paymentMethodId,
-      products: [{ id: productId, quantity: 2, price: 1000 }],
-      total: 2000,
+describe("secure POS order creation", () => {
+  it("creates items, modifier snapshots and initial history atomically", async () => {
+    const order = await caller.create({
+      branchId, orderType: "takeaway", clientRequestId: requestId("atomic"),
+      items: [pizzaLine({ quantity: 2, modifierOptionIds: [cheddarId, olivesId], notes: "well done" })],
     });
 
-    const list = await caller.list();
-    expect(list.length).toBe(1);
-    const order = list[0];
-    expect(order.customer).toBeDefined();
-    expect(order.customer!.name).toBe("Test Customer");
-    expect(order.total_amount).toBe(2000);
-    expect(order.user_uid).toBe("user-1");
+    expect(order.status).toBe("pending");
+    expect(order.total_amount).toBe((10000 + 2000 + 1000) * 2);
+    const [item] = await db.select().from(orderItems).where(eq(orderItems.order_id, order.id));
+    expect(item.price).toBe(10000);
+    expect(item.notes).toBe("well done");
+    const snapshots = await db.select().from(orderItemModifiers).where(eq(orderItemModifiers.order_item_id, item.id));
+    expect(snapshots.map((entry) => entry.price_delta).sort()).toEqual([1000, 2000]);
+    expect((await db.select().from(orderStatusHistory).where(eq(orderStatusHistory.order_id, order.id))).map((entry) => entry.to_status)).toEqual(["pending"]);
+    expect(await db.select().from(transactions).where(eq(transactions.order_id, order.id))).toHaveLength(0);
   });
 
-  it("filters by user_uid — other user sees nothing", async () => {
-    const other = callerAs("outsider");
-    const otherList = await other.list();
-    expect(otherList.length).toBe(0);
-
-    const myList = await caller.list();
-    expect(myList.every((o) => o.user_uid === "user-1")).toBe(true);
-    expect(myList.length).toBeGreaterThanOrEqual(1);
+  it("recalculates variant and modifier prices from the database", async () => {
+    const order = await caller.create({
+      branchId, orderType: "takeaway", clientRequestId: requestId("pricing"),
+      items: [pizzaLine({ variantId: largeVariantId, modifierOptionIds: [cheddarId, olivesId, mushroomsId], quantity: 3 })],
+    });
+    expect(order.total_amount).toBe((15000 + 2000 + 1000 + 1500) * 3);
   });
-});
 
-describe("orders.create", () => {
-  it("creates order + orderItems + transaction atomically", async () => {
+  it("returns the original order for a duplicate client request ID", async () => {
+    const clientRequestId = requestId("duplicate");
+    const first = await caller.create({ branchId, orderType: "takeaway", clientRequestId, items: [pizzaLine()] });
+    const second = await caller.create({ branchId, orderType: "takeaway", clientRequestId, items: [pizzaLine({ quantity: 4 })] });
+    expect(second.id).toBe(first.id);
+    expect(second.total_amount).toBe(first.total_amount);
+    expect((await db.select().from(orderItems).where(eq(orderItems.order_id, first.id)))).toHaveLength(1);
+  });
+
+  it("requires and atomically claims an available table for dine-in", async () => {
+    await expect(caller.create({ branchId, orderType: "dine_in", clientRequestId: requestId("no-table"), items: [pizzaLine()] })).rejects.toThrow("require a table");
+    const order = await caller.create({ branchId, orderType: "dine_in", diningTableId: tableId, clientRequestId: requestId("dine-in"), items: [pizzaLine()] });
+    expect(order.dining_table_id).toBe(tableId);
+    expect((await db.select().from(restaurantTables).where(eq(restaurantTables.id, tableId)))[0].status).toBe("occupied");
+  });
+
+  it("allows takeaway without a table", async () => {
+    const order = await caller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("takeaway"), items: [pizzaLine()] });
+    expect(order.dining_table_id).toBeNull();
+    expect(order.delivery_address).toBeNull();
+  });
+
+  it("requires both a customer and address for delivery", async () => {
+    await expect(caller.create({ branchId, orderType: "delivery", clientRequestId: requestId("delivery-address"), items: [pizzaLine()] })).rejects.toThrow("require an address");
+    await expect(caller.create({ branchId, orderType: "delivery", deliveryAddress: "1 Test Street", clientRequestId: requestId("delivery-customer"), items: [pizzaLine()] })).rejects.toThrow("customer information");
+    const order = await caller.create({ branchId, customerId, orderType: "delivery", deliveryAddress: "1 Test Street", clientRequestId: requestId("delivery-ok"), items: [pizzaLine()] });
+    expect(order.delivery_address).toBe("1 Test Street");
+    expect(order.customer?.name).toBe("Delivery Customer");
+  });
+
+  it("rejects a variant owned by a different menu item without writing", async () => {
     const before = await caller.list();
-    const order = await caller.create({
-      customerId,
-      paymentMethodId,
-      products: [{ id: productId, quantity: 3, price: 1000 }],
-      total: 3000,
-    });
-
-    expect(order.id).toBeGreaterThan(0);
-    expect(order.total_amount).toBe(3000);
-    expect(order.status).toBe("completed");
-    expect(order.customer!.name).toBe("Test Customer");
-
-    // Verify order appeared in list
-    const after = await caller.list();
-    expect(after.length).toBe(before.length + 1);
-
-    // Verify orderItems in DB
-    const items = await db
-      .select()
-      .from(orderItems)
-      .where(eq(orderItems.order_id, order.id));
-    expect(items.length).toBe(1);
-    expect(items[0].quantity).toBe(3);
-    expect(items[0].price).toBe(1000);
-    expect(items[0].product_id).toBe(productId);
-
-    // Verify transaction in DB
-    const txns = await db
-      .select()
-      .from(transactions)
-      .where(eq(transactions.order_id, order.id));
-    expect(txns.length).toBe(1);
-    expect(txns[0].amount).toBe(3000);
-    expect(txns[0].type).toBe("income");
-    expect(txns[0].category).toBe("selling");
-    expect(txns[0].status).toBe("completed");
-    expect(txns[0].user_uid).toBe("user-1");
-    expect(txns[0].payment_method_id).toBe(paymentMethodId);
+    await expect(caller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("foreign-variant"), items: [pizzaLine({ variantId: foreignVariantId })] })).rejects.toThrow("variant does not belong");
+    expect(await caller.list()).toHaveLength(before.length);
   });
 
-  it("rejects quantity: 0 — no order created", async () => {
-    const before = await caller.list();
-    await expect(
-      caller.create({
-        customerId,
-        paymentMethodId,
-        products: [{ id: productId, quantity: 0, price: 1000 }],
-        total: 0,
-      })
-    ).rejects.toThrow();
-    const after = await caller.list();
-    expect(after.length).toBe(before.length);
+  it("rejects foreign modifiers, missing required selections and selections above maximum", async () => {
+    await expect(caller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("foreign-mod"), items: [pizzaLine({ modifierOptionIds: [mozzarellaId, foreignModifierId] })] })).rejects.toThrow("modifier does not belong");
+    await expect(caller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("missing-required"), items: [pizzaLine({ modifierOptionIds: [] })] })).rejects.toThrow("CHEESE requires 1-1");
+    await expect(caller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("over-max"), items: [pizzaLine({ modifierOptionIds: [mozzarellaId, cheddarId] })] })).rejects.toThrow("CHEESE requires 1-1");
+  });
+
+  it("isolates orders by user", async () => {
+    expect(await callerAs("outsider").list()).toEqual([]);
   });
 });
 
-describe("orders.update", () => {
-  it("updates status and change persists in list()", async () => {
-    const order = await caller.create({
-      customerId,
-      paymentMethodId,
-      products: [{ id: productId, quantity: 1, price: 500 }],
-      total: 500,
-    });
-    const updated = await caller.update({ id: order.id, status: "cancelled" });
-    expect(updated.status).toBe("cancelled");
-
-    const list = await caller.list();
-    const persisted = list.find((o) => o.id === order.id)!;
-    expect(persisted.status).toBe("cancelled");
-    expect(persisted.total_amount).toBe(500); // unchanged field preserved
-  });
-
-  it("rejects invalid status enum", async () => {
-    const order = await caller.create({
-      customerId,
-      paymentMethodId,
-      products: [{ id: productId, quantity: 1, price: 500 }],
-      total: 500,
-    });
-    await expect(
-      caller.update({ id: order.id, status: "bogus" as any })
-    ).rejects.toThrow();
-
-    // Original status untouched
-    const list = await caller.list();
-    const persisted = list.find((o) => o.id === order.id)!;
-    expect(persisted.status).toBe("completed");
-  });
-});
-
-describe("orders.transition", () => {
-  it("persists a validated lifecycle and rejects a type-incompatible state", async () => {
-    const [order] = await db.insert(orders).values({
-      customer_id: customerId,
-      order_type: "takeaway",
-      total_amount: 1000,
-      user_uid: "user-1",
-      status: "pending",
-    }).returning();
-
+describe("order lifecycle", () => {
+  it("validates type-specific transitions and records history", async () => {
+    const order = await caller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("lifecycle"), items: [pizzaLine()] });
     expect((await caller.transition({ id: order.id, status: "confirmed" })).status).toBe("confirmed");
     expect((await caller.transition({ id: order.id, status: "preparing" })).status).toBe("preparing");
     expect((await caller.transition({ id: order.id, status: "ready" })).status).toBe("ready");
     await expect(caller.transition({ id: order.id, status: "served" })).rejects.toThrow();
     expect((await caller.transition({ id: order.id, status: "collected" })).status).toBe("collected");
     expect((await caller.transition({ id: order.id, status: "completed" })).status).toBe("completed");
-
-    const history = await db.select().from(orderStatusHistory).where(eq(orderStatusHistory.order_id, order.id));
-    expect(history.map((entry) => entry.to_status)).toEqual(["confirmed", "preparing", "ready", "collected", "completed"]);
-  });
-
-  it("rejects invalid order-type fulfilment data before writing", async () => {
-    await expect(caller.create({
-      customerId, paymentMethodId, orderType: "delivery",
-      products: [{ id: productId, quantity: 1, price: 1000 }], total: 1000,
-    })).rejects.toThrow("require an address");
-    await expect(caller.create({
-      customerId, paymentMethodId, orderType: "dine_in",
-      products: [{ id: productId, quantity: 1, price: 1000 }], total: 1000,
-    })).rejects.toThrow("require a table");
-  });
-});
-
-describe("orders.delete", () => {
-  it("deletes order + orderItems — both gone from DB", async () => {
-    const order = await caller.create({
-      customerId,
-      paymentMethodId,
-      products: [{ id: productId, quantity: 1, price: 100 }],
-      total: 100,
-    });
-
-    // Delete associated transaction first to avoid FK violation
-    await db.delete(transactions).where(eq(transactions.order_id, order.id));
-
-    const before = await caller.list();
-    await caller.delete({ id: order.id });
-    const after = await caller.list();
-
-    expect(after.length).toBe(before.length - 1);
-    expect(after.some((o) => o.id === order.id)).toBe(false);
-
-    // Verify orderItems also deleted
-    const items = await db
-      .select()
-      .from(orderItems)
-      .where(eq(orderItems.order_id, order.id));
-    expect(items.length).toBe(0);
-  });
-
-  it("fails with FK error when transaction references order — order survives", async () => {
-    const order = await caller.create({
-      customerId,
-      paymentMethodId,
-      products: [{ id: productId, quantity: 1, price: 100 }],
-      total: 100,
-    });
-
-    const before = await caller.list();
-    await expect(caller.delete({ id: order.id })).rejects.toThrow();
-
-    // Order still exists
-    const after = await caller.list();
-    expect(after.length).toBe(before.length);
-    expect(after.some((o) => o.id === order.id)).toBe(true);
-  });
-
-  it("is idempotent — deleting non-existent id is no-op", async () => {
-    const before = await caller.list();
-    const result = await caller.delete({ id: 999999 });
-    expect(result.success).toBe(true);
-    const after = await caller.list();
-    expect(after.length).toBe(before.length);
   });
 });

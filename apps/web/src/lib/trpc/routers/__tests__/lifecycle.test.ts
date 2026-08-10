@@ -22,7 +22,8 @@ describe("order lifecycle", () => {
     expect(() => validateOrderFulfilment({ orderType: "dine_in" })).toThrow();
     expect(() => validateOrderFulfilment({ orderType: "takeaway" })).not.toThrow();
     expect(() => validateOrderFulfilment({ orderType: "takeaway", diningTableId: 1 })).toThrow();
-    expect(() => validateOrderFulfilment({ orderType: "delivery", deliveryAddress: "New Cairo" })).not.toThrow();
+    expect(() => validateOrderFulfilment({ orderType: "delivery", deliveryAddress: "New Cairo", customerId: 1 })).not.toThrow();
+    expect(() => validateOrderFulfilment({ orderType: "delivery", deliveryAddress: "New Cairo" })).toThrow();
     expect(() => validateOrderFulfilment({ orderType: "delivery" })).toThrow();
   });
 });

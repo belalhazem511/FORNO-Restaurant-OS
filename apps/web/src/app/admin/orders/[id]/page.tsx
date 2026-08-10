@@ -12,15 +12,19 @@ import { useTRPC } from "@/lib/trpc/client";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslations, useLocale } from "next-intl";
 import { formatCurrency } from "@/lib/utils";
+import type { RouterOutputs } from "@/lib/trpc/router";
+
+type OrderItem = NonNullable<RouterOutputs["orders"]["get"]>["orderItems"][number];
 
 export default function OrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const orderId = parseInt(id);
   const trpc = useTRPC();
-  const { data: order, isLoading } = useQuery(trpc.orders.get.queryOptions({ id: orderId })) as { data: any; isLoading: boolean };
+  const { data: order, isLoading } = useQuery(trpc.orders.get.queryOptions({ id: orderId }));
   const t = useTranslations("orders");
   const tc = useTranslations("common");
   const locale = useLocale();
+  const isArabic = locale === "ar";
 
   if (isLoading) {
     return (
@@ -88,17 +92,34 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {order.orderItems.map((item: any) => (
+                  {order.orderItems.map((item: OrderItem) => {
+                    const modifierTotal = item.modifiers.reduce((sum, modifier) => sum + modifier.price_delta, 0);
+                    const itemName = item.menuItem
+                      ? (isArabic ? item.menuItem.name_ar : item.menuItem.name_en)
+                      : item.product?.name ?? `#${item.product_id}`;
+                    const variantName = item.variant
+                      ? (isArabic ? item.variant.name_ar : item.variant.name_en)
+                      : null;
+                    return (
                     <TableRow key={item.id}>
-                      <TableCell className="font-medium">{item.product?.name ?? `#${item.product_id}`}</TableCell>
+                      <TableCell className="font-medium">
+                        <div>{itemName}{variantName ? ` · ${variantName}` : ""}</div>
+                        {item.modifiers.length > 0 && (
+                          <div className="mt-1 text-xs font-normal text-muted-foreground">
+                            {item.modifiers.map((modifier) => isArabic ? modifier.name_ar : modifier.name_en).join("، ")}
+                          </div>
+                        )}
+                        {item.notes && <div className="mt-1 text-xs font-normal text-muted-foreground">{item.notes}</div>}
+                      </TableCell>
                       <TableCell className="hidden sm:table-cell">
                         {item.product?.category ? <Badge variant="outline">{item.product.category}</Badge> : "—"}
                       </TableCell>
                       <TableCell>{item.quantity}</TableCell>
-                      <TableCell>{formatCurrency(item.price, locale)}</TableCell>
-                      <TableCell className="font-medium">{formatCurrency(item.price * item.quantity, locale)}</TableCell>
+                      <TableCell>{formatCurrency(item.price + modifierTotal, locale)}</TableCell>
+                      <TableCell className="font-medium">{formatCurrency((item.price + modifierTotal) * item.quantity, locale)}</TableCell>
                     </TableRow>
-                  ))}
+                    );
+                  })}
                 </TableBody>
               </Table>
             </div>

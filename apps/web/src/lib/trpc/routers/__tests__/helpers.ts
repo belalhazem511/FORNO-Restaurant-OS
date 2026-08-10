@@ -55,7 +55,9 @@ function tableToDDL(table: PgTable): string {
   return `CREATE TABLE IF NOT EXISTS ${name} (\n  ${[...colDefs, ...fkDefs].join(",\n  ")}\n);`;
 }
 
-export const SCHEMA_DDL = TABLES.map(tableToDDL).join("\n\n");
+export const SCHEMA_DDL = `${TABLES.map(tableToDDL).join("\n\n")}
+
+CREATE UNIQUE INDEX IF NOT EXISTS orders_client_request_uidx ON orders (client_request_id);`;
 
 export function createTestDb() {
   const pg = new PGlite();

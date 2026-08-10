@@ -16,6 +16,8 @@ interface DeleteConfirmationDialogProps {
   onOpenChange: (open: boolean) => void;
   onConfirm: () => void;
   description?: string;
+  title?: string;
+  confirmLabel?: string;
 }
 
 export function DeleteConfirmationDialog({
@@ -23,6 +25,8 @@ export function DeleteConfirmationDialog({
   onOpenChange,
   onConfirm,
   description,
+  title,
+  confirmLabel,
 }: DeleteConfirmationDialogProps) {
   const t = useTranslations("common");
 
@@ -30,7 +34,7 @@ export function DeleteConfirmationDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{t("confirmDeletion")}</DialogTitle>
+          <DialogTitle>{title ?? t("confirmDeletion")}</DialogTitle>
           <DialogDescription>{description ?? t("defaultDeleteMessage")}</DialogDescription>
         </DialogHeader>
         <DialogFooter>
@@ -38,7 +42,7 @@ export function DeleteConfirmationDialog({
             {t("cancel")}
           </Button>
           <Button variant="destructive" onClick={onConfirm}>
-            {t("delete")}
+            {confirmLabel ?? t("delete")}
           </Button>
         </DialogFooter>
       </DialogContent>
