@@ -1,0 +1,78 @@
+# dependencies
+node_modules
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# testing
+coverage
+
+# next.js
+.next/
+out/
+
+# build outputs
+build
+dist
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# local env files
+.env*.local
+.env
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+.aider*
+
+# turbo
+.turbo
+
+# pglite local database
+**/data/*
+!**/data/.gitkeep
+
+# drizzle migrations
+drizzle
+
+# playwright mcp
+.playwright-mcp/
+.reference/
+
+# IDEs
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea
+*.swp
+*.swo
+*~
+
+# logs
+logs
+*.log
+*.tgz
+.cache
+tmp
+temp
+
+# Fumadocs generated
+apps/docs/.source/
+
+# Manual fiscal test scripts (contain sensitive data)
+packages/fiscal/src/manual-*.ts
