@@ -1,0 +1,52 @@
+{
+  "name": "forno-restaurant-system",
+  "private": true,
+  "workspaces": {
+    "packages": [
+      "apps/*",
+      "packages/*"
+    ],
+    "catalog": {
+      "dotenv": "^17.2.2",
+      "zod": "^4.3.6",
+      "lucide-react": "^0.575.0",
+      "next": "^16.1.6",
+      "next-themes": "^0.4.6",
+      "react": "^19.2.4",
+      "react-dom": "^19.2.4",
+      "sonner": "^2.0.7",
+      "@trpc/server": "^11.10.0",
+      "@trpc/client": "^11.10.0",
+      "better-auth": "^1.4.20",
+      "@types/react": "^19.2.14",
+      "@types/react-dom": "^19.2.3",
+      "tailwindcss": "^4.2.1"
+    }
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "check-types": "turbo check-types",
+    "dev:web": "turbo -F web dev",
+    "db:push": "turbo -F @forno/db db:push",
+    "db:studio": "turbo -F @forno/db db:studio",
+    "db:generate": "turbo -F @forno/db db:generate",
+    "db:migrate": "turbo -F @forno/db db:migrate",
+    "db:seed": "turbo -F web db:seed",
+    "check": "biome check --write ."
+  },
+  "dependencies": {
+    "@forno/env": "workspace:*",
+    "dotenv": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "@forno/config": "workspace:*",
+    "@types/node": "^22.13.14",
+    "turbo": "^2.8.12",
+    "typescript": "^5"
+  },
+  "packageManager": "bun@1.3.5"
+}
