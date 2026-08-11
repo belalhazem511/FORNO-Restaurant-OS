@@ -3,6 +3,8 @@ import { auth } from "../auth";
 import { db, pglite } from ".";
 import {
   branches,
+  cashierRegisters,
+  cashierShifts,
   customers,
   diningAreas,
   kitchenStations,
@@ -13,11 +15,14 @@ import {
   modifierGroups,
   modifierOptions,
   orderItems,
+  orderCheckouts,
+  orderPayments,
   orders,
   orderStatusHistory,
   paymentMethods,
   products,
   restaurantTables,
+  staffAssignments,
   transactions,
   user,
 } from "./schema";
@@ -25,20 +30,30 @@ import {
 const DEMO_EMAIL = "admin@forno.local";
 const DEMO_PASSWORD = "Forno123!";
 const DEMO_NAME = "FORNO Admin";
+const CASHIER_EMAIL = "cashier@forno.local";
+const CASHIER_PASSWORD = "Forno123!";
 
-async function demoUserId() {
-  const [existing] = await db.select({ id: user.id }).from(user).where(eq(user.email, DEMO_EMAIL)).limit(1);
+async function demoUserId(email: string, name: string, password: string) {
+  const [existing] = await db.select({ id: user.id }).from(user).where(eq(user.email, email)).limit(1);
   if (existing) return existing.id;
   const result = await auth.api.signUpEmail({
-    body: { name: DEMO_NAME, email: DEMO_EMAIL, password: DEMO_PASSWORD },
+    body: { name, email, password },
   });
   return result.user.id;
 }
 
 export async function seed() {
-  const userId = await demoUserId();
+  const userId = await demoUserId(DEMO_EMAIL, DEMO_NAME, DEMO_PASSWORD);
+  const cashierUserId = await demoUserId(CASHIER_EMAIL, "FORNO Cashier", CASHIER_PASSWORD);
 
-  await db.insert(paymentMethods).values([{ name: "Card" }, { name: "InstaPay" }, { name: "Cash" }]).onConflictDoNothing();
+  await db.insert(paymentMethods).values([
+    { code: "CARD", name: "Card", affects_drawer: false, is_active: true },
+    { code: "INSTAPAY", name: "InstaPay", affects_drawer: false, is_active: true },
+    { code: "CASH", name: "Cash", affects_drawer: true, is_active: true },
+  ]).onConflictDoNothing();
+  await db.update(paymentMethods).set({ code: "CARD", affects_drawer: false, is_active: true }).where(eq(paymentMethods.name, "Card"));
+  await db.update(paymentMethods).set({ code: "INSTAPAY", affects_drawer: false, is_active: true }).where(eq(paymentMethods.name, "InstaPay"));
+  await db.update(paymentMethods).set({ code: "CASH", affects_drawer: true, is_active: true }).where(eq(paymentMethods.name, "Cash"));
   const methods = await db.select().from(paymentMethods);
   const paymentByName = new Map(methods.map((method) => [method.name, method.id]));
 
@@ -52,6 +67,32 @@ export async function seed() {
   }).onConflictDoNothing();
   const branch = await db.query.branches.findFirst({ where: eq(branches.code, "FORNO-MAIN") });
   if (!branch) throw new Error("Failed to seed FORNO branch");
+
+  await db.insert(staffAssignments).values({
+    user_id: userId,
+    branch_id: branch.id,
+    role: "admin",
+    is_active: true,
+  }).onConflictDoUpdate({
+    target: [staffAssignments.user_id, staffAssignments.branch_id],
+    set: { role: "admin", is_active: true, updated_at: new Date() },
+  });
+  await db.insert(staffAssignments).values({
+    user_id: cashierUserId,
+    branch_id: branch.id,
+    role: "cashier",
+    is_active: true,
+  }).onConflictDoUpdate({
+    target: [staffAssignments.user_id, staffAssignments.branch_id],
+    set: { role: "cashier", is_active: true, updated_at: new Date() },
+  });
+  await db.insert(cashierRegisters).values({
+    branch_id: branch.id,
+    code: "FRONT",
+    name_en: "Front Register",
+    name_ar: "كاشير الواجهة",
+    is_active: true,
+  }).onConflictDoNothing();
 
   const areaSeeds = [
     { code: "INDOOR", name_en: "Main Dining Room", name_ar: "الصالة الرئيسية", sort_order: 1 },
@@ -189,6 +230,28 @@ export async function seed() {
   const customerByEmail = new Map(demoCustomers.map((customer) => [customer.email, customer.id]));
   const tables = await db.select().from(restaurantTables);
   const table1 = tables.find((table) => table.code === "T1")!;
+  const register = await db.query.cashierRegisters.findFirst({ where: and(eq(cashierRegisters.branch_id, branch.id), eq(cashierRegisters.code, "FRONT")) });
+  if (!register) throw new Error("Failed to seed cashier register");
+  let demoShift = await db.query.cashierShifts.findFirst({ where: and(
+    eq(cashierShifts.register_id, register.id),
+    eq(cashierShifts.opened_by, userId),
+    eq(cashierShifts.status, "closed"),
+  ) });
+  if (!demoShift) {
+    [demoShift] = await db.insert(cashierShifts).values({
+      branch_id: branch.id,
+      register_id: register.id,
+      cashier_user_id: userId,
+      opened_by: userId,
+      closed_by: userId,
+      status: "closed",
+      opening_float: 0,
+      expected_cash: 41500,
+      closing_cash: 41500,
+      variance: 0,
+      closed_at: new Date(),
+    }).returning();
+  }
 
   const orderSeeds = [
     { request: "forno-demo-dine-in", customer: "ahmed@forno.demo", type: "dine_in" as const, table: table1.id, address: null, item: "MARGHERITA" },
@@ -203,18 +266,59 @@ export async function seed() {
       dining_table_id: demo.table,
       client_request_id: demo.request,
       order_type: demo.type,
+      subtotal_amount: menuItem.base_price,
       total_amount: menuItem.base_price,
+      payment_status: "paid",
+      paid_at: new Date(),
       delivery_address: demo.address,
       user_uid: userId,
       status: "completed",
     }).onConflictDoNothing().returning();
-    if (!created) continue;
-    await db.insert(orderItems).values({ order_id: created.id, menu_item_id: menuItem.id, product_id: menuItem.product_id, quantity: 1, price: menuItem.base_price });
-    await db.insert(orderStatusHistory).values({ order_id: created.id, from_status: null, to_status: "completed", changed_by: userId, note: "FORNO demo order" });
-    await db.insert(transactions).values({ order_id: created.id, payment_method_id: paymentByName.get("Cash"), amount: menuItem.base_price, user_uid: userId, type: "income", category: "selling", status: "completed", description: `Payment for order #${created.id}` });
+    const seededOrder = created ?? await db.query.orders.findFirst({ where: eq(orders.client_request_id, demo.request) });
+    if (!seededOrder) throw new Error(`Failed to seed order ${demo.request}`);
+    await db.update(orders).set({
+      subtotal_amount: menuItem.base_price,
+      discount_value: 0,
+      discount_amount: 0,
+      total_amount: menuItem.base_price,
+      payment_status: "paid",
+      paid_at: seededOrder.paid_at ?? new Date(),
+    }).where(eq(orders.id, seededOrder.id));
+    if (created) {
+      await db.insert(orderItems).values({ order_id: created.id, menu_item_id: menuItem.id, product_id: menuItem.product_id, quantity: 1, price: menuItem.base_price });
+      await db.insert(orderStatusHistory).values({ order_id: created.id, from_status: null, to_status: "completed", changed_by: userId, note: "FORNO demo order" });
+    }
+    let checkout = await db.query.orderCheckouts.findFirst({ where: eq(orderCheckouts.order_id, seededOrder.id) });
+    if (!checkout) {
+      [checkout] = await db.insert(orderCheckouts).values({
+        order_id: seededOrder.id,
+        shift_id: demoShift.id,
+        idempotency_key: `seed-checkout-${demo.request}`,
+        subtotal_amount: menuItem.base_price,
+        discount_amount: 0,
+        payable_amount: menuItem.base_price,
+        created_by: userId,
+      }).returning();
+    }
+    let payment = await db.query.orderPayments.findFirst({ where: and(eq(orderPayments.checkout_id, checkout.id), eq(orderPayments.kind, "payment")) });
+    if (!payment) {
+      [payment] = await db.insert(orderPayments).values({
+        checkout_id: checkout.id,
+        order_id: seededOrder.id,
+        shift_id: demoShift.id,
+        payment_method_id: paymentByName.get("Cash")!,
+        kind: "payment",
+        amount: menuItem.base_price,
+        tendered_amount: menuItem.base_price,
+        change_amount: 0,
+        created_by: userId,
+      }).returning();
+    }
+    const transaction = await db.query.transactions.findFirst({ where: eq(transactions.order_payment_id, payment.id) });
+    if (!transaction) await db.insert(transactions).values({ order_id: seededOrder.id, shift_id: demoShift.id, order_payment_id: payment.id, payment_method_id: paymentByName.get("Cash"), amount: menuItem.base_price, user_uid: userId, type: "income", category: "selling", status: "completed", description: `Payment for order #${seededOrder.id}` });
   }
 
-  console.log(`FORNO seed ready: ${DEMO_EMAIL} / ${DEMO_PASSWORD}`);
+  console.log(`FORNO seed ready: ${DEMO_EMAIL} and ${CASHIER_EMAIL} / ${DEMO_PASSWORD}`);
 }
 
 if (import.meta.main) {

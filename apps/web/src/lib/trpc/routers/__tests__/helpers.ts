@@ -6,7 +6,9 @@ import * as schema from "@/lib/db/schema";
 
 // FK-safe order: referenced tables before referencing tables
 const TABLES: PgTable[] = [
+  schema.user,
   schema.branches,
+  schema.staffAssignments,
   schema.diningAreas,
   schema.restaurantTables,
   schema.kitchenStations,
@@ -18,11 +20,18 @@ const TABLES: PgTable[] = [
   schema.modifierOptions,
   schema.menuItemModifierGroups,
   schema.customers,
+  schema.cashierRegisters,
+  schema.cashierShifts,
+  schema.shiftCashMovements,
   schema.paymentMethods,
   schema.orders,
   schema.orderItems,
   schema.orderItemModifiers,
   schema.orderStatusHistory,
+  schema.orderCheckouts,
+  schema.orderPayments,
+  schema.orderCancellations,
+  schema.auditLogs,
   schema.transactions,
 ];
 
@@ -32,7 +41,7 @@ function tableToDDL(table: PgTable): string {
   const colDefs = columns.map((col) => {
     const sqlType = col.getSQLType();
     const isSerial = sqlType === "serial";
-    const parts: string[] = [col.name, sqlType];
+    const parts: string[] = [`"${col.name}"`, sqlType];
 
     if (col.primary) parts.push("PRIMARY KEY");
     if (col.notNull && !isSerial) parts.push("NOT NULL");
@@ -49,15 +58,23 @@ function tableToDDL(table: PgTable): string {
     const col = ref.columns[0].name;
     const refTable = getTableName(ref.foreignColumns[0].table);
     const refCol = ref.foreignColumns[0].name;
-    return `FOREIGN KEY (${col}) REFERENCES ${refTable}(${refCol})`;
+    return `FOREIGN KEY ("${col}") REFERENCES "${refTable}"("${refCol}")`;
   });
 
-  return `CREATE TABLE IF NOT EXISTS ${name} (\n  ${[...colDefs, ...fkDefs].join(",\n  ")}\n);`;
+  return `CREATE TABLE IF NOT EXISTS "${name}" (\n  ${[...colDefs, ...fkDefs].join(",\n  ")}\n);`;
 }
 
 export const SCHEMA_DDL = `${TABLES.map(tableToDDL).join("\n\n")}
 
-CREATE UNIQUE INDEX IF NOT EXISTS orders_client_request_uidx ON orders (client_request_id);`;
+CREATE UNIQUE INDEX IF NOT EXISTS orders_client_request_uidx ON orders (client_request_id);
+CREATE UNIQUE INDEX IF NOT EXISTS staff_assignments_user_branch_uidx ON staff_assignments (user_id, branch_id);
+CREATE UNIQUE INDEX IF NOT EXISTS cashier_shifts_open_register_uidx ON cashier_shifts (register_id) WHERE status = 'open';
+CREATE UNIQUE INDEX IF NOT EXISTS cashier_shifts_open_cashier_uidx ON cashier_shifts (cashier_user_id) WHERE status = 'open';
+CREATE UNIQUE INDEX IF NOT EXISTS order_checkouts_order_uidx ON order_checkouts (order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS order_checkouts_idempotency_uidx ON order_checkouts (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS order_cancellations_order_uidx ON order_cancellations (order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS order_cancellations_idempotency_uidx ON order_cancellations (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS order_payments_refund_original_uidx ON order_payments (original_payment_id) WHERE kind = 'refund';`;
 
 export function createTestDb() {
   const pg = new PGlite();

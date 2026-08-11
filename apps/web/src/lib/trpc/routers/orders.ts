@@ -28,7 +28,14 @@ const orderBaseSchema = z.object({
   dining_table_id: z.number().nullable(),
   client_request_id: z.string().nullable(),
   order_type: orderTypeSchema,
+  subtotal_amount: z.number(),
+  discount_type: z.string().nullable(),
+  discount_value: z.number(),
+  discount_amount: z.number(),
+  discount_reason: z.string().nullable(),
   total_amount: z.number(),
+  payment_status: z.enum(["unpaid", "paid", "refunded"]),
+  paid_at: z.date().nullable(),
   delivery_address: z.string().nullable(),
   status: orderStatusSchema,
   user_uid: z.string(),
@@ -239,7 +246,11 @@ export const ordersRouter = router({
           dining_table_id: input.diningTableId ?? null,
           client_request_id: input.clientRequestId,
           order_type: input.orderType,
+          subtotal_amount: totalAmount,
+          discount_value: 0,
+          discount_amount: 0,
           total_amount: totalAmount,
+          payment_status: "unpaid",
           delivery_address: input.deliveryAddress ?? null,
           user_uid: ctx.user.id,
           status: "pending",
@@ -313,6 +324,8 @@ export const ordersRouter = router({
         where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)),
       });
       if (!current) throw new Error("Order not found");
+      if (input.total_amount !== undefined) throw new Error("Order totals are server-calculated and cannot be edited");
+      if (input.status === "cancelled") throw new Error("Use the audited cancellation workflow");
 
       if (input.status && input.status !== current.status) {
         assertOrderTransition(current.status as OrderStatus, input.status, current.order_type as OrderType);
@@ -350,6 +363,7 @@ export const ordersRouter = router({
         where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)),
       });
       if (!current) throw new Error("Order not found");
+      if (input.status === "cancelled") throw new Error("Use the audited cancellation workflow");
       assertOrderTransition(current.status as OrderStatus, input.status, current.order_type as OrderType);
 
       const [updated] = await tx.update(orders).set({ status: input.status, updated_at: new Date() })
@@ -376,26 +390,8 @@ export const ordersRouter = router({
     .input(z.object({ id: z.number() }))
     .output(z.object({ success: z.boolean() }))
     .mutation(async ({ ctx, input }) => {
-      await db.transaction(async (tx) => {
-        const current = await tx.query.orders.findFirst({
-          where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)),
-        });
-        const itemIds = await tx.select({ id: orderItems.id }).from(orderItems)
-          .where(eq(orderItems.order_id, input.id));
-        if (itemIds.length > 0) {
-          await tx.delete(orderItemModifiers).where(inArray(
-            orderItemModifiers.order_item_id,
-            itemIds.map((item) => item.id),
-          ));
-        }
-        await tx.delete(orderStatusHistory).where(eq(orderStatusHistory.order_id, input.id));
-        await tx.delete(orderItems).where(eq(orderItems.order_id, input.id));
-        await tx.delete(orders).where(and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)));
-        if (current?.dining_table_id) {
-          await tx.update(restaurantTables).set({ status: "available" })
-            .where(eq(restaurantTables.id, current.dining_table_id));
-        }
-      });
-      return { success: true };
+      const current = await db.query.orders.findFirst({ where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)) });
+      if (!current) return { success: true };
+      throw new Error("Orders are immutable financial documents; cancel the order instead");
     }),
 });

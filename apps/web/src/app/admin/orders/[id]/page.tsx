@@ -1,6 +1,6 @@
 "use client";
 
-import { use } from "react";
+import { use, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@forno/ui/components/card";
 import { Badge } from "@forno/ui/components/badge";
 import { Button } from "@forno/ui/components/button";
@@ -13,6 +13,10 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslations, useLocale } from "next-intl";
 import { formatCurrency } from "@/lib/utils";
 import type { RouterOutputs } from "@/lib/trpc/router";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@forno/ui/components/dialog";
+import { Input } from "@forno/ui/components/input";
+import { Label } from "@forno/ui/components/label";
 
 type OrderItem = NonNullable<RouterOutputs["orders"]["get"]>["orderItems"][number];
 
@@ -20,11 +24,29 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
   const { id } = use(params);
   const orderId = parseInt(id);
   const trpc = useTRPC();
+  const queryClient = useQueryClient();
   const { data: order, isLoading } = useQuery(trpc.orders.get.queryOptions({ id: orderId }));
+  const financialsQuery = useQuery(trpc.checkout.financials.queryOptions({ orderId }));
   const t = useTranslations("orders");
   const tc = useTranslations("common");
   const locale = useLocale();
   const isArabic = locale === "ar";
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelError, setCancelError] = useState("");
+  const [cancelRequestId] = useState(() => `cancel-${crypto.randomUUID()}`);
+  const cancelMutation = useMutation(trpc.checkout.cancel.mutationOptions({
+    onSuccess: async () => {
+      setCancelOpen(false);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: trpc.orders.get.queryOptions({ id: orderId }).queryKey }),
+        queryClient.invalidateQueries({ queryKey: trpc.orders.list.queryOptions().queryKey }),
+        queryClient.invalidateQueries({ queryKey: trpc.checkout.financials.queryOptions({ orderId }).queryKey }),
+        queryClient.invalidateQueries({ queryKey: trpc.restaurant.model.queryOptions().queryKey }),
+      ]);
+    },
+    onError: (cause) => setCancelError(cause.message),
+  }));
 
   if (isLoading) {
     return (
@@ -67,6 +89,10 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
             <div>
               <dt className="text-muted-foreground">{tc("total")}</dt>
               <dd className="text-lg font-bold">{formatCurrency(order.total_amount, locale)}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t("paymentStatus")}</dt>
+              <dd className="font-semibold">{t(`payment_${order.payment_status}`)}</dd>
             </div>
             <div>
               <dt className="text-muted-foreground">{t("createdAt")}</dt>
@@ -126,6 +152,18 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
           </CardContent>
         </Card>
       )}
+
+      <Card>
+        <CardHeader className="flex-row items-center justify-between"><CardTitle>{t("financialHistory")}</CardTitle>{financialsQuery.data?.canCancel && order.status !== "cancelled" && <Button variant={order.payment_status === "paid" ? "destructive" : "outline"} onClick={() => setCancelOpen(true)}>{order.payment_status === "paid" ? t("reverseAndCancel") : t("cancelOrder")}</Button>}</CardHeader>
+        <CardContent className="space-y-3">
+          {financialsQuery.data?.checkout && <div className="grid gap-2 rounded-lg border p-4 sm:grid-cols-3"><span>{t("subtotal")}: {formatCurrency(financialsQuery.data.checkout.subtotal_amount, locale)}</span><span>{t("discount")}: {formatCurrency(financialsQuery.data.checkout.discount_amount, locale)}</span><strong>{t("payable")}: {formatCurrency(financialsQuery.data.checkout.payable_amount, locale)}</strong></div>}
+          {financialsQuery.data?.payments.map((payment) => <div key={payment.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3"><span>{payment.kind === "refund" ? t("refund") : t("payment")} · {payment.method}</span><strong className={payment.kind === "refund" ? "text-destructive" : "text-emerald-700"}>{payment.kind === "refund" ? "−" : "+"}{formatCurrency(payment.amount, locale)}</strong></div>)}
+          {financialsQuery.data?.cancellation && <div className="rounded-lg bg-destructive/10 p-4"><strong>{t("cancelled")}</strong><p className="text-sm">{financialsQuery.data.cancellation.reason}</p></div>}
+          {!financialsQuery.data?.checkout && !financialsQuery.data?.cancellation && <p className="text-muted-foreground">{t("noFinancialActivity")}</p>}
+        </CardContent>
+      </Card>
+
+      <Dialog open={cancelOpen} onOpenChange={setCancelOpen}><DialogContent><DialogHeader><DialogTitle>{order.payment_status === "paid" ? t("reverseAndCancel") : t("cancelOrder")}</DialogTitle></DialogHeader><div className="space-y-2"><Label htmlFor="cancel-reason">{t("cancellationReason")}</Label><Input id="cancel-reason" value={cancelReason} onChange={(event) => setCancelReason(event.target.value)} />{order.payment_status === "paid" && <p className="text-sm text-muted-foreground">{t("fullReversalNotice")}</p>}{cancelError && <p role="alert" className="text-sm text-destructive">{cancelError}</p>}</div><DialogFooter><Button variant="outline" onClick={() => setCancelOpen(false)}>{tc("cancel")}</Button><Button variant="destructive" disabled={cancelMutation.isPending || cancelReason.trim().length < 3} onClick={() => { setCancelError(""); cancelMutation.mutate({ orderId, idempotencyKey: cancelRequestId, reason: cancelReason }); }}>{t("confirmCancellation")}</Button></DialogFooter></DialogContent></Dialog>
     </div>
   );
 }

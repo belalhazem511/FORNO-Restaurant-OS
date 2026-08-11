@@ -38,12 +38,8 @@ export const transactionsRouter = router({
       })
     )
     .output(transactionSchema)
-    .mutation(async ({ ctx, input }) => {
-      const [data] = await db
-        .insert(transactions)
-        .values({ ...input, user_uid: ctx.user.id })
-        .returning();
-      return data;
+    .mutation(async () => {
+      throw new Error("Direct transaction creation is disabled; use audited shift and checkout workflows");
     }),
 
   update: protectedProcedure
@@ -59,24 +55,15 @@ export const transactionsRouter = router({
       })
     )
     .output(transactionSchema)
-    .mutation(async ({ ctx, input }) => {
-      const { id, ...data } = input;
-      const [updated] = await db
-        .update(transactions)
-        .set({ ...data, user_uid: ctx.user.id })
-        .where(and(eq(transactions.id, id), eq(transactions.user_uid, ctx.user.id)))
-        .returning();
-      return updated;
+    .mutation(async () => {
+      throw new Error("Financial transactions are immutable");
     }),
 
   delete: protectedProcedure
     .meta({ openapi: { method: "DELETE", path: "/transactions/{id}", tags: ["Transactions"], summary: "Delete a transaction" } })
     .input(z.object({ id: z.number() }))
     .output(z.object({ success: z.boolean() }))
-    .mutation(async ({ ctx, input }) => {
-      await db
-        .delete(transactions)
-        .where(and(eq(transactions.id, input.id), eq(transactions.user_uid, ctx.user.id)));
-      return { success: true };
+    .mutation(async () => {
+      throw new Error("Financial transactions are immutable");
     }),
 });
