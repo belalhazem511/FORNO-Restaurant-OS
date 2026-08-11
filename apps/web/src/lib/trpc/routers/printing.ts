@@ -273,6 +273,7 @@ export const printingRouter = router({
       const financial = job.document_type === "kot" ? null : {
         state: classifyReceiptState({ paymentStatus: order.payment_status, wasPaidCancellation: cancellation?.was_paid ?? false }),
         receiptNumber: documentNumber(job.document_type, order.id, checkout?.id ?? null, job.id),
+        offlineReceiptReference: order.offline_receipt_reference,
         subtotal: checkout?.subtotal_amount ?? order.subtotal_amount,
         discount: checkout?.discount_amount ?? order.discount_amount,
         discountReason: order.discount_reason,

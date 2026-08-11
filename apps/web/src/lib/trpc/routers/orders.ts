@@ -27,6 +27,7 @@ const orderBaseSchema = z.object({
   customer_id: z.number().nullable(),
   dining_table_id: z.number().nullable(),
   client_request_id: z.string().nullable(),
+  offline_receipt_reference: z.string().nullable(),
   order_type: orderTypeSchema,
   subtotal_amount: z.number(),
   discount_type: z.string().nullable(),

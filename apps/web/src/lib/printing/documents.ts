@@ -60,6 +60,7 @@ export type TrustedPrintDocument = {
   financial: null | {
     state: ReceiptState;
     receiptNumber: string;
+    offlineReceiptReference: string | null;
     subtotal: number;
     discount: number;
     discountReason: string | null;

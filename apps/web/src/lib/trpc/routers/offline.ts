@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { TRPCError } from "@trpc/server";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod/v4";
@@ -10,6 +10,7 @@ import {
   cashierShifts,
   customers,
   menuItems,
+  offlinePriceSnapshots,
   offlineSyncRecords,
   orderCheckouts,
   orderItemModifiers,
@@ -30,6 +31,11 @@ import { protectedProcedure, router } from "../init";
 export const OFFLINE_SNAPSHOT_STALE_MS = 2 * 60 * 60 * 1000;
 export const OFFLINE_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+export function offlinePriceSnapshotTtlMs() {
+  const configured = Number(process.env.FORNO_OFFLINE_PRICE_SNAPSHOT_TTL_MS ?? OFFLINE_SNAPSHOT_MAX_AGE_MS);
+  return Number.isFinite(configured) ? Math.max(5 * 60 * 1000, Math.min(configured, 7 * 24 * 60 * 60 * 1000)) : OFFLINE_SNAPSHOT_MAX_AGE_MS;
+}
+
 export const OFFLINE_CONFLICT_CODES = [
   "menu_price_changed",
   "menu_item_unavailable",
@@ -41,6 +47,9 @@ export const OFFLINE_CONFLICT_CODES = [
   "permission_changed",
   "user_branch_mismatch",
   "cash_insufficient",
+  "price_snapshot_invalid",
+  "price_snapshot_expired",
+  "receipt_payload_tampered",
   "duplicate_already_accepted",
   "invalid_order",
 ] as const;
@@ -69,6 +78,8 @@ const offlineOperationSchema = z.object({
   kind: z.enum(["order", "cash_sale"]),
   clientOperationId: z.string().trim().min(12).max(100),
   snapshotRevision: z.string().trim().min(8).max(100),
+  priceSnapshotReference: z.string().trim().min(12).max(80),
+  priceSnapshotRevision: z.string().trim().min(16).max(64),
   branchId: z.number().int().positive(),
   registerId: z.number().int().positive(),
   shiftId: z.number().int().positive(),
@@ -88,6 +99,17 @@ const offlineOperationSchema = z.object({
     checkoutIdempotencyKey: z.string().trim().min(12).max(100),
     tenderedAmount: z.number().int().positive(),
   }).nullable(),
+  offlineReceipt: z.object({
+    number: z.string().trim().regex(/^OFF-[A-Z0-9-]{12,76}$/),
+    deviceInstanceId: z.string().trim().min(16).max(100),
+    checkoutAt: z.string().datetime({ offset: true }),
+    subtotal: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+    cashReceived: z.number().int().positive(),
+    change: z.number().int().nonnegative(),
+    printIdempotencyKey: z.string().trim().min(12).max(120),
+    previewedAt: z.string().datetime({ offset: true }).nullable(),
+  }).nullable(),
   kotAcknowledgements: z.array(z.object({
     stationId: z.number().int().positive(),
     idempotencyKey: z.string().trim().min(12).max(120),
@@ -97,6 +119,9 @@ const offlineOperationSchema = z.object({
 }).superRefine((value, ctx) => {
   if ((value.kind === "cash_sale") !== Boolean(value.cash)) {
     ctx.addIssue({ code: "custom", message: "Cash details are required only for an offline cash sale" });
+  }
+  if ((value.kind === "cash_sale") !== Boolean(value.offlineReceipt)) {
+    ctx.addIssue({ code: "custom", message: "An immutable offline cash receipt is required only for an offline cash sale" });
   }
   if (value.order.orderType === "dine_in" && !value.order.diningTableId) {
     ctx.addIssue({ code: "custom", message: "Dine-in orders require a table" });
@@ -121,13 +146,30 @@ function snapshotRevision(value: unknown) {
 function conflictCategory(code: OfflineConflictCode) {
   if (["shift_closed", "register_unavailable"].includes(code)) return "temporary" as const;
   if (["permission_changed", "user_branch_mismatch"].includes(code)) return "permission" as const;
-  if (["menu_price_changed", "cash_insufficient"].includes(code)) return "financial" as const;
+  if (["menu_price_changed", "cash_insufficient", "price_snapshot_invalid", "price_snapshot_expired", "receipt_payload_tampered"].includes(code)) return "financial" as const;
   return "validation" as const;
 }
 
 function stableDeliveryEmail(branchId: number, userId: string, phone: string) {
   const digest = createHash("sha256").update(`${branchId}:${userId}:${phone}`).digest("hex").slice(0, 24);
   return `offline-${digest}@forno.local`;
+}
+
+type OfflinePricingPayload = {
+  items: Array<{
+    id: number;
+    basePrice: number;
+    variants: Array<{ id: number; price: number }>;
+    modifiers: Array<{ id: number; priceDelta: number }>;
+  }>;
+};
+
+function expectedOfflineReceiptNumber(input: { branchCode: string; registerCode: string; branchId: number; registerId: number; deviceInstanceId: string; checkoutIdempotencyKey: string; checkoutAt: string }) {
+  const date = input.checkoutAt.slice(0, 10).replaceAll("-", "");
+  const digest = createHash("sha256").update(`${input.branchId}:${input.registerId}:${input.deviceInstanceId}:${input.checkoutIdempotencyKey}`).digest("hex").slice(0, 16).toUpperCase();
+  const branchCode = input.branchCode.replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 8) || "BRANCH";
+  const registerCode = input.registerCode.replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 8) || "REG";
+  return `OFF-${branchCode}-${registerCode}-${date}-${digest}`;
 }
 
 async function loadBootstrap(userId: string, branchId: number) {
@@ -161,6 +203,8 @@ async function loadBootstrap(userId: string, branchId: number) {
     },
   });
   if (!branch) throw new TRPCError({ code: "NOT_FOUND", message: "Active branch not found" });
+  const cashier = await db.query.user.findFirst({ where: (users, { eq: equals }) => equals(users.id, userId) });
+  if (!cashier) throw new TRPCError({ code: "UNAUTHORIZED", message: "Authenticated cashier not found" });
   const shift = await db.query.cashierShifts.findFirst({
     where: and(
       eq(cashierShifts.branch_id, branchId),
@@ -176,8 +220,31 @@ async function loadBootstrap(userId: string, branchId: number) {
     where: eq(registerPrintPreferences.register_id, shift.register_id),
   });
   const createdAt = new Date();
+  const pricing: OfflinePricingPayload = {
+    items: branch.menuCategories.flatMap((category) => category.menuItems.map((item) => ({
+      id: item.id,
+      basePrice: item.base_price,
+      variants: item.variants.map((variant) => ({ id: variant.id, price: variant.price })),
+      modifiers: item.modifierGroups.flatMap((link) => link.modifierGroup.options.map((option) => ({ id: option.id, priceDelta: option.price_delta }))),
+    }))),
+  };
+  const priceRevision = snapshotRevision(pricing);
+  const priceReference = `OPS-${branchId}-${randomBytes(18).toString("base64url")}`;
+  const priceExpiresAt = new Date(createdAt.getTime() + offlinePriceSnapshotTtlMs());
+  await db.insert(offlinePriceSnapshots).values({
+    reference: priceReference,
+    revision: priceRevision,
+    branch_id: branch.id,
+    register_id: shift.register_id,
+    shift_id: shift.id,
+    actor_user_id: userId,
+    pricing_payload: JSON.stringify(pricing),
+    issued_at: createdAt,
+    expires_at: priceExpiresAt,
+  });
   const core = {
     userId,
+    cashier: { id: cashier.id, name: cashier.name },
     role: assignment.role,
     permissions: permissionsForRole(assignment.role),
     branch,
@@ -196,13 +263,20 @@ async function loadBootstrap(userId: string, branchId: number) {
       receiptCopies: printPreference?.receipt_copies ?? 1,
       kotCopies: printPreference?.kot_copies ?? 1,
     },
+    priceSnapshot: {
+      reference: priceReference,
+      revision: priceRevision,
+      issuedAt: createdAt,
+      expiresAt: priceExpiresAt,
+      ttlMs: offlinePriceSnapshotTtlMs(),
+    },
   };
   return {
-    version: 1 as const,
+    version: 2 as const,
     revision: snapshotRevision(core),
     createdAt,
     staleAt: new Date(createdAt.getTime() + OFFLINE_SNAPSHOT_STALE_MS),
-    expiresAt: new Date(createdAt.getTime() + OFFLINE_SNAPSHOT_MAX_AGE_MS),
+    expiresAt: priceExpiresAt,
     ...core,
   };
 }
@@ -263,6 +337,12 @@ async function recordConflict(input: OfflineSyncInput, userId: string, conflict:
       client_operation_id: input.clientOperationId,
       order_client_request_id: input.order.clientRequestId,
       checkout_idempotency_key: input.cash?.checkoutIdempotencyKey ?? null,
+      price_snapshot_reference: input.priceSnapshotReference,
+      offline_receipt_number: input.offlineReceipt?.number ?? null,
+      printed_subtotal_amount: input.offlineReceipt?.subtotal ?? null,
+      printed_total_amount: input.offlineReceipt?.total ?? null,
+      printed_tendered_amount: input.offlineReceipt?.cashReceived ?? null,
+      printed_change_amount: input.offlineReceipt?.change ?? null,
       status: "needs_review",
       conflict_code: conflict.code,
       conflict_details: conflict.message,
@@ -297,6 +377,29 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
   const branch = await db.query.branches.findFirst({ where: and(eq(branches.id, input.branchId), eq(branches.is_active, true)) });
   if (!branch) throw new OfflineConflict("user_branch_mismatch", "The selected branch is unavailable", input.kind === "cash_sale");
 
+  let trustedPricing: OfflinePricingPayload | null = null;
+  if (input.cash) {
+    const priceSnapshot = await db.query.offlinePriceSnapshots.findFirst({ where: eq(offlinePriceSnapshots.reference, input.priceSnapshotReference) });
+    if (!priceSnapshot || priceSnapshot.actor_user_id !== userId || priceSnapshot.branch_id !== input.branchId || priceSnapshot.register_id !== input.registerId || priceSnapshot.shift_id !== input.shiftId || priceSnapshot.revision !== input.priceSnapshotRevision) {
+      throw new OfflineConflict("price_snapshot_invalid", "The server-issued offline price snapshot is missing, invalid, or belongs to another scope", true);
+    }
+    if (priceSnapshot.expires_at.getTime() <= Date.now()) {
+      throw new OfflineConflict("price_snapshot_expired", "The server-issued offline price snapshot expired before synchronization", true);
+    }
+    try {
+      trustedPricing = JSON.parse(priceSnapshot.pricing_payload) as OfflinePricingPayload;
+    } catch {
+      throw new OfflineConflict("price_snapshot_invalid", "The stored offline price snapshot cannot be verified", true);
+    }
+    if (snapshotRevision(trustedPricing) !== priceSnapshot.revision) {
+      throw new OfflineConflict("price_snapshot_invalid", "The stored offline price snapshot failed its integrity check", true);
+    }
+    const receiptOwner = input.offlineReceipt ? await db.query.offlineSyncRecords.findFirst({ where: eq(offlineSyncRecords.offline_receipt_number, input.offlineReceipt.number) }) : null;
+    if (receiptOwner && receiptOwner.client_operation_id !== input.clientOperationId) {
+      throw new OfflineConflict("duplicate_already_accepted", "The offline receipt number is already associated with another operation", true);
+    }
+  }
+
   return db.transaction(async (tx) => {
     const shift = await tx.query.cashierShifts.findFirst({ where: eq(cashierShifts.id, input.shiftId) });
     if (!shift || shift.status !== "open" || shift.branch_id !== input.branchId || shift.cashier_user_id !== userId || shift.register_id !== input.registerId) {
@@ -305,6 +408,15 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
     const register = await tx.query.cashierRegisters.findFirst({ where: eq(cashierRegisters.id, input.registerId) });
     if (!register || !register.is_active || register.branch_id !== input.branchId) {
       throw new OfflineConflict("register_unavailable", "The cached register is no longer available", input.kind === "cash_sale");
+    }
+    if (input.cash && input.offlineReceipt) {
+      const expectedNumber = expectedOfflineReceiptNumber({ branchCode: branch.code, registerCode: register.code, branchId: input.branchId, registerId: input.registerId, deviceInstanceId: input.offlineReceipt.deviceInstanceId, checkoutIdempotencyKey: input.cash.checkoutIdempotencyKey, checkoutAt: input.offlineReceipt.checkoutAt });
+      const valuesMatch = input.offlineReceipt.number === expectedNumber
+        && input.offlineReceipt.subtotal === input.order.expectedTotal
+        && input.offlineReceipt.total === input.order.expectedTotal
+        && input.offlineReceipt.cashReceived === input.cash.tenderedAmount
+        && input.offlineReceipt.change === input.cash.tenderedAmount - input.offlineReceipt.total;
+      if (!valuesMatch) throw new OfflineConflict("receipt_payload_tampered", "The immutable offline cash receipt identity or financial values were modified", true);
     }
     if (input.order.diningTableId) {
       const table = await tx.query.restaurantTables.findFirst({
@@ -338,6 +450,8 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
       if (!item || item.category.branch_id !== input.branchId || !item.is_available || !item.category.is_active || !item.kitchenStation.is_active) {
         throw new OfflineConflict("menu_item_unavailable", `Menu item ${requested.menuItemId} is unavailable`, input.kind === "cash_sale");
       }
+      const trustedItem = trustedPricing?.items.find((entry) => entry.id === item.id) ?? null;
+      if (input.cash && !trustedItem) throw new OfflineConflict("price_snapshot_invalid", `Menu item ${item.code} is absent from the trusted price snapshot`, true);
       const variants = item.variants.filter((variant) => variant.is_available);
       const variant = requested.variantId ? variants.find((entry) => entry.id === requested.variantId) ?? null : variants.length === 1 ? variants[0] : null;
       if ((requested.variantId && !variant) || (!requested.variantId && variants.length > 1)) {
@@ -356,13 +470,21 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
         if (chosen.length < group.min_selections || chosen.length > group.max_selections) {
           throw new OfflineConflict("modifier_unavailable", `Modifier selection for ${group.code} is no longer valid`, input.kind === "cash_sale");
         }
-        selected.push(...chosen.map((option) => ({ id: option.id, name_en: option.name_en, name_ar: option.name_ar, price_delta: option.price_delta })));
+        selected.push(...chosen.map((option) => {
+          const trustedOption = trustedItem?.modifiers.find((entry) => entry.id === option.id);
+          if (input.cash && !trustedOption) throw new OfflineConflict("price_snapshot_invalid", `Modifier ${option.code} is absent from the trusted price snapshot`, true);
+          return { id: option.id, name_en: option.name_en, name_ar: option.name_ar, price_delta: trustedOption?.priceDelta ?? option.price_delta };
+        }));
       }
       if (ids.some((id) => !allowed.has(id))) throw new OfflineConflict("modifier_unavailable", `A modifier for ${item.code} is unavailable`, input.kind === "cash_sale");
-      prepared.push({ requested, menuItemId: item.id, productId: item.product_id, variantId: variant?.id ?? null, basePrice: variant?.price ?? item.base_price, stationId: item.kitchen_station_id, modifiers: selected });
+      const trustedBasePrice = variant
+        ? trustedItem?.variants.find((entry) => entry.id === variant.id)?.price
+        : trustedItem?.basePrice;
+      if (input.cash && trustedBasePrice == null) throw new OfflineConflict("price_snapshot_invalid", `Variant pricing for ${item.code} is absent from the trusted price snapshot`, true);
+      prepared.push({ requested, menuItemId: item.id, productId: item.product_id, variantId: variant?.id ?? null, basePrice: trustedBasePrice ?? variant?.price ?? item.base_price, stationId: item.kitchen_station_id, modifiers: selected });
     }
     const authoritativeTotal = prepared.reduce((sum, item) => sum + (item.basePrice + item.modifiers.reduce((value, modifier) => value + modifier.price_delta, 0)) * item.requested.quantity, 0);
-    if (authoritativeTotal !== input.order.expectedTotal && !allowReviewedPriceChange) {
+    if (authoritativeTotal !== input.order.expectedTotal && (Boolean(input.cash) || !allowReviewedPriceChange)) {
       throw new OfflineConflict("menu_price_changed", `Authoritative total changed from ${input.order.expectedTotal} to ${authoritativeTotal}`, input.kind === "cash_sale");
     }
     if (input.cash && input.cash.tenderedAmount < authoritativeTotal) {
@@ -386,6 +508,7 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
       customer_id: customerId,
       dining_table_id: input.order.diningTableId,
       client_request_id: input.order.clientRequestId,
+      offline_receipt_reference: input.offlineReceipt?.number ?? null,
       order_type: input.order.orderType,
       subtotal_amount: authoritativeTotal,
       discount_value: 0,
@@ -462,8 +585,8 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
     if (checkout) {
       let receipt = await tx.query.printJobs.findFirst({ where: and(eq(printJobs.order_id, order.id), eq(printJobs.document_type, "receipt"), eq(printJobs.is_reprint, false)) });
       if (!receipt) {
-        [receipt] = await tx.insert(printJobs).values({ order_id: order.id, register_id: register.id, shift_id: shift.id, requested_by: userId, document_type: "receipt", status: "requested", is_reprint: false, idempotency_key: `offline-receipt:${input.clientOperationId}`, copy_count: preference?.receipt_copies ?? 1, paper_width: preference?.paper_width ?? 80, language: preference?.language ?? "bilingual" }).returning();
-        await tx.insert(auditLogs).values({ branch_id: input.branchId, shift_id: shift.id, order_id: order.id, actor_user_id: userId, action: "offline.receipt.available", entity_type: "print_job", entity_id: String(receipt.id), details: JSON.stringify({ operationId: input.clientOperationId }) });
+        [receipt] = await tx.insert(printJobs).values({ order_id: order.id, register_id: register.id, shift_id: shift.id, requested_by: userId, document_type: "receipt", status: input.offlineReceipt?.previewedAt ? "previewed" : "requested", is_reprint: false, idempotency_key: input.offlineReceipt?.printIdempotencyKey ?? `offline-receipt:${input.clientOperationId}`, copy_count: preference?.receipt_copies ?? 1, paper_width: preference?.paper_width ?? 80, language: preference?.language ?? "bilingual", previewed_at: input.offlineReceipt?.previewedAt ? new Date(input.offlineReceipt.previewedAt) : null }).returning();
+        await tx.insert(auditLogs).values({ branch_id: input.branchId, shift_id: shift.id, order_id: order.id, actor_user_id: userId, action: input.offlineReceipt?.previewedAt ? "offline.receipt.previewed" : "offline.receipt.available", entity_type: "print_job", entity_id: String(receipt.id), details: JSON.stringify({ operationId: input.clientOperationId, offlineReceiptNumber: input.offlineReceipt?.number ?? null, physicalPrintConfirmed: false }) });
       }
       receiptJobId = receipt.id;
     }
@@ -476,6 +599,12 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
       client_operation_id: input.clientOperationId,
       order_client_request_id: input.order.clientRequestId,
       checkout_idempotency_key: input.cash?.checkoutIdempotencyKey ?? null,
+      price_snapshot_reference: input.priceSnapshotReference,
+      offline_receipt_number: input.offlineReceipt?.number ?? null,
+      printed_subtotal_amount: input.offlineReceipt?.subtotal ?? null,
+      printed_total_amount: input.offlineReceipt?.total ?? null,
+      printed_tendered_amount: input.offlineReceipt?.cashReceived ?? null,
+      printed_change_amount: input.offlineReceipt?.change ?? null,
       status: "accepted",
       order_id: order.id,
       checkout_id: checkout?.id ?? null,

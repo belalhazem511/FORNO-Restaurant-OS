@@ -100,6 +100,7 @@ export function ThermalDocument({ document, copyNumber, locale }: { document: Tr
     <dl className={styles.meta}>
       <Meta label={l("orderNumber")} value={document.order.number} />
       {document.financial && <Meta label={l("receiptNumber")} value={document.financial.receiptNumber} />}
+      {document.financial?.offlineReceiptReference && <Meta label={l("offlineReceiptReference")} value={document.financial.offlineReceiptReference} />}
       <Meta label={l("dateTime")} value={new Intl.DateTimeFormat(language === "en" ? "en-EG" : "ar-EG", { dateStyle: "short", timeStyle: "short", timeZone: "Africa/Cairo" }).format(new Date(document.financial?.transactionAt ?? document.order.createdAt))} />
       <Meta label="" value={typeLabel} />
       {document.station && <Meta label={l("station")} value={localized(document.station, language) ?? document.station.code} />}

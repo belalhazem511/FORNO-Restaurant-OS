@@ -9,6 +9,7 @@ const DB_NAME = "forno-offline-pos";
 const SNAPSHOTS = "snapshots";
 const QUEUE = "queue";
 const DOCUMENTS = "documents";
+const META = "meta";
 
 function requestResult<T>(request: IDBRequest<T>) {
   return new Promise<T>((resolve, reject) => {
@@ -34,6 +35,8 @@ export interface OfflineStore {
   listQueue(): Promise<OfflineQueueEntry[]>;
   putDocument(document: OfflineDocument): Promise<void>;
   getDocument(id: string): Promise<OfflineDocument | null>;
+  getOrCreateDeviceInstanceId(): Promise<string>;
+  markReceiptPreview(operationId: string, previewedAt: string): Promise<void>;
 }
 
 export class IndexedDbOfflineStore implements OfflineStore {
@@ -53,6 +56,7 @@ export class IndexedDbOfflineStore implements OfflineStore {
           queue.createIndex("userBranch", ["userId", "branchId"]);
         }
         if (!database.objectStoreNames.contains(DOCUMENTS)) database.createObjectStore(DOCUMENTS, { keyPath: "id" });
+        if (!database.objectStoreNames.contains(META)) database.createObjectStore(META, { keyPath: "key" });
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error ?? new Error("Unable to open FORNO offline storage"));
@@ -131,12 +135,39 @@ export class IndexedDbOfflineStore implements OfflineStore {
     await done;
     return value ?? null;
   }
+
+  async getOrCreateDeviceInstanceId() {
+    const database = await this.open();
+    const transaction = database.transaction(META, "readwrite");
+    const done = transactionDone(transaction);
+    const store = transaction.objectStore(META);
+    const existing = await requestResult<{ key: string; value: string } | undefined>(store.get("device-instance-id"));
+    if (existing?.value) { await done; return existing.value; }
+    if (!globalThis.crypto?.randomUUID) throw new Error("Secure device identity is unavailable in this browser");
+    const value = crypto.randomUUID();
+    store.put({ key: "device-instance-id", value });
+    await done;
+    return value;
+  }
+
+  async markReceiptPreview(operationId: string, previewedAt: string) {
+    const database = await this.open();
+    const transaction = database.transaction(QUEUE, "readwrite");
+    const done = transactionDone(transaction);
+    const store = transaction.objectStore(QUEUE);
+    const entry = await requestResult<OfflineQueueEntry | undefined>(store.get(operationId));
+    if (entry?.payload.offlineReceipt && !entry.payload.offlineReceipt.previewedAt) {
+      store.put({ ...entry, payload: { ...entry.payload, offlineReceipt: { ...entry.payload.offlineReceipt, previewedAt } }, updatedAt: previewedAt });
+    }
+    await done;
+  }
 }
 
 export class MemoryOfflineStore implements OfflineStore {
   readonly snapshots = new Map<string, OfflineBootstrapSnapshot>();
   readonly queue = new Map<string, OfflineQueueEntry>();
   readonly documents = new Map<string, OfflineDocument>();
+  deviceInstanceId = "00000000-0000-4000-8000-000000000001";
 
   async putSnapshot(snapshot: OfflineBootstrapSnapshot) { this.snapshots.set(`${snapshot.userId}:${snapshot.branch.id}`, structuredClone(snapshot)); }
   async getSnapshot(userId: string, branchId: number) { return structuredClone(this.snapshots.get(`${userId}:${branchId}`) ?? null); }
@@ -146,6 +177,8 @@ export class MemoryOfflineStore implements OfflineStore {
   async listQueue() { return [...this.queue.values()].map((value) => structuredClone(value)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
   async putDocument(document: OfflineDocument) { this.documents.set(document.id, structuredClone(document)); }
   async getDocument(id: string) { return structuredClone(this.documents.get(id) ?? null); }
+  async getOrCreateDeviceInstanceId() { return this.deviceInstanceId; }
+  async markReceiptPreview(operationId: string, previewedAt: string) { const entry = this.queue.get(operationId); if (entry?.payload.offlineReceipt && !entry.payload.offlineReceipt.previewedAt) this.queue.set(operationId, structuredClone({ ...entry, payload: { ...entry.payload, offlineReceipt: { ...entry.payload.offlineReceipt, previewedAt } }, updatedAt: previewedAt })); }
 }
 
 let sharedStore: IndexedDbOfflineStore | null = null;

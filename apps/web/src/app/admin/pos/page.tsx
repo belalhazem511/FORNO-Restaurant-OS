@@ -57,9 +57,11 @@ import { useTRPC } from "@/lib/trpc/client";
 import type { RouterOutputs } from "@/lib/trpc/router";
 import { PrintActions } from "@/components/printing/print-actions";
 import { useOffline } from "@/components/offline/offline-provider";
-import { buildOfflineKots, buildOfflineSummary } from "@/lib/offline/documents";
+import { OfflineReceiptAction } from "@/components/offline/offline-receipt-action";
+import { buildOfflineCashReceipt, buildOfflineKots, buildOfflineSummary, offlineReceiptNumber } from "@/lib/offline/documents";
 import { createQueueEntry, snapshotAgeState } from "@/lib/offline/queue";
-import { newOfflineId, type OfflineBootstrapSnapshot, type OfflineKotDocument } from "@/lib/offline/types";
+import { offlineStore } from "@/lib/offline/storage";
+import { newOfflineId, type OfflineBootstrapSnapshot, type OfflineCashReceiptDocument, type OfflineKotDocument } from "@/lib/offline/types";
 
 type RestaurantBranch = RouterOutputs["restaurant"]["model"][number];
 type MenuCategory = RestaurantBranch["menuCategories"][number];
@@ -73,6 +75,11 @@ type OfflineSuccess = {
   kots: OfflineKotDocument[];
   provisionalTotal: number;
   cashReceived: number | null;
+  cart: CartLine[];
+  areaId: number | null;
+  tableId: number | null;
+  delivery: { name: string; phone: string; address: string } | null;
+  receipt: OfflineCashReceiptDocument | null;
 };
 
 function createRequestId() {
@@ -93,7 +100,7 @@ export default function POSPage() {
   const customersQuery = useQuery(trpc.customers.list.queryOptions());
   const branches = restaurantQuery.data ?? [];
   const onlineBranch = branches.find((entry) => entry.is_active) ?? branches[0];
-  const cachedSnapshot = offline.snapshots.find((entry) => entry.userId === offline.userId && (!onlineBranch || entry.branch.id === onlineBranch.id)) ?? null;
+  const cachedSnapshot = offline.snapshots.find((entry) => entry.version === 2 && entry.userId === offline.userId && (!onlineBranch || entry.branch.id === onlineBranch.id)) ?? null;
   const branch = onlineBranch ?? cachedSnapshot?.branch;
   const isOfflineMode = !offline.serverReachable;
   const customers = customersQuery.data ?? [];
@@ -295,7 +302,9 @@ export default function POSPage() {
       const payload: OfflineSuccess["payload"] = {
         kind: "order",
         clientOperationId: operationId,
-        snapshotRevision: cachedSnapshot.revision,
+          snapshotRevision: cachedSnapshot.revision,
+          priceSnapshotReference: cachedSnapshot.priceSnapshot.reference,
+          priceSnapshotRevision: cachedSnapshot.priceSnapshot.revision,
         branchId: cachedSnapshot.branch.id,
         registerId: cachedSnapshot.register.id,
         shiftId: cachedSnapshot.shift.id,
@@ -309,13 +318,14 @@ export default function POSPage() {
           items: cart.map((line) => ({ menuItemId: line.menuItemId, variantId: line.variantId, modifierOptionIds: line.modifiers.map((modifier) => modifier.id), quantity: line.quantity, notes: line.notes || null })),
         },
         cash: null,
+        offlineReceipt: null,
         kotAcknowledgements: kots.map((kot) => ({ stationId: kot.stationId, idempotencyKey: kot.id, previewed: true, acknowledged: false })),
       };
       await offline.enqueue(createQueueEntry({ payload, userId: offline.userId }), [
         ...kots.map((kot) => ({ ...kot, previewed: true })),
         buildOfflineSummary({ operationId, orderReference, orderType, cart, provisionalTotal: cartTotal, cashReceived: null }),
       ]);
-      setOfflineSuccess({ operationId, orderReference, payload, kots, provisionalTotal: cartTotal, cashReceived: null });
+      setOfflineSuccess({ operationId, orderReference, payload, kots, provisionalTotal: cartTotal, cashReceived: null, cart: structuredClone(cart), areaId, tableId, delivery: orderType === "delivery" ? { name: deliveryName, phone: deliveryPhone, address: deliveryAddress } : null, receipt: null });
       setCart([]);
       return;
     }
@@ -380,15 +390,16 @@ export default function POSPage() {
       <Card className="mx-auto max-w-2xl border-amber-500/50">
         <CardContent className="space-y-5 p-7 text-center">
           <Badge className="bg-amber-500 text-black">OFFLINE — PENDING SYNC</Badge>
-          <div><h2 className="text-2xl font-bold">{isArabic ? "طلب مؤقت محفوظ بأمان" : "Provisional order stored safely"}</h2><p className="text-muted-foreground">{isArabic ? "هذا ملخص طلب غير مدفوع وليس إيصالاً نهائياً." : "This is an unpaid pending order summary, not a final receipt."}</p></div>
+          <div><h2 className="text-2xl font-bold">{isArabic ? "طلب دون اتصال محفوظ بأمان" : "Offline order stored safely"}</h2><p className="text-muted-foreground">{offlineSuccess.receipt ? (isArabic ? "تم استلام النقد محلياً. الإيصال النقدي دون اتصال متاح الآن والمزامنة ما زالت معلقة." : "Cash was received locally. The Offline Cash Receipt is available now and server synchronization is still pending.") : (isArabic ? "هذا ملخص طلب غير مدفوع وليس إيصالاً نهائياً." : "This is an unpaid pending order summary, not a final receipt.")}</p></div>
           <p className="font-mono text-sm">{offlineSuccess.orderReference}</p>
           <div className="grid gap-2 sm:grid-cols-3">{offlineSuccess.kots.map((kot) => <Button key={kot.id} variant="outline" className="min-h-12" onClick={() => setPreviewKot(kot)}>{isArabic ? kot.station.name_ar : kot.station.name_en} KOT</Button>)}</div>
-          {synced?.state === "synced" ? <div className="rounded-lg bg-emerald-50 p-4 text-emerald-900"><p className="font-bold">{isArabic ? "تمت المزامنة" : "Synchronized"}</p><Link className="underline" href={`/admin/orders/${synced.authoritativeOrderId}`}>{isArabic ? `الطلب الرسمي #${synced.authoritativeOrderId}` : `Authoritative order #${synced.authoritativeOrderId}`}</Link></div> : <div className="rounded-lg bg-amber-50 p-4 text-amber-900">{isArabic ? "سيعيد الخادم التسعير والتحقق قبل القبول." : "The server will reprice and revalidate this order before acceptance."}</div>}
+          {synced?.state === "synced" ? <div className="rounded-lg bg-emerald-50 p-4 text-emerald-900"><p className="font-bold">{isArabic ? "تمت المزامنة" : "Synchronized"}</p><Link className="underline" href={`/admin/orders/${synced.authoritativeOrderId}`}>{isArabic ? `الطلب الرسمي #${synced.authoritativeOrderId}` : `Authoritative order #${synced.authoritativeOrderId}`}</Link></div> : <div className="rounded-lg bg-amber-50 p-4 text-amber-900">{isArabic ? "سيعيد الخادم التحقق من النسخة السعرية الآمنة قبل القبول." : "The server will verify the secure issued price snapshot before acceptance."}</div>}
           {!offlineSuccess.cashReceived && synced?.state !== "synced" && <Button size="lg" className="min-h-14 w-full" onClick={() => setOfflineCashOpen(true)}>{isArabic ? "دفع نقدي دون اتصال" : "Offline cash checkout"}</Button>}
+          {offlineSuccess.receipt && <OfflineReceiptAction documentId={offlineSuccess.receipt.id} label={isArabic ? "طباعة إيصال نقدي دون اتصال" : "Print Offline Cash Receipt"} />}
           <div className="flex flex-wrap justify-center gap-2"><Button onClick={startNewOrder}>{isArabic ? "طلب جديد" : "New order"}</Button><Button variant="outline" asChild><Link href="/admin/sync">{isArabic ? "مركز المزامنة" : "Sync Center"}</Link></Button></div>
         </CardContent>
       </Card>
-      <OfflineCashDialog open={offlineCashOpen} onOpenChange={setOfflineCashOpen} sale={offlineSuccess} onQueued={(cashReceived) => { setOfflineSuccess((current) => current ? { ...current, cashReceived } : current); setOfflineCashOpen(false); }} />
+      {cachedSnapshot && <OfflineCashDialog open={offlineCashOpen} onOpenChange={setOfflineCashOpen} sale={offlineSuccess} snapshot={cachedSnapshot} onQueued={(receipt) => { setOfflineSuccess((current) => current ? { ...current, cashReceived: receipt.financial.cashReceived, receipt } : current); setOfflineCashOpen(false); }} />}
       <OfflineKotDialog document={previewKot} onOpenChange={(open) => { if (!open) setPreviewKot(null); }} />
     </>;
   }
@@ -532,45 +543,61 @@ function OfflineKotDialog({ document, onOpenChange }: { document: OfflineKotDocu
   </Dialog>;
 }
 
-function OfflineCashDialog({ open, onOpenChange, sale, onQueued }: {
+function OfflineCashDialog({ open, onOpenChange, sale, snapshot, onQueued }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   sale: OfflineSuccess;
-  onQueued: (cashReceived: number) => void;
+  snapshot: OfflineBootstrapSnapshot;
+  onQueued: (receipt: OfflineCashReceiptDocument) => void;
 }) {
   const locale = useLocale();
   const isArabic = locale.startsWith("ar");
   const offline = useOffline();
   const [received, setReceived] = useState((sale.provisionalTotal / 100).toFixed(2));
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
   const receivedMinor = Math.round(Number(received || 0) * 100);
   const change = Math.max(0, receivedMinor - sale.provisionalTotal);
 
   const confirm = async () => {
     setError("");
-    if (!offline.userId || receivedMinor < sale.provisionalTotal) {
-      setError(isArabic ? "المبلغ النقدي لا يغطي الإجمالي المؤقت." : "Cash received does not cover the provisional total.");
+    if (new Date(snapshot.priceSnapshot.expiresAt).getTime() <= Date.now()) {
+      setError(isArabic ? "انتهت صلاحية النسخة السعرية الآمنة. اتصل بالخادم لتحديثها قبل استلام النقد." : "The secure price snapshot expired. Reconnect and refresh it before accepting cash.");
       return;
     }
-    const operationId = newOfflineId("offline-cash");
-    const payload: OfflineSuccess["payload"] = {
-      ...sale.payload,
-      kind: "cash_sale",
-      clientOperationId: operationId,
-      cash: { checkoutIdempotencyKey: newOfflineId("offline-checkout"), tenderedAmount: receivedMinor },
-      kotAcknowledgements: sale.kots.map((kot) => ({ stationId: kot.stationId, idempotencyKey: kot.id, previewed: true, acknowledged: false })),
-    };
-    await offline.enqueue(createQueueEntry({ payload, userId: offline.userId, dependencies: [sale.operationId] }), [
-      buildOfflineSummary({ operationId, orderReference: sale.orderReference, orderType: sale.payload.order.orderType, cart: [], provisionalTotal: sale.provisionalTotal, cashReceived: receivedMinor }),
-    ]);
-    onQueued(receivedMinor);
+    if (!offline.userId || receivedMinor < sale.provisionalTotal) {
+      setError(isArabic ? "المبلغ النقدي لا يغطي إجمالي الإيصال." : "Cash received does not cover the receipt total.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const checkoutAt = new Date().toISOString();
+      const checkoutIdempotencyKey = newOfflineId("offline-checkout");
+      const deviceInstanceId = await offlineStore().getOrCreateDeviceInstanceId();
+      const number = await offlineReceiptNumber({ branchId: snapshot.branch.id, branchCode: snapshot.branch.code, registerId: snapshot.register.id, registerCode: snapshot.register.code, deviceInstanceId, checkoutIdempotencyKey, checkoutAt });
+      const printIdempotencyKey = `offline-receipt-print:${sale.operationId}`;
+      const receipt = buildOfflineCashReceipt({ operationId: sale.operationId, orderReference: sale.orderReference, offlineReceiptNumber: number, checkoutIdempotencyKey, printIdempotencyKey, checkoutAt, orderType: sale.payload.order.orderType, areaId: sale.areaId, tableId: sale.tableId, delivery: sale.delivery, cart: sale.cart, total: sale.provisionalTotal, cashReceived: receivedMinor, snapshot });
+      const payload: OfflineSuccess["payload"] = {
+        ...sale.payload,
+        kind: "cash_sale",
+        cash: { checkoutIdempotencyKey, tenderedAmount: receivedMinor },
+        offlineReceipt: { number, deviceInstanceId, checkoutAt, subtotal: receipt.financial.subtotal, total: receipt.financial.total, cashReceived: receipt.financial.cashReceived, change: receipt.financial.change, printIdempotencyKey, previewedAt: null },
+        kotAcknowledgements: sale.kots.map((kot) => ({ stationId: kot.stationId, idempotencyKey: kot.id, previewed: true, acknowledged: false })),
+      };
+      await offline.enqueue(createQueueEntry({ payload, userId: offline.userId, now: new Date(checkoutAt) }), [receipt]);
+      onQueued(receipt);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
   };
 
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent className="max-w-lg">
-      <DialogHeader><DialogTitle>{isArabic ? "دفع نقدي دون اتصال" : "Offline cash checkout"}</DialogTitle><DialogDescription>{isArabic ? "مؤقت فقط. لن يتوفر إيصال مدفوع حتى يقبل الخادم المزامنة." : "Provisional only. No paid receipt is available until the server accepts synchronization."}</DialogDescription></DialogHeader>
-      <div className="space-y-4"><div className="rounded-lg bg-muted p-4 text-center"><p className="text-sm text-muted-foreground">{isArabic ? "الإجمالي المؤقت" : "Provisional total"}</p><strong className="text-2xl">{formatCurrency(sale.provisionalTotal, locale)}</strong></div><Input inputMode="decimal" label={isArabic ? "النقد المستلم" : "Cash received"} value={received} onChange={(event) => setReceived(event.target.value)} /><p className="font-semibold">{isArabic ? "الباقي التقديري" : "Estimated change"}: {formatCurrency(change, locale)}</p><div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">{isArabic ? "قد يتغير الإجمالي بعد إعادة التسعير. أي تعارض مالي ينتقل إلى مراجعة المدير ولا يُحذف." : "The total may change after server repricing. Any financial conflict moves to manager review and is never discarded."}</div>{error && <p role="alert" className="text-sm text-destructive">{error}</p>}</div>
-      <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{isArabic ? "إلغاء" : "Cancel"}</Button><Button disabled={receivedMinor < sale.provisionalTotal} onClick={() => void confirm()}>{isArabic ? "حفظ الدفع النقدي" : "Store cash checkout"}</Button></DialogFooter>
+      <DialogHeader><DialogTitle>{isArabic ? "دفع نقدي دون اتصال" : "Offline cash checkout"}</DialogTitle><DialogDescription>{isArabic ? "سيتم تثبيت المبالغ وإنشاء إيصال نقدي قابل للطباعة فور استلام النقد." : "Amounts will be frozen into an immediately printable Offline Cash Receipt when cash is accepted."}</DialogDescription></DialogHeader>
+      <div className="space-y-4"><div className="rounded-lg bg-muted p-4 text-center"><p className="text-sm text-muted-foreground">{isArabic ? "إجمالي الإيصال" : "Receipt total"}</p><strong className="text-2xl">{formatCurrency(sale.provisionalTotal, locale)}</strong></div><Input inputMode="decimal" label={isArabic ? "النقد المستلم" : "Cash received"} value={received} onChange={(event) => setReceived(event.target.value)} /><p className="font-semibold">{isArabic ? "الباقي" : "Change"}: {formatCurrency(change, locale)}</p><div className="rounded-lg border border-blue-300 bg-blue-50 p-3 text-sm text-blue-950">{isArabic ? "الأسعار معتمدة من نسخة خادم آمنة وصالحة حتى" : "Prices are bound to a secure server-issued snapshot valid until"} {new Date(snapshot.priceSnapshot.expiresAt).toLocaleString(locale)}. {isArabic ? "ستبقى القيم المطبوعة ثابتة، وأي تعارض ينتقل إلى مراجعة المدير ولا يُحذف." : "Printed values remain fixed; any conflict moves to manager review and is never discarded."}</div>{error && <p role="alert" className="text-sm text-destructive">{error}</p>}</div>
+      <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{isArabic ? "إلغاء" : "Cancel"}</Button><Button disabled={saving || receivedMinor < sale.provisionalTotal} onClick={() => void confirm()}>{saving ? (isArabic ? "جارٍ الحفظ…" : "Saving…") : (isArabic ? "استلام النقد وإنشاء الإيصال" : "Accept cash and create receipt")}</Button></DialogFooter>
     </DialogContent>
   </Dialog>;
 }

@@ -1,5 +1,5 @@
-const SHELL_CACHE = "forno-pos-shell-v2";
-const STATIC_CACHE = "forno-pos-static-v2";
+const SHELL_CACHE = "forno-pos-shell-v3";
+const STATIC_CACHE = "forno-pos-static-v3";
 // Authenticated HTML is cached only after a successful online navigation. The
 // install step contains public assets exclusively, avoiding cached redirects or
 // authenticated API data.
@@ -38,6 +38,15 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(fetch(request).then(async (response) => {
       if (response.ok) await (await caches.open(SHELL_CACHE)).put(url.pathname, response.clone());
       return response;
-    }).catch(async () => (await caches.open(SHELL_CACHE)).match(url.pathname) || (await caches.open(SHELL_CACHE)).match("/admin/pos")));
+    }).catch(async () => {
+      const cache = await caches.open(SHELL_CACHE);
+      const exact = await cache.match(url.pathname);
+      if (exact) return exact;
+      if (url.pathname.startsWith("/offline-print/")) {
+        const printShell = await cache.match("/offline-print/__warmup__");
+        if (printShell) return printShell;
+      }
+      return cache.match("/admin/pos");
+    }));
   }
 });

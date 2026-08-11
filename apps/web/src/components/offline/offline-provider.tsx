@@ -113,6 +113,17 @@ export function OfflineProvider({ children }: { children: React.ReactNode }) {
     };
   }, [ensureEngine, health, refresh, syncNow]);
 
+  useEffect(() => {
+    if (!serverReachable || typeof document === "undefined") return;
+    const frame = document.createElement("iframe");
+    frame.hidden = true;
+    frame.title = "Offline receipt print shell cache";
+    frame.src = `${process.env.NEXT_PUBLIC_BASE_PATH || ""}/offline-print/__warmup__`;
+    frame.onload = () => window.setTimeout(() => frame.remove(), 500);
+    document.body.appendChild(frame);
+    return () => frame.remove();
+  }, [serverReachable]);
+
   const pendingCount = queue.filter((entry) => entry.state !== "synced").length;
   const financialPendingCount = queue.filter((entry) => entry.financial && entry.state !== "synced").length;
   const needsReviewCount = queue.filter((entry) => entry.state === "needs_review").length;

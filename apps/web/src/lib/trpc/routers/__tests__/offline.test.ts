@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
+import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 
@@ -19,15 +20,24 @@ let registerId: number;
 let shiftId: number;
 let tableId: number;
 let revision: string;
+let priceSnapshotReference: string;
+let priceSnapshotRevision: string;
 let items: Array<{ id: number; stationId: number; price: number }>;
 let sequence = 0;
 
 function operation(overrides: Record<string, unknown> = {}) {
   const id = ++sequence;
+  const checkoutIdempotencyKey = `offline-checkout-${id.toString().padStart(4, "0")}`;
+  const checkoutAt = "2026-08-11T12:00:00.000Z";
+  const deviceInstanceId = "00000000-0000-4000-8000-000000000001";
+  const digest = createHash("sha256").update(`${branchId}:${registerId}:${deviceInstanceId}:${checkoutIdempotencyKey}`).digest("hex").slice(0, 16).toUpperCase();
+  const total = items.reduce((sum, item) => sum + item.price, 0);
   const base = {
     kind: "cash_sale" as const,
     clientOperationId: `offline-operation-${id.toString().padStart(4, "0")}`,
     snapshotRevision: revision,
+    priceSnapshotReference,
+    priceSnapshotRevision,
     branchId,
     registerId,
     shiftId,
@@ -37,10 +47,11 @@ function operation(overrides: Record<string, unknown> = {}) {
       diningTableId: null as number | null,
       deliveryAddress: null,
       deliveryContact: null,
-      expectedTotal: items.reduce((sum, item) => sum + item.price, 0),
+      expectedTotal: total,
       items: items.map((item) => ({ menuItemId: item.id, variantId: null, modifierOptionIds: [], quantity: 1, notes: item.stationId === items[0].stationId ? "No onions" : null })),
     },
-    cash: { checkoutIdempotencyKey: `offline-checkout-${id.toString().padStart(4, "0")}`, tenderedAmount: 100_000 },
+    cash: { checkoutIdempotencyKey, tenderedAmount: 100_000 },
+    offlineReceipt: { number: `OFF-OFFLINE-OFFLINEP-20260811-${digest}`, deviceInstanceId, checkoutAt, subtotal: total, total, cashReceived: 100_000, change: 100_000 - total, printIdempotencyKey: `offline-receipt-print-${id.toString().padStart(4, "0")}`, previewedAt: checkoutAt },
     kotAcknowledgements: items.map((item) => ({ stationId: item.stationId, idempotencyKey: `offline-kot-${id}-${item.stationId}`, previewed: true, acknowledged: false })),
   };
   return { ...base, ...overrides };
@@ -86,7 +97,10 @@ beforeAll(async () => {
     const [item] = await db.insert(schema.menuItems).values({ category_id: category.id, kitchen_station_id: station.id, product_id: product.id, code: `${code}-ITEM`, name_en: `${code} item`, name_ar: code, base_price: product.price, is_available: true, sort_order: 1 }).returning();
     items.push({ id: item.id, stationId: station.id, price: item.base_price });
   }
-  revision = (await cashier.bootstrap({ branchId })).revision;
+  const snapshot = await cashier.bootstrap({ branchId });
+  revision = snapshot.revision;
+  priceSnapshotReference = snapshot.priceSnapshot.reference;
+  priceSnapshotRevision = snapshot.priceSnapshot.revision;
 });
 
 afterAll(async () => { await pg.close(); });
@@ -94,7 +108,7 @@ afterAll(async () => { await pg.close(); });
 describe("offline POS bootstrap and authoritative synchronization", () => {
   it("returns a scoped, versioned snapshot with an active shift, register, menu, stations, tables, permissions, and printing preferences", async () => {
     const snapshot = await cashier.bootstrap({ branchId });
-    expect(snapshot.version).toBe(1);
+    expect(snapshot.version).toBe(2);
     expect(snapshot.userId).toBe("offline-cashier");
     expect(snapshot.branch.menuCategories).toHaveLength(3);
     expect(snapshot.branch.kitchenStations.map((station) => station.code)).toEqual(["PIZZA", "DONER", "CAFE"]);
@@ -102,6 +116,7 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     expect(snapshot.register.id).toBe(registerId);
     expect(snapshot.permissions).toContain("order:create");
     expect(snapshot.printing).toEqual({ paperWidth: 80, language: "bilingual", receiptCopies: 1, kotCopies: 1 });
+    expect(snapshot.priceSnapshot.reference).toStartWith(`OPS-${branchId}-`);
     expect(new Date(snapshot.expiresAt).getTime()).toBeGreaterThan(new Date(snapshot.staleAt).getTime());
   });
 
@@ -134,24 +149,69 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     expect((await db.select().from(schema.printJobs).where(eq(schema.printJobs.order_id, first.orderId!))).filter((job) => job.document_type === "kot")).toHaveLength(3);
   });
 
-  it("rejects tampered cached totals into Needs Review before creating an order", async () => {
+  it("honors an unexpired server-issued price snapshot and exactly matches the printed offline receipt", async () => {
+    const input = operation();
+    const originalPrice = items[0].price;
+    await db.update(schema.menuItems).set({ base_price: originalPrice + 5_000 }).where(eq(schema.menuItems.id, items[0].id));
+    const result = await cashier.sync(input);
+    expect(result.status).toBe("accepted");
+    const order = await db.query.orders.findFirst({ where: eq(schema.orders.id, result.orderId!) });
+    const checkout = await db.query.orderCheckouts.findFirst({ where: eq(schema.orderCheckouts.id, result.checkoutId!) });
+    expect(order?.total_amount).toBe(input.offlineReceipt.total);
+    expect(checkout?.payable_amount).toBe(input.offlineReceipt.total);
+    expect(order?.offline_receipt_reference).toBe(input.offlineReceipt.number);
+    await db.update(schema.menuItems).set({ base_price: originalPrice }).where(eq(schema.menuItems.id, items[0].id));
+  });
+
+  it("rejects expired or foreign price snapshot references and preserves printed values for review", async () => {
+    const expired = operation();
+    await db.update(schema.offlinePriceSnapshots).set({ expires_at: new Date("2020-01-01T00:00:00Z") }).where(eq(schema.offlinePriceSnapshots.reference, expired.priceSnapshotReference));
+    const expiredResult = await cashier.sync(expired);
+    expect(expiredResult.status).toBe("needs_review");
+    expect(expiredResult.conflict?.code).toBe("price_snapshot_expired");
+    const record = await db.query.offlineSyncRecords.findFirst({ where: eq(schema.offlineSyncRecords.client_operation_id, expired.clientOperationId) });
+    expect(record?.offline_receipt_number).toBe(expired.offlineReceipt.number);
+    expect(record?.printed_tendered_amount).toBe(expired.offlineReceipt.cashReceived);
+    const refreshed = await cashier.bootstrap({ branchId });
+    priceSnapshotReference = refreshed.priceSnapshot.reference;
+    priceSnapshotRevision = refreshed.priceSnapshot.revision;
+    revision = refreshed.revision;
+    const foreign = operation({ priceSnapshotReference: "OPS-999-missing-reference" });
+    const foreignResult = await cashier.sync(foreign);
+    expect(foreignResult.conflict?.code).toBe("price_snapshot_invalid");
+  });
+
+  it("audits one deterministic offline receipt preview without claiming physical printing", async () => {
+    const input = operation();
+    const result = await cashier.sync(input);
+    const jobs = await db.select().from(schema.printJobs).where(and(eq(schema.printJobs.order_id, result.orderId!), eq(schema.printJobs.document_type, "receipt")));
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].idempotency_key).toBe(input.offlineReceipt.printIdempotencyKey);
+    expect(jobs[0].status).toBe("previewed");
+    expect(jobs[0].acknowledged_at).toBeNull();
+    const audits = await db.select().from(schema.auditLogs).where(and(eq(schema.auditLogs.order_id, result.orderId!), eq(schema.auditLogs.action, "offline.receipt.previewed")));
+    expect(audits).toHaveLength(1);
+    expect(audits[0].details).toContain('"physicalPrintConfirmed":false');
+  });
+
+  it("rejects tampered receipt totals into Needs Review before creating an order", async () => {
     const input = operation();
     input.order.expectedTotal -= 500;
     const result = await cashier.sync(input);
     expect(result.status).toBe("needs_review");
-    expect(result.conflict?.code).toBe("menu_price_changed");
+    expect(result.conflict?.code).toBe("receipt_payload_tampered");
     expect(result.conflict?.category).toBe("financial");
     expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
     expect(await db.select().from(schema.offlineSyncRecords).where(eq(schema.offlineSyncRecords.client_operation_id, input.clientOperationId))).toHaveLength(1);
   });
 
-  it("moves insufficient cash to financial Needs Review and never writes a partial payment", async () => {
+  it("moves tampered cash tendering to financial Needs Review and never writes a partial payment", async () => {
     const paymentsBefore = (await db.select().from(schema.orderPayments)).length;
     const input = operation();
     input.cash!.tenderedAmount = input.order.expectedTotal - 1;
     const result = await cashier.sync(input);
     expect(result.status).toBe("needs_review");
-    expect(result.conflict?.code).toBe("cash_insufficient");
+    expect(result.conflict?.code).toBe("receipt_payload_tampered");
     expect(await db.select().from(schema.orderPayments)).toHaveLength(paymentsBefore);
     expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
   });
@@ -178,14 +238,16 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
 
   it("requires manager review with a durable audit reason, then revalidates the same operation", async () => {
     const input = operation();
-    input.order.expectedTotal -= 100;
+    await db.update(schema.cashierShifts).set({ status: "closed", closed_at: new Date() }).where(eq(schema.cashierShifts.id, shiftId));
     const conflict = await cashier.sync(input);
     await expect(cashier.resolveReview({ recordId: conflict.conflict!.recordId!, reason: "Cashier self approval" })).rejects.toThrow("Manager");
-    await manager.resolveReview({ recordId: conflict.conflict!.recordId!, reason: "Approved server repricing after cash verification" });
+    await manager.resolveReview({ recordId: conflict.conflict!.recordId!, reason: "Verified the original printed cash receipt and reopened the shift" });
+    await db.update(schema.cashierShifts).set({ status: "open", closed_at: null }).where(eq(schema.cashierShifts.id, shiftId));
     const accepted = await cashier.sync(input);
     expect(accepted.status).toBe("accepted");
     const record = await db.query.offlineSyncRecords.findFirst({ where: eq(schema.offlineSyncRecords.client_operation_id, input.clientOperationId) });
-    expect(record?.resolution_reason).toBe("Approved server repricing after cash verification");
+    expect(record?.resolution_reason).toBe("Verified the original printed cash receipt and reopened the shift");
+    expect(record?.printed_total_amount).toBe(input.offlineReceipt.total);
     expect((await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.action, "offline.sync.review_resolved"))).length).toBeGreaterThan(0);
   });
 
@@ -194,6 +256,6 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     const input = operation({ branchId: otherBranchId });
     const result = await outsider.sync(input);
     expect(result.status).toBe("needs_review");
-    expect(result.conflict?.code).toBe("shift_closed");
+    expect(result.conflict?.code).toBe("price_snapshot_invalid");
   });
 });

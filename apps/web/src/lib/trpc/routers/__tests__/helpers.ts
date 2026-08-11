@@ -34,6 +34,7 @@ const TABLES: PgTable[] = [
   schema.orderCancellations,
   schema.auditLogs,
   schema.printJobs,
+  schema.offlinePriceSnapshots,
   schema.offlineSyncRecords,
   schema.transactions,
 ];
@@ -70,6 +71,7 @@ function tableToDDL(table: PgTable): string {
 export const SCHEMA_DDL = `${TABLES.map(tableToDDL).join("\n\n")}
 
 CREATE UNIQUE INDEX IF NOT EXISTS orders_client_request_uidx ON orders (client_request_id);
+CREATE UNIQUE INDEX IF NOT EXISTS orders_offline_receipt_reference_uidx ON orders (offline_receipt_reference);
 CREATE UNIQUE INDEX IF NOT EXISTS staff_assignments_user_branch_uidx ON staff_assignments (user_id, branch_id);
 CREATE UNIQUE INDEX IF NOT EXISTS cashier_shifts_open_register_uidx ON cashier_shifts (register_id) WHERE status = 'open';
 CREATE UNIQUE INDEX IF NOT EXISTS cashier_shifts_open_cashier_uidx ON cashier_shifts (cashier_user_id) WHERE status = 'open';
@@ -82,8 +84,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS register_print_preferences_register_uidx ON re
 CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_idempotency_uidx ON print_jobs (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_kot_uidx ON print_jobs (order_id, station_id) WHERE document_type = 'kot' AND is_reprint = false;
 CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_document_uidx ON print_jobs (order_id, document_type) WHERE document_type <> 'kot' AND is_reprint = false;
+CREATE UNIQUE INDEX IF NOT EXISTS offline_price_snapshots_reference_uidx ON offline_price_snapshots (reference);
 CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_operation_uidx ON offline_sync_records (client_operation_id);
-CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_checkout_key_uidx ON offline_sync_records (checkout_idempotency_key);`;
+CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_checkout_key_uidx ON offline_sync_records (checkout_idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_receipt_number_uidx ON offline_sync_records (offline_receipt_number);`;
 
 export function createTestDb() {
   const pg = new PGlite();

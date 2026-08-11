@@ -100,6 +100,10 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
               <dt className="text-muted-foreground">{t("createdAt")}</dt>
               <dd>{order.created_at ? new Date(order.created_at).toLocaleString() : "—"}</dd>
             </div>
+            {order.offline_receipt_reference && <div>
+              <dt className="text-muted-foreground">{t("offlineReceiptReference")}</dt>
+              <dd className="font-mono font-semibold">{order.offline_receipt_reference}</dd>
+            </div>}
           </dl>
         </CardContent>
       </Card>

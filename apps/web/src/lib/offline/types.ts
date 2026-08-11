@@ -1,7 +1,7 @@
 import type { RouterInputs, RouterOutputs } from "@/lib/trpc/router";
 
-export const OFFLINE_DB_VERSION = 1;
-export const OFFLINE_QUEUE_VERSION = 1;
+export const OFFLINE_DB_VERSION = 2;
+export const OFFLINE_QUEUE_VERSION = 2;
 
 export type OfflineBootstrapSnapshot = RouterOutputs["offline"]["bootstrap"];
 export type OfflineSyncPayload = RouterInputs["offline"]["sync"];
@@ -70,7 +70,60 @@ export interface OfflineOrderSummaryDocument {
   createdAt: string;
 }
 
-export type OfflineDocument = OfflineKotDocument | OfflineOrderSummaryDocument;
+export interface OfflineCashReceiptDocument {
+  version: 1;
+  id: string;
+  kind: "offline_cash_receipt";
+  operationId: string;
+  orderReference: string;
+  offlineReceiptNumber: string;
+  checkoutIdempotencyKey: string;
+  priceSnapshot: { reference: string; revision: string; expiresAt: string };
+  checkoutAt: string;
+  restaurant: {
+    name: { en: string; ar: string };
+    branch: { en: string; ar: string };
+    address: { en: string; ar: string };
+    phone: string | null;
+  };
+  operator: {
+    cashier: string;
+    register: { en: string; ar: string; code: string };
+    shiftNumber: string;
+  };
+  order: {
+    type: "dine_in" | "takeaway" | "delivery";
+    area: { en: string; ar: string } | null;
+    table: { en: string; ar: string } | null;
+    customerName: string | null;
+    customerPhone: string | null;
+    deliveryAddress: string | null;
+  };
+  items: Array<{
+    name: { en: string; ar: string };
+    variant: { en: string; ar: string } | null;
+    modifiers: Array<{ name: { en: string; ar: string }; priceDelta: number }>;
+    quantity: number;
+    unitPrice: number;
+    lineTotal: number;
+    notes: string | null;
+  }>;
+  financial: {
+    subtotal: number;
+    total: number;
+    cashReceived: number;
+    change: number;
+  };
+  printing: {
+    paperWidth: 58 | 80;
+    language: "ar" | "en" | "bilingual";
+    copyCount: number;
+  };
+  printIdempotencyKey: string;
+  createdAt: string;
+}
+
+export type OfflineDocument = OfflineKotDocument | OfflineOrderSummaryDocument | OfflineCashReceiptDocument;
 
 export function newOfflineId(prefix: string) {
   const suffix = typeof crypto !== "undefined" && "randomUUID" in crypto
