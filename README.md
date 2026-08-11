@@ -8,6 +8,30 @@ The project started from the MIT-licensed FinOpenPOS codebase and has been refoc
   <img src="docs/assets/forno-platform-overview.svg" alt="FORNO platform overview" width="900">
 </p>
 
+## Real Project Screenshots
+
+These screenshots were captured from the running FORNO application with seeded data and an authenticated admin session.
+
+| Login | Admin Dashboard |
+| --- | --- |
+| <img src="docs/screenshots/01-login.png" alt="FORNO login screen" width="420"> | <img src="docs/screenshots/02-admin-dashboard.png" alt="FORNO admin dashboard" width="420"> |
+
+| POS | Sync Center |
+| --- | --- |
+| <img src="docs/screenshots/03-pos.png" alt="FORNO POS screen" width="420"> | <img src="docs/screenshots/04-sync-center.png" alt="FORNO offline sync center" width="420"> |
+
+| Inventory Overview | Ingredients |
+| --- | --- |
+| <img src="docs/screenshots/05-inventory-overview.png" alt="FORNO inventory overview" width="420"> | <img src="docs/screenshots/06-ingredients.png" alt="FORNO ingredients and balances" width="420"> |
+
+| Recipe Costing | Stock Movement Ledger |
+| --- | --- |
+| <img src="docs/screenshots/07-recipes.png" alt="FORNO recipe builder and costing" width="420"> | <img src="docs/screenshots/08-stock-movements.png" alt="FORNO stock movement ledger" width="420"> |
+
+| Orders |
+| --- | --- |
+| <img src="docs/screenshots/09-orders.png" alt="FORNO orders list" width="420"> |
+
 ## What Has Been Built
 
 FORNO now covers the operational backbone of a restaurant POS:
