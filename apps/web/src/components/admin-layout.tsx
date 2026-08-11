@@ -28,18 +28,20 @@ import {
   UsersIcon,
   ShoppingBagIcon,
   CreditCardIcon,
+  RefreshCwIcon,
   MenuIcon,
   XIcon,
   type LucideIcon,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { LocaleSwitcher } from "@/components/locale-switcher";
+import { useOffline } from "@/components/offline/offline-provider";
 
 import { logout } from "@/app/login/actions";
 
 interface NavItem {
   href: string;
-  labelKey: "dashboard" | "cashier" | "products" | "customers" | "orders" | "paymentMethods" | "pos";
+  labelKey: "dashboard" | "cashier" | "products" | "customers" | "orders" | "paymentMethods" | "pos" | "syncCenter";
   icon: LucideIcon;
 }
 
@@ -51,12 +53,14 @@ const navItems: NavItem[] = [
   { href: "/admin/orders", labelKey: "orders", icon: ShoppingBagIcon },
   { href: "/admin/payment-methods", labelKey: "paymentMethods", icon: CreditCardIcon },
   { href: "/admin/pos", labelKey: "pos", icon: ShoppingCartIcon },
+  { href: "/admin/sync", labelKey: "syncCenter", icon: RefreshCwIcon },
 ];
 
 export function AdminLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const t = useTranslations("nav");
+  const offline = useOffline();
 
   const pageNames: Record<string, string> = Object.fromEntries(
     navItems.map((item) => [item.href, t(item.labelKey)])
@@ -83,6 +87,7 @@ export function AdminLayout({ children }: { children: React.ReactNode }) {
         </Link>
         <h1 className="text-lg sm:text-xl font-bold truncate">{pageNames[pathname]}</h1>
         <div className="ms-auto flex items-center gap-2">
+          <Link href="/admin/sync" aria-label={`${offline.connection}, ${offline.pendingCount} pending`} className={`flex min-h-9 items-center gap-1 rounded-full border px-2 text-xs font-bold ${offline.connection === "offline" || offline.connection === "needs_review" || offline.connection === "failed" ? "border-amber-400 bg-amber-50 text-amber-900" : "border-emerald-300 bg-emerald-50 text-emerald-900"}`}><span className="h-2 w-2 rounded-full bg-current" />{offline.connection.replace("_", " ")} {offline.pendingCount > 0 && `(${offline.pendingCount})`}</Link>
           <LocaleSwitcher />
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -106,7 +111,7 @@ export function AdminLayout({ children }: { children: React.ReactNode }) {
               <DropdownMenuItem>{t("settings")}</DropdownMenuItem>
               <DropdownMenuItem>{t("support")}</DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => logout()}>{t("logout")}</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => { if (offline.financialPendingCount > 0) { window.alert("Unsynchronized cash sales block logout. Open Sync Center for authorized recovery.\nتوجد مبيعات نقدية غير متزامنة. افتح مركز المزامنة للمعالجة المعتمدة."); return; } void logout(); }}>{t("logout")}</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

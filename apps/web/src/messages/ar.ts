@@ -46,6 +46,7 @@ const messages = {
     orders: "الطلبات",
     paymentMethods: "طرق الدفع",
     pos: "نقطة البيع",
+    syncCenter: "مركز المزامنة",
     adminPanel: "لوحة الإدارة",
     openMenu: "فتح القائمة",
     myAccount: "حسابي",

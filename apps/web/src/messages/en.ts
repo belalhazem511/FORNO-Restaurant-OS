@@ -46,6 +46,7 @@ const messages = {
     orders: "Orders",
     paymentMethods: "Payment Methods",
     pos: "Point of Sale",
+    syncCenter: "Sync Center",
     adminPanel: "Admin Panel",
     openMenu: "Open menu",
     myAccount: "My Account",
