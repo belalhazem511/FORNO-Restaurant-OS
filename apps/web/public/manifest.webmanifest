@@ -1,0 +1,13 @@
+{
+  "name": "FORNO Restaurant OS",
+  "short_name": "FORNO POS",
+  "description": "Offline-capable restaurant point of sale",
+  "start_url": "/admin/pos",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#fff7ed",
+  "theme_color": "#9a3412",
+  "icons": [
+    { "src": "/forno-pwa-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
