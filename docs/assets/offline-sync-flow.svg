@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">Offline synchronization flow</title>
+  <desc id="desc">Flow showing online bootstrap, offline sale, durable queue, server synchronization, and conflict recovery.</desc>
+  <rect width="1200" height="560" fill="#f8fafc"/>
+  <text x="600" y="58" text-anchor="middle" fill="#0f172a" font-family="Arial, sans-serif" font-size="32" font-weight="700">Offline POS Synchronization</text>
+  <g font-family="Arial, sans-serif" font-size="16">
+    <rect x="70" y="130" width="190" height="120" rx="14" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>
+    <text x="165" y="166" text-anchor="middle" fill="#075985" font-size="20" font-weight="700">Online Login</text>
+    <text x="165" y="198" text-anchor="middle" fill="#0f172a">Auth, branch</text>
+    <text x="165" y="224" text-anchor="middle" fill="#0f172a">register, shift</text>
+    <rect x="320" y="130" width="190" height="120" rx="14" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <text x="415" y="166" text-anchor="middle" fill="#166534" font-size="20" font-weight="700">Snapshot</text>
+    <text x="415" y="198" text-anchor="middle" fill="#0f172a">Menu, permissions</text>
+    <text x="415" y="224" text-anchor="middle" fill="#0f172a">availability, printers</text>
+    <rect x="570" y="130" width="190" height="120" rx="14" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+    <text x="665" y="166" text-anchor="middle" fill="#92400e" font-size="20" font-weight="700">Offline Sale</text>
+    <text x="665" y="198" text-anchor="middle" fill="#0f172a">Order, KOT preview</text>
+    <text x="665" y="224" text-anchor="middle" fill="#0f172a">cash receipt</text>
+    <rect x="820" y="130" width="190" height="120" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+    <text x="915" y="166" text-anchor="middle" fill="#5b21b6" font-size="20" font-weight="700">Queue</text>
+    <text x="915" y="198" text-anchor="middle" fill="#0f172a">IndexedDB durable</text>
+    <text x="915" y="224" text-anchor="middle" fill="#0f172a">idempotent ops</text>
+    <rect x="70" y="340" width="190" height="120" rx="14" fill="#ffe4e6" stroke="#e11d48" stroke-width="2"/>
+    <text x="165" y="376" text-anchor="middle" fill="#9f1239" font-size="20" font-weight="700">Server Sync</text>
+    <text x="165" y="408" text-anchor="middle" fill="#0f172a">Revalidate and</text>
+    <text x="165" y="434" text-anchor="middle" fill="#0f172a">reprice</text>
+    <rect x="320" y="340" width="190" height="120" rx="14" fill="#f1f5f9" stroke="#475569" stroke-width="2"/>
+    <text x="415" y="376" text-anchor="middle" fill="#334155" font-size="20" font-weight="700">Mapping</text>
+    <text x="415" y="408" text-anchor="middle" fill="#0f172a">Local IDs to</text>
+    <text x="415" y="434" text-anchor="middle" fill="#0f172a">server IDs</text>
+    <rect x="570" y="340" width="190" height="120" rx="14" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+    <text x="665" y="376" text-anchor="middle" fill="#991b1b" font-size="20" font-weight="700">Needs Review</text>
+    <text x="665" y="408" text-anchor="middle" fill="#0f172a">Financial conflicts</text>
+    <text x="665" y="434" text-anchor="middle" fill="#0f172a">manager action</text>
+    <rect x="820" y="340" width="190" height="120" rx="14" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <text x="915" y="376" text-anchor="middle" fill="#166534" font-size="20" font-weight="700">Final Receipt</text>
+    <text x="915" y="408" text-anchor="middle" fill="#0f172a">Authoritative</text>
+    <text x="915" y="434" text-anchor="middle" fill="#0f172a">server record</text>
+    <path d="M260 190 H320" stroke="#64748b" stroke-width="4" marker-end="url(#arrow)"/>
+    <path d="M510 190 H570" stroke="#64748b" stroke-width="4" marker-end="url(#arrow)"/>
+    <path d="M760 190 H820" stroke="#64748b" stroke-width="4" marker-end="url(#arrow)"/>
+    <path d="M915 250 V300 H165 V340" stroke="#64748b" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+    <path d="M260 400 H320" stroke="#64748b" stroke-width="4" marker-end="url(#arrow)"/>
+    <path d="M510 400 H570" stroke="#64748b" stroke-width="4" marker-end="url(#arrow)"/>
+    <path d="M760 400 H820" stroke="#64748b" stroke-width="4" marker-end="url(#arrow)"/>
+  </g>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+</svg>

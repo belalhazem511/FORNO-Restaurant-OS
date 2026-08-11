@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">FORNO Restaurant OS platform overview</title>
+  <desc id="desc">Diagram showing POS, kitchen, offline sync, finance, inventory, and database safety areas.</desc>
+  <rect width="1200" height="620" fill="#0f172a"/>
+  <rect x="36" y="36" width="1128" height="548" rx="20" fill="#111827" stroke="#334155" stroke-width="2"/>
+  <text x="600" y="86" text-anchor="middle" fill="#f8fafc" font-family="Arial, sans-serif" font-size="34" font-weight="700">FORNO Restaurant OS</text>
+  <text x="600" y="118" text-anchor="middle" fill="#cbd5e1" font-family="Arial, sans-serif" font-size="17">Restaurant operations platform for POS, kitchen, offline continuity, receipts, and recipe inventory</text>
+  <g font-family="Arial, sans-serif">
+    <rect x="92" y="172" width="280" height="150" rx="14" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+    <text x="232" y="211" text-anchor="middle" fill="#e0f2fe" font-size="23" font-weight="700">POS</text>
+    <text x="232" y="246" text-anchor="middle" fill="#cbd5e1" font-size="16">Dine-in, takeaway, delivery</text>
+    <text x="232" y="274" text-anchor="middle" fill="#cbd5e1" font-size="16">Cart, tables, modifiers</text>
+    <text x="232" y="302" text-anchor="middle" fill="#cbd5e1" font-size="16">Cashier shift workflow</text>
+    <rect x="460" y="172" width="280" height="150" rx="14" fill="#1e293b" stroke="#f97316" stroke-width="2"/>
+    <text x="600" y="211" text-anchor="middle" fill="#ffedd5" font-size="23" font-weight="700">Kitchen</text>
+    <text x="600" y="246" text-anchor="middle" fill="#cbd5e1" font-size="16">Pizza station</text>
+    <text x="600" y="274" text-anchor="middle" fill="#cbd5e1" font-size="16">Doner station</text>
+    <text x="600" y="302" text-anchor="middle" fill="#cbd5e1" font-size="16">Cafe station</text>
+    <rect x="828" y="172" width="280" height="150" rx="14" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+    <text x="968" y="211" text-anchor="middle" fill="#dcfce7" font-size="23" font-weight="700">Offline POS</text>
+    <text x="968" y="246" text-anchor="middle" fill="#cbd5e1" font-size="16">PWA shell and snapshot</text>
+    <text x="968" y="274" text-anchor="middle" fill="#cbd5e1" font-size="16">Durable queue</text>
+    <text x="968" y="302" text-anchor="middle" fill="#cbd5e1" font-size="16">Sync Center recovery</text>
+    <rect x="92" y="382" width="280" height="150" rx="14" fill="#1e293b" stroke="#a78bfa" stroke-width="2"/>
+    <text x="232" y="421" text-anchor="middle" fill="#ede9fe" font-size="23" font-weight="700">Finance</text>
+    <text x="232" y="456" text-anchor="middle" fill="#cbd5e1" font-size="16">Cash payments</text>
+    <text x="232" y="484" text-anchor="middle" fill="#cbd5e1" font-size="16">Refunds and reversals</text>
+    <text x="232" y="512" text-anchor="middle" fill="#cbd5e1" font-size="16">Immutable audit history</text>
+    <rect x="460" y="382" width="280" height="150" rx="14" fill="#1e293b" stroke="#eab308" stroke-width="2"/>
+    <text x="600" y="421" text-anchor="middle" fill="#fef9c3" font-size="23" font-weight="700">Inventory</text>
+    <text x="600" y="456" text-anchor="middle" fill="#cbd5e1" font-size="16">Ingredients and recipes</text>
+    <text x="600" y="484" text-anchor="middle" fill="#cbd5e1" font-size="16">Stock movements</text>
+    <text x="600" y="512" text-anchor="middle" fill="#cbd5e1" font-size="16">Theoretical COGS</text>
+    <rect x="828" y="382" width="280" height="150" rx="14" fill="#1e293b" stroke="#fb7185" stroke-width="2"/>
+    <text x="968" y="421" text-anchor="middle" fill="#ffe4e6" font-size="23" font-weight="700">Safety</text>
+    <text x="968" y="456" text-anchor="middle" fill="#cbd5e1" font-size="16">Branch isolation</text>
+    <text x="968" y="484" text-anchor="middle" fill="#cbd5e1" font-size="16">Permission checks</text>
+    <text x="968" y="512" text-anchor="middle" fill="#cbd5e1" font-size="16">Explicit database actions</text>
+  </g>
+</svg>
