@@ -19,6 +19,14 @@ const TABLES: PgTable[] = [
   schema.modifierGroups,
   schema.modifierOptions,
   schema.menuItemModifierGroups,
+  schema.inventoryLocations,
+  schema.ingredientCategories,
+  schema.unitsOfMeasure,
+  schema.ingredients,
+  schema.ingredientPackageConversions,
+  schema.stockBalances,
+  schema.recipeVersions,
+  schema.recipeComponents,
   schema.customers,
   schema.cashierRegisters,
   schema.registerPrintPreferences,
@@ -32,6 +40,10 @@ const TABLES: PgTable[] = [
   schema.orderCheckouts,
   schema.orderPayments,
   schema.orderCancellations,
+  schema.orderInventoryIssues,
+  schema.orderInventoryConsumptions,
+  schema.orderItemCogs,
+  schema.stockMovements,
   schema.auditLogs,
   schema.printJobs,
   schema.offlinePriceSnapshots,
@@ -87,7 +99,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_document_uidx ON print_jobs
 CREATE UNIQUE INDEX IF NOT EXISTS offline_price_snapshots_reference_uidx ON offline_price_snapshots (reference);
 CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_operation_uidx ON offline_sync_records (client_operation_id);
 CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_checkout_key_uidx ON offline_sync_records (checkout_idempotency_key);
-CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_receipt_number_uidx ON offline_sync_records (offline_receipt_number);`;
+CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_receipt_number_uidx ON offline_sync_records (offline_receipt_number);
+CREATE UNIQUE INDEX IF NOT EXISTS inventory_locations_branch_code_uidx ON inventory_locations (branch_id, code);
+CREATE UNIQUE INDEX IF NOT EXISTS ingredient_categories_branch_code_uidx ON ingredient_categories (branch_id, code);
+CREATE UNIQUE INDEX IF NOT EXISTS units_of_measure_code_uidx ON units_of_measure (code);
+CREATE UNIQUE INDEX IF NOT EXISTS ingredients_branch_sku_uidx ON ingredients (branch_id, sku);
+CREATE UNIQUE INDEX IF NOT EXISTS ingredient_packages_ingredient_code_uidx ON ingredient_package_conversions (ingredient_id, code);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_balances_location_ingredient_uidx ON stock_balances (location_id, ingredient_id);
+CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_configuration_version_uidx ON recipe_versions (menu_item_id, variant_id, version);
+CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_base_version_uidx ON recipe_versions (menu_item_id, version) WHERE variant_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_active_base_uidx ON recipe_versions (menu_item_id) WHERE status = 'active' AND variant_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_active_variant_uidx ON recipe_versions (menu_item_id, variant_id) WHERE status = 'active' AND variant_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS recipe_components_unambiguous_uidx ON recipe_components (recipe_version_id, ingredient_id, source_location_id, modifier_option_id);
+CREATE UNIQUE INDEX IF NOT EXISTS recipe_components_base_uidx ON recipe_components (recipe_version_id, ingredient_id, source_location_id) WHERE modifier_option_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS order_inventory_issues_order_uidx ON order_inventory_issues (order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS order_inventory_issues_idempotency_uidx ON order_inventory_issues (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS order_inventory_consumptions_snapshot_uidx ON order_inventory_consumptions (issue_id, order_item_id, ingredient_id, location_id);
+CREATE UNIQUE INDEX IF NOT EXISTS order_item_cogs_item_uidx ON order_item_cogs (order_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_movements_idempotency_uidx ON stock_movements (idempotency_key);`;
 
 export function createTestDb() {
   const pg = new PGlite();

@@ -112,6 +112,10 @@ export default function POSPage() {
     ...trpc.offline.bootstrap.queryOptions({ branchId: onlineBranch?.id ?? 0 }),
     enabled: Boolean(onlineBranch && offline.serverReachable),
   });
+  const availabilityQuery = useQuery({
+    ...trpc.inventory.availability.queryOptions({ branchId: onlineBranch?.id ?? 0 }),
+    enabled: Boolean(onlineBranch && offline.serverReachable),
+  });
   useEffect(() => {
     if (bootstrapQuery.data) void offline.cacheSnapshot(bootstrapQuery.data);
   }, [bootstrapQuery.data]);
@@ -152,6 +156,13 @@ export default function POSPage() {
     [branch],
   );
   const menuItems = useMemo(() => categories.flatMap((category) => category.menuItems), [categories]);
+  const availability = isOfflineMode ? cachedSnapshot?.availability ?? [] : availabilityQuery.data ?? [];
+  const inventoryStatus = (menuItemId: number, variantId: number | null) => availability.find((row) => row.menuItemId === menuItemId && row.variantId === variantId)?.status ?? "stock_unavailable";
+  const inventoryAllows = (menuItemId: number, variantId: number | null) => ["in_stock", "low_stock"].includes(inventoryStatus(menuItemId, variantId));
+  const itemInventoryStatus = (item: MenuItem) => {
+    const statuses = item.variants.length ? item.variants.map((variant) => inventoryStatus(item.id, variant.id)) : [inventoryStatus(item.id, null)];
+    return statuses.includes("in_stock") ? "in_stock" : statuses.includes("low_stock") ? "low_stock" : statuses[0] ?? "stock_unavailable";
+  };
   const visibleItems = useMemo(() => {
     const query = search.trim().toLocaleLowerCase(locale);
     return menuItems.filter((item) => {
@@ -181,7 +192,7 @@ export default function POSPage() {
   const openConfigurator = (item: MenuItem, line?: CartLine) => {
     setConfiguringItem(item);
     setEditingKey(line?.key ?? null);
-    const availableVariants = item.variants.filter((variant) => variant.is_available);
+    const availableVariants = item.variants.filter((variant) => variant.is_available && inventoryAllows(item.id, variant.id));
     const defaultVariant = availableVariants.find((variant) => variant.is_default) ?? availableVariants[0];
     setVariantId(line?.variantId ?? defaultVariant?.id ?? null);
     setModifierIds(line?.modifiers.map((modifier) => modifier.id) ?? item.modifierGroups.flatMap((link) => {
@@ -494,10 +505,12 @@ export default function POSPage() {
           {visibleItems.length === 0 ? <Card><CardContent className="flex min-h-52 flex-col items-center justify-center gap-2 text-center text-muted-foreground"><ShoppingBagIcon className="h-10 w-10" /><p>{search ? t("noSearchResults") : t("noMenuItems")}</p></CardContent></Card> : (
             <div className="grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-4">
               {visibleItems.map((item) => {
-                const availableVariants = item.variants.filter((variant) => variant.is_available);
+                const availableVariants = item.variants.filter((variant) => variant.is_available && inventoryAllows(item.id, variant.id));
                 const fromPrice = availableVariants.length > 0 ? Math.min(...availableVariants.map((variant) => variant.price)) : item.base_price;
-                return <button key={item.id} type="button" disabled={!item.is_available} onClick={() => openConfigurator(item)} className="group min-h-40 rounded-xl border bg-card p-4 text-start shadow-sm transition hover:-translate-y-0.5 hover:border-primary hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
-                  <div className="flex h-full flex-col justify-between gap-4"><div><div className="mb-2 flex items-start justify-between gap-2"><h3 className="font-bold leading-tight">{displayName(item)}</h3>{!item.is_available && <Badge variant="destructive">{t("unavailable")}</Badge>}</div><p className="text-xs text-muted-foreground" dir={isArabic ? "ltr" : "rtl"}>{secondaryName(item)}</p></div><div className="flex items-end justify-between gap-2"><strong className="text-base text-primary">{availableVariants.length > 1 ? t("fromPrice", { price: formatCurrency(fromPrice, locale) }) : formatCurrency(fromPrice, locale)}</strong>{(availableVariants.length > 0 || item.modifierGroups.length > 0) && <ChevronDownIcon className="h-5 w-5 text-muted-foreground transition group-hover:text-primary" />}</div></div>
+                const stockStatus = itemInventoryStatus(item);
+                const sellable = item.is_available && ["in_stock", "low_stock"].includes(stockStatus);
+                return <button key={item.id} type="button" disabled={!sellable} onClick={() => openConfigurator(item)} className="group min-h-40 rounded-xl border bg-card p-4 text-start shadow-sm transition hover:-translate-y-0.5 hover:border-primary hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+                  <div className="flex h-full flex-col justify-between gap-4"><div><div className="mb-2 flex items-start justify-between gap-2"><h3 className="font-bold leading-tight">{displayName(item)}</h3><Badge variant={sellable ? "outline" : "destructive"}>{stockStatus.replaceAll("_", " ")}</Badge></div><p className="text-xs text-muted-foreground" dir={isArabic ? "ltr" : "rtl"}>{secondaryName(item)}</p></div><div className="flex items-end justify-between gap-2"><strong className="text-base text-primary">{availableVariants.length > 1 ? t("fromPrice", { price: formatCurrency(fromPrice, locale) }) : formatCurrency(fromPrice, locale)}</strong>{(availableVariants.length > 0 || item.modifierGroups.length > 0) && <ChevronDownIcon className="h-5 w-5 text-muted-foreground transition group-hover:text-primary" />}</div></div>
                 </button>;
               })}
             </div>
@@ -519,7 +532,7 @@ export default function POSPage() {
 
       <Dialog open={Boolean(configuringItem)} onOpenChange={(open) => { if (!open) setConfiguringItem(null); }}>
         <DialogContent className="max-w-2xl p-0"><DialogHeader className="border-b p-5 pe-12 text-start"><DialogTitle className="text-xl">{configuringItem && displayName(configuringItem)}</DialogTitle><DialogDescription>{configuringItem && secondaryName(configuringItem)}</DialogDescription></DialogHeader>{configuringItem && <div className="space-y-6 px-5 pb-2">
-          {configuringItem.variants.filter((variant) => variant.is_available).length > 0 && <fieldset><legend className="mb-3 font-semibold">{t("chooseVariant")}</legend><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{configuringItem.variants.filter((variant) => variant.is_available).map((variant) => <Button key={variant.id} type="button" variant={variantId === variant.id ? "default" : "outline"} className="min-h-14 flex-col gap-0" aria-pressed={variantId === variant.id} onClick={() => setVariantId(variant.id)}><span>{displayName(variant)}</span><span className="text-xs opacity-80">{formatCurrency(variant.price, locale)}</span></Button>)}</div></fieldset>}
+          {configuringItem.variants.filter((variant) => variant.is_available).length > 0 && <fieldset><legend className="mb-3 font-semibold">{t("chooseVariant")}</legend><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{configuringItem.variants.filter((variant) => variant.is_available).map((variant) => { const status = inventoryStatus(configuringItem.id, variant.id); return <Button key={variant.id} type="button" disabled={!inventoryAllows(configuringItem.id, variant.id)} variant={variantId === variant.id ? "default" : "outline"} className="min-h-14 flex-col gap-0" aria-pressed={variantId === variant.id} onClick={() => setVariantId(variant.id)}><span>{displayName(variant)}</span><span className="text-xs opacity-80">{formatCurrency(variant.price, locale)} · {status.replaceAll("_", " ")}</span></Button>; })}</div></fieldset>}
           {configuringItem.modifierGroups.filter((link) => link.modifierGroup.is_active).map((link) => { const group = link.modifierGroup; return <fieldset key={group.id}><div className="mb-3 flex items-center justify-between gap-2"><legend className="font-semibold">{displayName(group)}</legend><span className="text-xs text-muted-foreground">{group.min_selections > 0 ? t("requiredSelections", { min: group.min_selections, max: group.max_selections }) : t("optionalSelections", { max: group.max_selections })}</span></div><div className="grid grid-cols-1 gap-2 sm:grid-cols-2">{group.options.filter((option) => option.is_available).map((option) => { const selected = modifierIds.includes(option.id); return <Button key={option.id} type="button" variant={selected ? "default" : "outline"} className="min-h-12 justify-between whitespace-normal text-start" aria-pressed={selected} onClick={() => toggleModifier(group, option.id)}><span>{displayName(option)}</span><span>{option.price_delta > 0 ? `+${formatCurrency(option.price_delta, locale)}` : t("included")}</span></Button>; })}</div></fieldset>; })}
           <div className="grid gap-4 sm:grid-cols-[160px_1fr]"><div><Label className="mb-2 block">{t("quantity")}</Label><div className="flex items-center"><Button type="button" variant="outline" size="icon" className="h-12 w-12" disabled={itemQuantity <= 1} onClick={() => setItemQuantity((value) => Math.max(1, value - 1))}><MinusIcon /></Button><span className="w-14 text-center text-xl font-bold">{itemQuantity}</span><Button type="button" variant="outline" size="icon" className="h-12 w-12" onClick={() => setItemQuantity((value) => value + 1)}><PlusIcon /></Button></div></div><div><Label htmlFor="kitchen-notes" className="mb-2 block">{t("kitchenNotes")}</Label><textarea id="kitchen-notes" className="min-h-24 w-full rounded-md border border-input bg-transparent px-3 py-2 text-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" value={itemNotes} onChange={(event) => setItemNotes(event.target.value)} maxLength={500} placeholder={t("kitchenNotesPlaceholder")} /></div></div>
           {configurationError && <p role="alert" className="text-sm font-medium text-destructive">{configurationError}</p>}

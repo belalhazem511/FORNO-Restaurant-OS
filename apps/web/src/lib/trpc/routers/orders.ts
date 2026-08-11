@@ -11,12 +11,15 @@ import {
   orders,
   orderStatusHistory,
   restaurantTables,
+  staffAssignments,
   type OrderStatus,
   type OrderType,
 } from "@/lib/db/schema";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod/v4";
 import { protectedProcedure, router } from "../init";
+import { assertPermission, hasPermission } from "@/lib/permissions";
+import { issueOrderInventory } from "@/lib/inventory/service";
 
 const orderTypeSchema = z.enum(ORDER_TYPES);
 const orderStatusSchema = z.enum(ORDER_STATUSES);
@@ -37,6 +40,7 @@ const orderBaseSchema = z.object({
   total_amount: z.number(),
   payment_status: z.enum(["unpaid", "paid", "refunded"]),
   paid_at: z.date().nullable(),
+  inventory_issued_at: z.date().nullable(),
   delivery_address: z.string().nullable(),
   status: orderStatusSchema,
   user_uid: z.string(),
@@ -318,6 +322,7 @@ export const ordersRouter = router({
       total_amount: z.number().int().nonnegative().optional(),
       status: orderStatusSchema.optional(),
       note: z.string().max(500).optional(),
+      inventoryOverrideReason: z.string().trim().min(3).max(500).optional(),
     }))
     .output(orderWithCustomerSchema)
     .mutation(async ({ ctx, input }) => db.transaction(async (tx) => {
@@ -330,6 +335,13 @@ export const ordersRouter = router({
 
       if (input.status && input.status !== current.status) {
         assertOrderTransition(current.status as OrderStatus, input.status, current.order_type as OrderType);
+        if (input.status === "confirmed") {
+          const assignment = await tx.query.staffAssignments.findFirst({ where: and(eq(staffAssignments.user_id, ctx.user.id), eq(staffAssignments.branch_id, current.branch_id!), eq(staffAssignments.is_active, true)) });
+          if (!assignment) throw new Error("No active staff assignment for this branch");
+          assertPermission(assignment.role, "order:create");
+          if (input.inventoryOverrideReason && !hasPermission(assignment.role, "inventory:override")) throw new Error("Cashiers cannot override insufficient stock");
+          await issueOrderInventory(tx, { orderId: current.id, actorUserId: ctx.user.id, idempotencyKey: `order-confirm:${current.id}`, allowNegative: Boolean(input.inventoryOverrideReason), overrideReason: input.inventoryOverrideReason });
+        }
       }
       const [updated] = await tx.update(orders).set({
         total_amount: input.total_amount,
@@ -357,7 +369,7 @@ export const ordersRouter = router({
     })),
 
   transition: protectedProcedure
-    .input(z.object({ id: z.number(), status: orderStatusSchema, note: z.string().max(500).optional() }))
+    .input(z.object({ id: z.number(), status: orderStatusSchema, note: z.string().max(500).optional(), inventoryOverrideReason: z.string().trim().min(3).max(500).optional() }))
     .output(orderWithCustomerSchema)
     .mutation(async ({ ctx, input }) => db.transaction(async (tx) => {
       const current = await tx.query.orders.findFirst({
@@ -366,6 +378,13 @@ export const ordersRouter = router({
       if (!current) throw new Error("Order not found");
       if (input.status === "cancelled") throw new Error("Use the audited cancellation workflow");
       assertOrderTransition(current.status as OrderStatus, input.status, current.order_type as OrderType);
+      if (input.status === "confirmed") {
+        const assignment = await tx.query.staffAssignments.findFirst({ where: and(eq(staffAssignments.user_id, ctx.user.id), eq(staffAssignments.branch_id, current.branch_id!), eq(staffAssignments.is_active, true)) });
+        if (!assignment) throw new Error("No active staff assignment for this branch");
+        assertPermission(assignment.role, "order:create");
+        if (input.inventoryOverrideReason && !hasPermission(assignment.role, "inventory:override")) throw new Error("Cashiers cannot override insufficient stock");
+        await issueOrderInventory(tx, { orderId: current.id, actorUserId: ctx.user.id, idempotencyKey: `order-confirm:${current.id}`, allowNegative: Boolean(input.inventoryOverrideReason), overrideReason: input.inventoryOverrideReason });
+      }
 
       const [updated] = await tx.update(orders).set({ status: input.status, updated_at: new Date() })
         .where(eq(orders.id, input.id)).returning();

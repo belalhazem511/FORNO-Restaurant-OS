@@ -22,6 +22,7 @@ let tableId: number;
 let revision: string;
 let priceSnapshotReference: string;
 let priceSnapshotRevision: string;
+let inventoryIngredientId: number;
 let items: Array<{ id: number; stationId: number; price: number }>;
 let sequence = 0;
 
@@ -96,6 +97,16 @@ beforeAll(async () => {
     const [product] = await db.insert(schema.products).values({ name: code, price: 10_000 + index * 1_000, in_stock: 100, user_uid: "offline-manager", category: code }).returning();
     const [item] = await db.insert(schema.menuItems).values({ category_id: category.id, kitchen_station_id: station.id, product_id: product.id, code: `${code}-ITEM`, name_en: `${code} item`, name_ar: code, base_price: product.price, is_available: true, sort_order: 1 }).returning();
     items.push({ id: item.id, stationId: station.id, price: item.base_price });
+  }
+  const [inventoryLocation] = await db.insert(schema.inventoryLocations).values({ branch_id: branchId, code: "PRODUCTION", name_en: "Production", name_ar: "الإنتاج", is_active: true }).returning();
+  const [ingredientCategory] = await db.insert(schema.ingredientCategories).values({ branch_id: branchId, code: "RAW", name_en: "Raw", name_ar: "خام", is_active: true }).returning();
+  const [pieceUnit] = await db.insert(schema.unitsOfMeasure).values({ code: "PC", name_en: "Piece", name_ar: "قطعة", dimension: "count", base_numerator: 1, base_denominator: 1 }).returning();
+  const [ingredient] = await db.insert(schema.ingredients).values({ branch_id: branchId, category_id: ingredientCategory.id, sku: "OFFLINE-COMPONENT", name_en: "Offline component", name_ar: "مكون دون اتصال", base_unit_id: pieceUnit.id, dimension: "count", default_location_id: inventoryLocation.id, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 5_000, par_level: 100_000, allow_negative: true, average_unit_cost_micros: 100_000_000, created_by: "offline-manager", updated_by: "offline-manager" }).returning();
+  inventoryIngredientId = ingredient.id;
+  await db.insert(schema.stockBalances).values({ branch_id: branchId, location_id: inventoryLocation.id, ingredient_id: ingredient.id, quantity_base: 1_000_000, average_unit_cost_micros: 100_000_000 });
+  for (const item of items) {
+    const [recipe] = await db.insert(schema.recipeVersions).values({ branch_id: branchId, menu_item_id: item.id, variant_id: null, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "offline-manager", approved_by: "offline-manager", approved_at: new Date() }).returning();
+    await db.insert(schema.recipeComponents).values({ recipe_version_id: recipe.id, ingredient_id: ingredient.id, source_location_id: inventoryLocation.id, modifier_option_id: null, unit_id: pieceUnit.id, quantity_input_scaled: 1_000, quantity_base: 1_000 });
   }
   const snapshot = await cashier.bootstrap({ branchId });
   revision = snapshot.revision;
@@ -249,6 +260,25 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     expect(record?.resolution_reason).toBe("Verified the original printed cash receipt and reopened the shift");
     expect(record?.printed_total_amount).toBe(input.offlineReceipt.total);
     expect((await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.action, "offline.sync.review_resolved"))).length).toBeGreaterThan(0);
+  });
+
+  it("preserves insufficient-stock cash sales in Needs Review and consumes once after manager override", async () => {
+    await db.update(schema.stockBalances).set({ quantity_base: 0 }).where(eq(schema.stockBalances.ingredient_id, inventoryIngredientId));
+    const input = operation();
+    const conflict = await cashier.sync(input);
+    expect(conflict.status).toBe("needs_review");
+    expect(conflict.conflict?.code).toBe("insufficient_stock");
+    expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
+    await manager.resolveReview({ recordId: conflict.conflict!.recordId!, reason: "Manager honors cash already received with negative stock" });
+    const accepted = await cashier.sync(input);
+    expect(accepted.status).toBe("accepted");
+    const duplicate = await cashier.sync(input);
+    expect(duplicate.duplicate).toBe(true);
+    expect(await db.select().from(schema.orderInventoryIssues).where(eq(schema.orderInventoryIssues.order_id, accepted.orderId!))).toHaveLength(1);
+    expect(await db.select().from(schema.orderPayments).where(eq(schema.orderPayments.order_id, accepted.orderId!))).toHaveLength(1);
+    const overrideAudit = await db.query.auditLogs.findFirst({ where: and(eq(schema.auditLogs.order_id, accepted.orderId!), eq(schema.auditLogs.action, "inventory.negative_override")) });
+    expect(overrideAudit?.approver_user_id).toBe("offline-manager");
+    await db.update(schema.stockBalances).set({ quantity_base: 1_000_000 }).where(eq(schema.stockBalances.ingredient_id, inventoryIngredientId));
   });
 
   it("enforces branch and user isolation in bootstrap and synchronization", async () => {

@@ -27,6 +27,7 @@ import {
   transactions,
   user,
 } from "./schema";
+import { seedInventory } from "./inventory-seed";
 
 const DEMO_EMAIL = "admin@forno.local";
 const DEMO_PASSWORD = "Forno123!";
@@ -220,6 +221,8 @@ export async function seed() {
       modifier_group_id: groupByCode.get(groupCode)!,
     }).onConflictDoNothing();
   }
+
+  await seedInventory(branch.id, userId);
 
   const customerSeeds = [
     { name: "Ahmed Hassan", email: "ahmed@forno.demo", phone: "01000000001", status: "active" },

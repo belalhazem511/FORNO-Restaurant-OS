@@ -63,3 +63,11 @@ The browser queue never mutates PGLite directly. Synchronization enters the auth
 Adding this table requires the same explicit, backed-up `bun run db:push` workflow described above. Development startup and production builds do not apply it. Tests construct isolated schemas, and seed/build verification continues to use unique temporary PGLite directories.
 
 `offline_price_snapshots` is an append-only pricing authority for offline cash receipts. It stores an opaque reference, scope, revision, expiry, and the minimum pricing payload required to reproduce the accepted total. `offline_sync_records` additionally preserves the external offline receipt reference and original printed subtotal, total, tendered cash, and change. Manager resolution may add a reason and revalidate state, but it never rewrites those printed values.
+
+## Inventory transactions and concurrency
+
+Inventory schema application remains explicit through the backed-up `bun run db:push` workflow. Builds cannot apply this schema or touch inventory data, and inventory seed records use stable branch codes, SKUs, recipe configuration/version keys, and opening-movement idempotency keys.
+
+Order production issue, manual adjustment, cancellation disposition, offline synchronization, balance projection, movement ledger, consumption snapshot, COGS snapshot, and audit rows share their respective database transaction. Balance rows are locked before availability decisions. Unique order-issue, movement, recipe-configuration, consumption, and COGS indexes make interruption/retry safe and prevent double issue. Concurrent confirmation therefore either observes the locked balance or fails into the authorized override/review workflow; it never silently oversells.
+
+`stock_movements`, `order_inventory_consumptions`, and `order_item_cogs` are historical records. Application APIs provide no update or delete operation. Recipe/cost changes create later versions or movements and cannot rewrite the values issued to an earlier order.

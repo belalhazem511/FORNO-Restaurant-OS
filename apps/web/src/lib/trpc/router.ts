@@ -11,6 +11,7 @@ import { shiftsRouter } from "./routers/shifts";
 import { checkoutRouter } from "./routers/checkout";
 import { printingRouter } from "./routers/printing";
 import { offlineRouter } from "./routers/offline";
+import { inventoryRouter } from "./routers/inventory";
 
 export const appRouter = router({
   products: productsRouter,
@@ -24,6 +25,7 @@ export const appRouter = router({
   checkout: checkoutRouter,
   printing: printingRouter,
   offline: offlineRouter,
+  inventory: inventoryRouter,
 });
 
 export type AppRouter = typeof appRouter;

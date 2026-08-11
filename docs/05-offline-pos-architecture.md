@@ -28,3 +28,9 @@ Offline creation covers dine-in, takeaway, and delivery orders, variants, modifi
 - `offline_sync_records` retains the printed receipt values and review reason. Missing, expired, foreign, or tampered snapshots/receipts enter Needs Review and are never silently removed.
 - Opening the offline preview records only a deterministic preview state for later audit. It never asserts that paper was physically produced and never triggers an automatic second print after synchronization.
 - The final paid receipt and Order Details show the offline receipt reference, while the Sync Center clearly separates the local offline receipt from the authoritative final receipt.
+
+## Phase 3A availability and stock issue
+
+- The authorized bootstrap snapshot carries a branch-scoped availability revision and cached per-menu/variant state (`in_stock`, `low_stock`, `out_of_stock`, `recipe_missing`, or `stock_unavailable`) with maximum producible quantity. Snapshot age remains visible offline; cached availability is advisory and contains no ingredient cost for cashiers.
+- Synchronization re-resolves the active immutable recipe and selected modifier deltas, locks current balances, and issues all stations' ingredients in the same transaction as the authoritative order and cash checkout. Operation, order, issue, payment, KOT, and receipt idempotency keys prevent duplicate consumption after interruption or retry.
+- Insufficient stock, missing recipes, or unavailable stock data never discard an offline cash receipt. They create a financial Needs Review record. A Manager or Owner/Admin may resolve it with a mandatory audit reason; revalidation can then honor the sale through the configured negative-stock override, preserving exactly one issue and the original printed cash values.

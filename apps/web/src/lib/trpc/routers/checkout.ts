@@ -7,6 +7,7 @@ import {
   cashierShifts,
   orderCancellations,
   orderCheckouts,
+  orderInventoryIssues,
   orderPayments,
   orders,
   orderStatusHistory,
@@ -17,6 +18,7 @@ import {
 import { calculateDiscount } from "@/lib/finance";
 import { requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
+import { applyCancellationDisposition } from "@/lib/inventory/service";
 
 const discountInputSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("percentage"), value: z.number().int().positive(), reason: z.string().trim().min(3).max(500) }),
@@ -213,6 +215,7 @@ export const checkoutRouter = router({
       orderId: z.number().int().positive(),
       idempotencyKey: z.string().trim().min(8).max(100),
       reason: z.string().trim().min(3).max(500),
+      inventoryDisposition: z.enum(["returned_unused", "prepared_discarded"]).optional(),
     }))
     .output(z.object({ orderId: z.number(), paymentStatus: z.enum(["unpaid", "refunded"]), refundedAmount: z.number() }))
     .mutation(async ({ ctx, input }) => {
@@ -228,6 +231,8 @@ export const checkoutRouter = router({
       const order = await db.query.orders.findFirst({ where: eq(orders.id, input.orderId) });
       if (!order || !order.branch_id) throw new Error("Order or order branch not found");
       await requireStaff(ctx.user.id, order.branch_id, "order:cancel");
+      const inventoryIssue = await db.query.orderInventoryIssues.findFirst({ where: eq(orderInventoryIssues.order_id, order.id) });
+      if (inventoryIssue && !input.inventoryDisposition) throw new Error("Cancellation after kitchen production requires an inventory disposition");
       if (order.status === "cancelled") throw new Error("Order is already cancelled");
       const wasPaid = order.payment_status === "paid";
       if (order.payment_status === "refunded") throw new Error("Order payment is already refunded");
@@ -254,7 +259,11 @@ export const checkoutRouter = router({
           was_paid: wasPaid,
           cancelled_by: ctx.user.id,
           approved_by: ctx.user.id,
+          inventory_disposition: input.inventoryDisposition ?? null,
+          inventory_resolved_by: input.inventoryDisposition ? ctx.user.id : null,
         }).returning();
+
+        if (input.inventoryDisposition) await applyCancellationDisposition(tx, { orderId: order.id, actorUserId: ctx.user.id, disposition: input.inventoryDisposition, reason: input.reason, idempotencyKey: `${input.idempotencyKey}:inventory` });
 
         let refundedAmount = 0;
         if (wasPaid && shift) {

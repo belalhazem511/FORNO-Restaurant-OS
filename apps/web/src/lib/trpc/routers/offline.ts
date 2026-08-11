@@ -26,6 +26,7 @@ import {
   transactions,
 } from "@/lib/db/schema";
 import { hasPermission, permissionsForRole } from "@/lib/permissions";
+import { InventoryConflict, issueOrderInventory, menuAvailability } from "@/lib/inventory/service";
 import { protectedProcedure, router } from "../init";
 
 export const OFFLINE_SNAPSHOT_STALE_MS = 2 * 60 * 60 * 1000;
@@ -52,6 +53,10 @@ export const OFFLINE_CONFLICT_CODES = [
   "receipt_payload_tampered",
   "duplicate_already_accepted",
   "invalid_order",
+  "recipe_missing",
+  "stock_unavailable",
+  "insufficient_stock",
+  "invalid_recipe",
 ] as const;
 
 export type OfflineConflictCode = (typeof OFFLINE_CONFLICT_CODES)[number];
@@ -146,7 +151,7 @@ function snapshotRevision(value: unknown) {
 function conflictCategory(code: OfflineConflictCode) {
   if (["shift_closed", "register_unavailable"].includes(code)) return "temporary" as const;
   if (["permission_changed", "user_branch_mismatch"].includes(code)) return "permission" as const;
-  if (["menu_price_changed", "cash_insufficient", "price_snapshot_invalid", "price_snapshot_expired", "receipt_payload_tampered"].includes(code)) return "financial" as const;
+  if (["menu_price_changed", "cash_insufficient", "price_snapshot_invalid", "price_snapshot_expired", "receipt_payload_tampered", "recipe_missing", "stock_unavailable", "insufficient_stock"].includes(code)) return "financial" as const;
   return "validation" as const;
 }
 
@@ -220,6 +225,7 @@ async function loadBootstrap(userId: string, branchId: number) {
     where: eq(registerPrintPreferences.register_id, shift.register_id),
   });
   const createdAt = new Date();
+  const availability = (await db.transaction((tx) => menuAvailability(tx, branchId))).map(({ theoreticalCost: _cost, ...entry }) => entry);
   const pricing: OfflinePricingPayload = {
     items: branch.menuCategories.flatMap((category) => category.menuItems.map((item) => ({
       id: item.id,
@@ -270,6 +276,8 @@ async function loadBootstrap(userId: string, branchId: number) {
       expiresAt: priceExpiresAt,
       ttlMs: offlinePriceSnapshotTtlMs(),
     },
+    availability,
+    availabilityRevision: snapshotRevision(availability),
   };
   return {
     version: 2 as const,
@@ -364,7 +372,7 @@ async function recordConflict(input: OfflineSyncInput, userId: string, conflict:
   });
 }
 
-async function synchronize(input: OfflineSyncInput, userId: string, allowReviewedPriceChange: boolean) {
+async function synchronize(input: OfflineSyncInput, userId: string, review: { approved: boolean; reason: string | null; approverUserId: string | null }) {
   const assignment = await db.query.staffAssignments.findFirst({ where: and(
     eq(staffAssignments.user_id, userId),
     eq(staffAssignments.branch_id, input.branchId),
@@ -484,7 +492,7 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
       prepared.push({ requested, menuItemId: item.id, productId: item.product_id, variantId: variant?.id ?? null, basePrice: trustedBasePrice ?? variant?.price ?? item.base_price, stationId: item.kitchen_station_id, modifiers: selected });
     }
     const authoritativeTotal = prepared.reduce((sum, item) => sum + (item.basePrice + item.modifiers.reduce((value, modifier) => value + modifier.price_delta, 0)) * item.requested.quantity, 0);
-    if (authoritativeTotal !== input.order.expectedTotal && (Boolean(input.cash) || !allowReviewedPriceChange)) {
+    if (authoritativeTotal !== input.order.expectedTotal && (Boolean(input.cash) || !review.approved)) {
       throw new OfflineConflict("menu_price_changed", `Authoritative total changed from ${input.order.expectedTotal} to ${authoritativeTotal}`, input.kind === "cash_sale");
     }
     if (input.cash && input.cash.tenderedAmount < authoritativeTotal) {
@@ -533,7 +541,27 @@ async function synchronize(input: OfflineSyncInput, userId: string, allowReviewe
         const [line] = await tx.insert(orderItems).values({ order_id: order.id, product_id: item.productId, menu_item_id: item.menuItemId, variant_id: item.variantId, quantity: item.requested.quantity, price: item.basePrice, notes: item.requested.notes }).returning();
         if (item.modifiers.length) await tx.insert(orderItemModifiers).values(item.modifiers.map((modifier) => ({ order_item_id: line.id, modifier_option_id: modifier.id, name_en: modifier.name_en, name_ar: modifier.name_ar, price_delta: modifier.price_delta })));
       }
-      await tx.insert(orderStatusHistory).values({ order_id: order.id, from_status: null, to_status: "pending", changed_by: userId, note: "Offline POS order synchronized" });
+    }
+
+    try {
+      await issueOrderInventory(tx, {
+        orderId: order.id,
+        actorUserId: userId,
+        idempotencyKey: `offline-inventory:${input.clientOperationId}`,
+        allowNegative: review.approved,
+        overrideReason: review.approved ? review.reason ?? undefined : undefined,
+        overrideApproverUserId: review.approved ? review.approverUserId ?? undefined : undefined,
+      });
+    } catch (cause) {
+      if (cause instanceof InventoryConflict) {
+        throw new OfflineConflict(cause.code, cause.message, input.kind === "cash_sale");
+      }
+      throw cause;
+    }
+    if (order.status === "pending") {
+      await tx.update(orders).set({ status: "confirmed", updated_at: new Date() }).where(eq(orders.id, order.id));
+      await tx.insert(orderStatusHistory).values({ order_id: order.id, from_status: "pending", to_status: "confirmed", changed_by: userId, note: "Offline POS order synchronized and inventory issued" });
+      order = { ...order, status: "confirmed" };
     }
 
     let checkout: typeof orderCheckouts.$inferSelect | null = null;
@@ -628,7 +656,7 @@ export const offlineRouter = router({
       if (prior?.status === "accepted" || prior?.status === "needs_review") return prior;
       const reviewed = await db.query.offlineSyncRecords.findFirst({ where: and(eq(offlineSyncRecords.client_operation_id, input.clientOperationId), eq(offlineSyncRecords.status, "resolved")) });
       try {
-        return await synchronize(input, ctx.user.id, Boolean(reviewed?.resolved_by));
+        return await synchronize(input, ctx.user.id, { approved: Boolean(reviewed?.resolved_by), reason: reviewed?.resolution_reason ?? null, approverUserId: reviewed?.resolved_by ?? null });
       } catch (cause) {
         if (!(cause instanceof OfflineConflict)) throw cause;
         const record = await recordConflict(input, ctx.user.id, cause);

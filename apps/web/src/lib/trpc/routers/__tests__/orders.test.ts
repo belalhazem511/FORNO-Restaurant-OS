@@ -9,6 +9,9 @@ const { ordersRouter } = await import("../orders");
 const { createCallerFactory } = await import("../../init");
 const {
   branches,
+  ingredientCategories,
+  ingredients,
+  inventoryLocations,
   customers,
   diningAreas,
   kitchenStations,
@@ -22,9 +25,15 @@ const {
   orderItems,
   orders,
   orderStatusHistory,
+  recipeComponents,
+  recipeVersions,
   products,
   restaurantTables,
+  stockBalances,
+  staffAssignments,
   transactions,
+  user,
+  unitsOfMeasure,
 } = await import("@/lib/db/schema");
 
 const caller = createCallerFactory(ordersRouter)({ user: makeUser("user-1") });
@@ -62,12 +71,15 @@ const pizzaLine = (overrides: Partial<{
 
 beforeAll(async () => {
   await pg.exec(SCHEMA_DDL);
+  await db.insert(user).values([makeUser("user-1"), makeUser("cashier-2")]);
 
   const [branch] = await db.insert(branches).values({
     code: "TEST", name_en: "Test Branch", name_ar: "فرع الاختبار",
     currency: "EGP", timezone: "Africa/Cairo", is_active: true,
   }).returning();
   branchId = branch.id;
+  await db.insert(staffAssignments).values({ user_id: "user-1", branch_id: branchId, role: "admin", is_active: true });
+  await db.insert(staffAssignments).values({ user_id: "cashier-2", branch_id: branchId, role: "cashier", is_active: true });
 
   const [area] = await db.insert(diningAreas).values({
     branch_id: branchId, code: "MAIN", name_en: "Main", name_ar: "الرئيسية",
@@ -133,6 +145,14 @@ beforeAll(async () => {
     { menu_item_id: pizzaId, modifier_group_id: extrasGroup.id, sort_order: 2 },
     { menu_item_id: donerId, modifier_group_id: foreignGroup.id, sort_order: 1 },
   ]);
+
+  const [inventoryLocation] = await db.insert(inventoryLocations).values({ branch_id: branchId, code: "PIZZA-KITCHEN", name_en: "Pizza Kitchen", name_ar: "مطبخ البيتزا", is_active: true }).returning();
+  const [ingredientCategory] = await db.insert(ingredientCategories).values({ branch_id: branchId, code: "DAIRY", name_en: "Dairy", name_ar: "ألبان", is_active: true }).returning();
+  const [gram] = await db.insert(unitsOfMeasure).values({ code: "G", name_en: "Gram", name_ar: "جرام", dimension: "mass", base_numerator: 1_000, base_denominator: 1 }).returning();
+  const [cheese] = await db.insert(ingredients).values({ branch_id: branchId, category_id: ingredientCategory.id, sku: "TEST-CHEESE", name_en: "Test cheese", name_ar: "جبن اختبار", base_unit_id: gram.id, dimension: "mass", default_location_id: inventoryLocation.id, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, par_level: null, allow_negative: true, average_unit_cost_micros: 10_000, created_by: "user-1", updated_by: "user-1" }).returning();
+  await db.insert(stockBalances).values({ branch_id: branchId, location_id: inventoryLocation.id, ingredient_id: cheese.id, quantity_base: 10_000_000_000, average_unit_cost_micros: 10_000 });
+  const [recipe] = await db.insert(recipeVersions).values({ branch_id: branchId, menu_item_id: pizzaId, variant_id: smallVariantId, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "user-1", approved_by: "user-1", approved_at: new Date() }).returning();
+  await db.insert(recipeComponents).values({ recipe_version_id: recipe.id, ingredient_id: cheese.id, source_location_id: inventoryLocation.id, modifier_option_id: null, unit_id: gram.id, quantity_input_scaled: 100_000, quantity_base: 100_000_000 });
 
   const [customer] = await db.insert(customers).values({
     name: "Delivery Customer", email: "delivery@example.test", phone: "01000000000",
@@ -225,5 +245,12 @@ describe("order lifecycle", () => {
     await expect(caller.transition({ id: order.id, status: "served" })).rejects.toThrow();
     expect((await caller.transition({ id: order.id, status: "collected" })).status).toBe("collected");
     expect((await caller.transition({ id: order.id, status: "completed" })).status).toBe("completed");
+  });
+
+  it("denies cashier negative-stock override even when a reason is supplied", async () => {
+    const cashierCaller = callerAs("cashier-2");
+    const order = await cashierCaller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("cashier-override"), items: [pizzaLine()] });
+    await expect(cashierCaller.transition({ id: order.id, status: "confirmed", inventoryOverrideReason: "Cashier cannot self authorize" })).rejects.toThrow("Cashiers cannot override");
+    expect((await db.query.orders.findFirst({ where: eq(orders.id, order.id) }))?.status).toBe("pending");
   });
 });

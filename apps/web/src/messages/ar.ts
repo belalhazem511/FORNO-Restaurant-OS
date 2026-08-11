@@ -47,6 +47,7 @@ const messages = {
     paymentMethods: "طرق الدفع",
     pos: "نقطة البيع",
     syncCenter: "مركز المزامنة",
+    inventory: "المخزون",
     adminPanel: "لوحة الإدارة",
     openMenu: "فتح القائمة",
     myAccount: "حسابي",

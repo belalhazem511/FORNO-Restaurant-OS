@@ -14,12 +14,18 @@ export type Permission =
   | "cash:adjust"
   | "print:initial"
   | "print:reprint"
-  | "print:settings";
+  | "print:settings"
+  | "inventory:view"
+  | "inventory:cost:view"
+  | "inventory:configure"
+  | "inventory:adjust"
+  | "inventory:override"
+  | "recipe:manage";
 
 const ROLE_PERMISSIONS: Record<StaffRole, ReadonlySet<Permission>> = {
-  owner: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings"]),
-  admin: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings"]),
-  manager: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings"]),
+  owner: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:configure", "inventory:adjust", "inventory:override", "recipe:manage"]),
+  admin: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:configure", "inventory:adjust", "inventory:override", "recipe:manage"]),
+  manager: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:adjust", "inventory:override", "recipe:manage"]),
   cashier: new Set(["order:create", "checkout:create", "shift:own", "print:initial"]),
 };
 
