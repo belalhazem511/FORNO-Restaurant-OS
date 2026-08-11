@@ -1,21 +1,35 @@
 # FORNO Restaurant OS
 
-نظام موحّد لإدارة المطعم والكافيه: نقطة بيع، طلبات، مخزون، وصفات، مطبخ، تقارير، وموقع عام للمنيو والقصة.
+FORNO Restaurant OS is a full-stack restaurant operations platform for dine-in, takeaway, delivery, cashier workflows, kitchen production, offline POS continuity, and recipe-driven inventory foundations.
 
-> المشروع في مرحلة البناء الأولى. الأساس الحالي مشتق من FinOpenPOS تحت ترخيص MIT، وتم حذف الموديول الضريبي البرازيلي وإعادة تهيئة المشروع لاحتياجات المطاعم في مصر.
+نظام FORNO Restaurant OS هو منصة تشغيل متكاملة للمطاعم تدعم الكاشير، الطلبات، المطبخ، الطباعة، العمل دون اتصال، وإدارة المخزون المعتمدة على الوصفات.
 
-## الموجود حاليًا
+## Current Capabilities
 
-- تطبيق ويب Full-stack باستخدام Next.js 16 وReact 19 وTypeScript.
-- قاعدة PostgreSQL مدمجة محليًا عبر PGLite، مع مسار انتقال إلى PostgreSQL كامل للإنتاج.
-- تسجيل دخول وصلاحيات أساسية باستخدام Better Auth.
-- نقطة بيع أولية، أصناف، عملاء، طلبات، طرق دفع، حركة خزنة، وتقارير ربح ومصروف.
-- واجهة عربية RTL وإنجليزية، وعرض الأسعار بالجنيه المصري.
-- بيانات تجريبية خاصة بمطعم FORNO.
+- POS workflows for dine-in, takeaway, and delivery orders.
+- Cashier shifts, cash payments, financial history, refunds, reversals, and audit records.
+- Thermal receipt and station-routed KOT printing for Pizza, Doner, and Cafe stations.
+- Offline POS mode with durable IndexedDB queueing, PWA shell, synchronization recovery, and offline cash receipts.
+- Recipe-driven inventory foundations with ingredients, units, conversions, stock movements, balances, recipe versions, and theoretical COGS.
+- Branch-scoped permissions, bilingual Arabic RTL and English UI, and Egyptian pound pricing.
+- Local PGLite development database with a production path toward PostgreSQL.
 
-## التشغيل المحلي
+## Technology
 
-المتطلبات: Bun 1.3.5 أو أحدث.
+- Next.js 16, React 19, and TypeScript.
+- Bun workspace tooling.
+- tRPC-style application APIs.
+- Drizzle ORM with PGLite for local development and PostgreSQL-compatible schema design.
+- Better Auth authentication.
+- IndexedDB and service worker support for offline POS operation.
+
+## Local Development
+
+Prerequisites:
+
+- Bun 1.3.5 or newer.
+
+Setup:
 
 ```bash
 bun install
@@ -25,41 +39,60 @@ bun run db:seed
 bun run dev:web
 ```
 
-ثم افتح `http://127.0.0.1:3001`.
+Open:
 
-الحساب التجريبي:
+```text
+http://127.0.0.1:3001
+```
 
-- البريد: `admin@forno.local`
-- كلمة المرور: `Forno123!`
+Default seeded account:
 
-غيّر بيانات الحساب والـsecret قبل أي نشر حقيقي.
+```text
+Email: admin@forno.local
+Password: Forno123!
+```
 
-## أوامر مهمة
+Change seeded credentials and secrets before any real deployment.
+
+## Useful Commands
 
 ```bash
-bun run dev:web       # تشغيل تطبيق الإدارة والكاشير
-bun run check-types   # فحص TypeScript لكل الحزم
+bun run dev:web       # Start the web application
+bun run check-types   # TypeScript validation
 bun run build         # Production build
-bun run db:seed       # إعادة تحميل بيانات FORNO التجريبية بأمان
+bun run db:push       # Explicit schema application
+bun run db:seed       # Idempotent FORNO seed data
 cd apps/web && bun test
 ```
 
-تهيئة قاعدة جديدة والترحيل والـseed عمليات صريحة وليست جزءًا من البناء أو بدء الخادم. لا يحذف النظام قاعدة موجودة تلقائيًا عند الخطأ أو التعارض. راجع [سياسة أمان وتشغيل قاعدة البيانات](docs/04-database-safety.md) قبل الترحيل أو النسخ الاحتياطي أو إعادة الضبط.
+Database schema application and seed commands are explicit operational steps. Builds and server startup must not migrate, seed, reset, delete, or recreate runtime databases automatically. See [Database Safety](docs/04-database-safety.md) before changing database workflows.
 
-## هيكل المشروع
+## Project Structure
 
 ```text
-apps/web       تطبيق الإدارة والكاشير والـAPI
-packages/api   تعريفات API المشتركة
-packages/auth  المصادقة
-packages/db    جداول وعلاقات قاعدة البيانات
-packages/env   إعدادات البيئة
-packages/ui    مكونات الواجهة المشتركة
-docs           نطاق المنتج، المعمارية، وخطة التنفيذ
+apps/web       Web application, POS UI, APIs, database runtime, tests
+packages/api   Shared API contracts
+packages/auth  Authentication helpers
+packages/db    Database schema exports
+packages/env   Environment configuration
+packages/ui    Shared UI primitives
+docs           Product scope, architecture, roadmap, and safety notes
 ```
 
-اقرأ [نطاق النسخة الأولى](docs/01-product-scope.md) و[خطة التنفيذ](docs/02-roadmap.md) قبل إضافة Features جديدة.
+## Documentation
 
-## الأصل والترخيص
+- [Product Scope](docs/01-product-scope.md)
+- [Roadmap](docs/02-roadmap.md)
+- [Architecture](docs/03-architecture.md)
+- [Database Safety](docs/04-database-safety.md)
+- [Offline POS Architecture](docs/05-offline-pos.md)
 
-هذا المشروع مبني على [FinOpenPOS](https://github.com/JoaoHenriqueBarbosa/FinOpenPOS) المرخّص بـMIT. يحتفظ ملف `LICENSE` بإشعار حقوق المصدر كما يشترط الترخيص.
+## Arabic Summary
+
+يوفر النظام حالياً نقطة بيع للمطاعم، إدارة الطلبات، الورديات، المدفوعات النقدية، الطباعة الحرارية، العمل دون اتصال، إيصالات نقدية مؤقتة عند انقطاع الإنترنت، ومخزوناً أولياً يعتمد على الوصفات وتكلفة المنتج النظرية.
+
+يجب تنفيذ أوامر قاعدة البيانات مثل `db:push` و `db:seed` بشكل صريح فقط. لا يقوم البناء أو تشغيل الخادم بتعديل قاعدة بيانات التشغيل تلقائياً.
+
+## Origin and License
+
+This project is based on [FinOpenPOS](https://github.com/JoaoHenriqueBarbosa/FinOpenPOS), licensed under MIT. The repository keeps the original license notice in [LICENSE](LICENSE).
