@@ -47,10 +47,12 @@ export const PRINT_DOCUMENT_TYPES = ["receipt", "order_summary", "kot", "refund"
 export const PRINT_JOB_STATUSES = ["requested", "previewed", "acknowledged", "failed", "cancelled"] as const;
 export const PRINT_LANGUAGES = ["ar", "en", "bilingual"] as const;
 export const PRINT_PAPER_WIDTHS = [58, 80] as const;
+export const OFFLINE_SYNC_STATUSES = ["accepted", "needs_review", "resolved"] as const;
 export type PrintDocumentType = (typeof PRINT_DOCUMENT_TYPES)[number];
 export type PrintJobStatus = (typeof PRINT_JOB_STATUSES)[number];
 export type PrintLanguage = (typeof PRINT_LANGUAGES)[number];
 export type PrintPaperWidth = (typeof PRINT_PAPER_WIDTHS)[number];
+export type OfflineSyncStatus = (typeof OFFLINE_SYNC_STATUSES)[number];
 
 export const branches = pgTable(
   "branches",
@@ -612,6 +614,39 @@ export const printJobs = pgTable(
   ],
 );
 
+export const offlineSyncRecords = pgTable(
+  "offline_sync_records",
+  {
+    id: serial("id").primaryKey(),
+    branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+    register_id: integer("register_id").references(() => cashierRegisters.id, { onDelete: "restrict" }),
+    shift_id: integer("shift_id").references(() => cashierShifts.id, { onDelete: "restrict" }),
+    actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+    client_operation_id: varchar("client_operation_id", { length: 100 }).notNull(),
+    order_client_request_id: varchar("order_client_request_id", { length: 80 }).notNull(),
+    checkout_idempotency_key: varchar("checkout_idempotency_key", { length: 100 }),
+    status: varchar("status", { length: 20 }).$type<OfflineSyncStatus>().notNull(),
+    conflict_code: varchar("conflict_code", { length: 60 }),
+    conflict_details: text("conflict_details"),
+    order_id: integer("order_id").references(() => orders.id, { onDelete: "restrict" }),
+    checkout_id: integer("checkout_id").references(() => orderCheckouts.id, { onDelete: "restrict" }),
+    resolved_by: text("resolved_by").references(() => user.id, { onDelete: "restrict" }),
+    resolution_reason: text("resolution_reason"),
+    resolved_at: timestamp("resolved_at"),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+    updated_at: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("offline_sync_records_operation_uidx").on(table.client_operation_id),
+    index("offline_sync_records_order_request_idx").on(table.order_client_request_id),
+    uniqueIndex("offline_sync_records_checkout_key_uidx").on(table.checkout_idempotency_key),
+    index("offline_sync_records_branch_status_idx").on(table.branch_id, table.status, table.updated_at),
+    index("offline_sync_records_actor_idx").on(table.actor_user_id, table.created_at),
+    check("offline_sync_records_status_check", sql`${table.status} in ('accepted', 'needs_review', 'resolved')`),
+    check("offline_sync_records_conflict_check", sql`(${table.status} = 'accepted' and ${table.conflict_code} is null and ${table.order_id} is not null and (${table.checkout_idempotency_key} is null or ${table.checkout_id} is not null)) or (${table.status} = 'needs_review' and ${table.conflict_code} is not null) or (${table.status} = 'resolved' and ${table.resolved_by} is not null and length(trim(${table.resolution_reason})) >= 3 and ${table.resolved_at} is not null)`),
+  ],
+);
+
 export const transactions = pgTable(
   "transactions",
   {
@@ -667,3 +702,4 @@ export const orderPaymentsRelations = relations(orderPayments, ({ one }) => ({ c
 export const orderCancellationsRelations = relations(orderCancellations, ({ one }) => ({ order: one(orders, { fields: [orderCancellations.order_id], references: [orders.id] }), shift: one(cashierShifts, { fields: [orderCancellations.shift_id], references: [cashierShifts.id] }) }));
 export const auditLogsRelations = relations(auditLogs, ({ one }) => ({ branch: one(branches, { fields: [auditLogs.branch_id], references: [branches.id] }), shift: one(cashierShifts, { fields: [auditLogs.shift_id], references: [cashierShifts.id] }), order: one(orders, { fields: [auditLogs.order_id], references: [orders.id] }) }));
 export const printJobsRelations = relations(printJobs, ({ one }) => ({ order: one(orders, { fields: [printJobs.order_id], references: [orders.id] }), station: one(kitchenStations, { fields: [printJobs.station_id], references: [kitchenStations.id] }), register: one(cashierRegisters, { fields: [printJobs.register_id], references: [cashierRegisters.id] }), shift: one(cashierShifts, { fields: [printJobs.shift_id], references: [cashierShifts.id] }) }));
+export const offlineSyncRecordsRelations = relations(offlineSyncRecords, ({ one }) => ({ branch: one(branches, { fields: [offlineSyncRecords.branch_id], references: [branches.id] }), register: one(cashierRegisters, { fields: [offlineSyncRecords.register_id], references: [cashierRegisters.id] }), shift: one(cashierShifts, { fields: [offlineSyncRecords.shift_id], references: [cashierShifts.id] }), order: one(orders, { fields: [offlineSyncRecords.order_id], references: [orders.id] }), checkout: one(orderCheckouts, { fields: [offlineSyncRecords.checkout_id], references: [orderCheckouts.id] }) }));

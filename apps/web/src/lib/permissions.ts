@@ -27,6 +27,10 @@ export function hasPermission(role: StaffRole, permission: Permission) {
   return ROLE_PERMISSIONS[role].has(permission);
 }
 
+export function permissionsForRole(role: StaffRole): Permission[] {
+  return [...ROLE_PERMISSIONS[role]];
+}
+
 export function assertPermission(role: StaffRole, permission: Permission) {
   if (!hasPermission(role, permission)) {
     throw new TRPCError({ code: "FORBIDDEN", message: `Role ${role} cannot perform ${permission}` });
