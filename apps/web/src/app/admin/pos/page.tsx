@@ -55,6 +55,7 @@ import {
 } from "@/lib/pos/cart";
 import { useTRPC } from "@/lib/trpc/client";
 import type { RouterOutputs } from "@/lib/trpc/router";
+import { PrintActions } from "@/components/printing/print-actions";
 
 type RestaurantBranch = RouterOutputs["restaurant"]["model"][number];
 type MenuCategory = RestaurantBranch["menuCategories"][number];
@@ -314,6 +315,7 @@ export default function POSPage() {
           <div className="rounded-full bg-emerald-100 p-4 text-emerald-700"><CheckCircle2Icon className="h-14 w-14" /></div>
           <div className="space-y-2"><h2 className="text-3xl font-bold">{t("orderCreated")}</h2><p className="text-lg text-muted-foreground">{t("orderNumber", { number: successOrderId })}</p></div>
           {checkoutResult ? <div className="w-full rounded-xl border border-emerald-300 bg-emerald-50 p-4 text-emerald-900"><p className="font-bold">{t("paymentComplete")}</p><p>{t("amountPaid")}: {formatCurrency(checkoutResult.payableAmount, locale)}</p>{checkoutResult.changeAmount > 0 && <p>{t("changeDue")}: {formatCurrency(checkoutResult.changeAmount, locale)}</p>}</div> : activeShift ? <Button size="lg" className="min-h-14 w-full text-base" onClick={() => setCheckoutOpen(true)}><CreditCardIcon />{t("checkoutOrder")}</Button> : <div className="w-full rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-900"><p className="font-semibold">{t("activeShiftRequired")}</p><Button className="mt-3 min-h-11" variant="outline" asChild><Link href="/admin/cashier">{t("openShift")}</Link></Button></div>}
+          <div className="w-full"><PrintActions orderId={successOrderId} compact /></div>
           <div className="flex w-full flex-col gap-3 sm:flex-row sm:justify-center">
             <Button size="lg" className="min-h-12" onClick={startNewOrder}>{t("newOrder")}</Button>
             <Button size="lg" variant="outline" className="min-h-12" asChild><Link href={`/admin/orders/${successOrderId}`}>{t("viewOrder")}</Link></Button>
@@ -486,6 +488,7 @@ function POSCheckoutDialog({
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: trpc.orders.list.queryOptions().queryKey }),
         queryClient.invalidateQueries({ queryKey: trpc.shifts.context.queryOptions({ branchId }).queryKey }),
+        queryClient.invalidateQueries({ queryKey: trpc.printing.options.queryOptions({ orderId }).queryKey }),
       ]);
       onSuccess(result);
     },

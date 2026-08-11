@@ -12,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@forno/ui/components/skeleton";
 import { useTRPC } from "@/lib/trpc/client";
 import { formatCurrency } from "@/lib/utils";
+import { PrintSettings } from "@/components/printing/print-settings";
 
 function minorUnits(value: string) {
   const parsed = Number(value);
@@ -96,6 +97,7 @@ export default function CashierShiftsPage() {
         </>
       )}
 
+      <PrintSettings branchId={branch.id} />
       <Card><CardHeader><CardTitle>{t("shiftHistory")}</CardTitle></CardHeader><CardContent className="space-y-3">{historyQuery.data?.length ? historyQuery.data.map((entry) => <div key={entry.id} className="grid gap-2 rounded-lg border p-4 sm:grid-cols-5"><strong>#{entry.id} · {entry.register.code}</strong><span>{entry.status === "open" ? t("shiftOpen") : t("shiftClosed")}</span><span>{t("expectedCash")}: {formatCurrency(entry.summary.expectedCash, locale)}</span><span>{t("closingCash")}: {entry.closing_cash == null ? "—" : formatCurrency(entry.closing_cash, locale)}</span><span>{t("variance")}: {entry.variance == null ? "—" : formatCurrency(entry.variance, locale)}</span></div>) : <p className="text-muted-foreground">{t("noShiftHistory")}</p>}</CardContent></Card>
     </div>
   );

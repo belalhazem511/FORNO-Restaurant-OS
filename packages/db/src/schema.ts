@@ -43,6 +43,14 @@ export const STAFF_ROLES = ["owner", "admin", "manager", "cashier"] as const;
 export type StaffRole = (typeof STAFF_ROLES)[number];
 export const PAYMENT_STATUSES = ["unpaid", "paid", "refunded"] as const;
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
+export const PRINT_DOCUMENT_TYPES = ["receipt", "order_summary", "kot", "refund", "reversal"] as const;
+export const PRINT_JOB_STATUSES = ["requested", "previewed", "acknowledged", "failed", "cancelled"] as const;
+export const PRINT_LANGUAGES = ["ar", "en", "bilingual"] as const;
+export const PRINT_PAPER_WIDTHS = [58, 80] as const;
+export type PrintDocumentType = (typeof PRINT_DOCUMENT_TYPES)[number];
+export type PrintJobStatus = (typeof PRINT_JOB_STATUSES)[number];
+export type PrintLanguage = (typeof PRINT_LANGUAGES)[number];
+export type PrintPaperWidth = (typeof PRINT_PAPER_WIDTHS)[number];
 
 export const branches = pgTable(
   "branches",
@@ -392,6 +400,27 @@ export const cashierRegisters = pgTable(
   ],
 );
 
+export const registerPrintPreferences = pgTable(
+  "register_print_preferences",
+  {
+    id: serial("id").primaryKey(),
+    register_id: integer("register_id").notNull().references(() => cashierRegisters.id, { onDelete: "cascade" }),
+    paper_width: integer("paper_width").$type<PrintPaperWidth>().default(80).notNull(),
+    language: varchar("language", { length: 12 }).$type<PrintLanguage>().default("bilingual").notNull(),
+    receipt_copies: integer("receipt_copies").default(1).notNull(),
+    kot_copies: integer("kot_copies").default(1).notNull(),
+    updated_by: text("updated_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+    updated_at: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("register_print_preferences_register_uidx").on(table.register_id),
+    check("register_print_preferences_width_check", sql`${table.paper_width} in (58, 80)`),
+    check("register_print_preferences_language_check", sql`${table.language} in ('ar', 'en', 'bilingual')`),
+    check("register_print_preferences_copies_check", sql`${table.receipt_copies} between 1 and 5 and ${table.kot_copies} between 1 and 5`),
+  ],
+);
+
 export const cashierShifts = pgTable(
   "cashier_shifts",
   {
@@ -542,6 +571,47 @@ export const auditLogs = pgTable(
   ],
 );
 
+export const printJobs = pgTable(
+  "print_jobs",
+  {
+    id: serial("id").primaryKey(),
+    order_id: integer("order_id").notNull().references(() => orders.id, { onDelete: "restrict" }),
+    station_id: integer("station_id").references(() => kitchenStations.id, { onDelete: "restrict" }),
+    register_id: integer("register_id").references(() => cashierRegisters.id, { onDelete: "restrict" }),
+    shift_id: integer("shift_id").references(() => cashierShifts.id, { onDelete: "restrict" }),
+    requested_by: text("requested_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+    approved_by: text("approved_by").references(() => user.id, { onDelete: "restrict" }),
+    document_type: varchar("document_type", { length: 20 }).$type<PrintDocumentType>().notNull(),
+    status: varchar("status", { length: 20 }).$type<PrintJobStatus>().default("requested").notNull(),
+    is_reprint: boolean("is_reprint").default(false).notNull(),
+    idempotency_key: varchar("idempotency_key", { length: 120 }).notNull(),
+    copy_count: integer("copy_count").notNull(),
+    paper_width: integer("paper_width").$type<PrintPaperWidth>().notNull(),
+    language: varchar("language", { length: 12 }).$type<PrintLanguage>().notNull(),
+    reprint_reason: text("reprint_reason"),
+    error_message: text("error_message"),
+    requested_at: timestamp("requested_at").defaultNow().notNull(),
+    previewed_at: timestamp("previewed_at"),
+    acknowledged_at: timestamp("acknowledged_at"),
+    updated_at: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("print_jobs_idempotency_uidx").on(table.idempotency_key),
+    uniqueIndex("print_jobs_initial_kot_uidx").on(table.order_id, table.station_id).where(sql`${table.document_type} = 'kot' and ${table.is_reprint} = false`),
+    uniqueIndex("print_jobs_initial_document_uidx").on(table.order_id, table.document_type).where(sql`${table.document_type} <> 'kot' and ${table.is_reprint} = false`),
+    index("print_jobs_order_requested_idx").on(table.order_id, table.requested_at),
+    index("print_jobs_branch_register_idx").on(table.register_id, table.requested_at),
+    index("print_jobs_status_idx").on(table.status),
+    check("print_jobs_document_type_check", sql`${table.document_type} in ('receipt', 'order_summary', 'kot', 'refund', 'reversal')`),
+    check("print_jobs_status_check", sql`${table.status} in ('requested', 'previewed', 'acknowledged', 'failed', 'cancelled')`),
+    check("print_jobs_station_check", sql`(${table.document_type} = 'kot' and ${table.station_id} is not null) or (${table.document_type} <> 'kot' and ${table.station_id} is null)`),
+    check("print_jobs_width_check", sql`${table.paper_width} in (58, 80)`),
+    check("print_jobs_language_check", sql`${table.language} in ('ar', 'en', 'bilingual')`),
+    check("print_jobs_copy_count_check", sql`${table.copy_count} between 1 and 5`),
+    check("print_jobs_reprint_check", sql`(${table.is_reprint} = true and length(trim(${table.reprint_reason})) >= 3 and ${table.approved_by} is not null) or (${table.is_reprint} = false and ${table.reprint_reason} is null)`),
+  ],
+);
+
 export const transactions = pgTable(
   "transactions",
   {
@@ -569,17 +639,17 @@ export const transactions = pgTable(
   ],
 );
 
-export const branchesRelations = relations(branches, ({ many }) => ({ diningAreas: many(diningAreas), kitchenStations: many(kitchenStations), menuCategories: many(menuCategories), modifierGroups: many(modifierGroups), orders: many(orders) }));
+export const branchesRelations = relations(branches, ({ many }) => ({ diningAreas: many(diningAreas), kitchenStations: many(kitchenStations), menuCategories: many(menuCategories), modifierGroups: many(modifierGroups), orders: many(orders), registers: many(cashierRegisters) }));
 export const diningAreasRelations = relations(diningAreas, ({ one, many }) => ({ branch: one(branches, { fields: [diningAreas.branch_id], references: [branches.id] }), tables: many(restaurantTables) }));
 export const restaurantTablesRelations = relations(restaurantTables, ({ one, many }) => ({ diningArea: one(diningAreas, { fields: [restaurantTables.dining_area_id], references: [diningAreas.id] }), orders: many(orders) }));
-export const kitchenStationsRelations = relations(kitchenStations, ({ one, many }) => ({ branch: one(branches, { fields: [kitchenStations.branch_id], references: [branches.id] }), menuItems: many(menuItems) }));
+export const kitchenStationsRelations = relations(kitchenStations, ({ one, many }) => ({ branch: one(branches, { fields: [kitchenStations.branch_id], references: [branches.id] }), menuItems: many(menuItems), printJobs: many(printJobs) }));
 export const menuCategoriesRelations = relations(menuCategories, ({ one, many }) => ({ branch: one(branches, { fields: [menuCategories.branch_id], references: [branches.id] }), menuItems: many(menuItems) }));
 export const menuItemsRelations = relations(menuItems, ({ one, many }) => ({ category: one(menuCategories, { fields: [menuItems.category_id], references: [menuCategories.id] }), kitchenStation: one(kitchenStations, { fields: [menuItems.kitchen_station_id], references: [kitchenStations.id] }), product: one(products, { fields: [menuItems.product_id], references: [products.id] }), variants: many(menuItemVariants), modifierGroups: many(menuItemModifierGroups), orderItems: many(orderItems) }));
 export const menuItemVariantsRelations = relations(menuItemVariants, ({ one, many }) => ({ menuItem: one(menuItems, { fields: [menuItemVariants.menu_item_id], references: [menuItems.id] }), orderItems: many(orderItems) }));
 export const modifierGroupsRelations = relations(modifierGroups, ({ one, many }) => ({ branch: one(branches, { fields: [modifierGroups.branch_id], references: [branches.id] }), options: many(modifierOptions), menuItems: many(menuItemModifierGroups) }));
 export const modifierOptionsRelations = relations(modifierOptions, ({ one, many }) => ({ group: one(modifierGroups, { fields: [modifierOptions.modifier_group_id], references: [modifierGroups.id] }), orderItemModifiers: many(orderItemModifiers) }));
 export const menuItemModifierGroupsRelations = relations(menuItemModifierGroups, ({ one }) => ({ menuItem: one(menuItems, { fields: [menuItemModifierGroups.menu_item_id], references: [menuItems.id] }), modifierGroup: one(modifierGroups, { fields: [menuItemModifierGroups.modifier_group_id], references: [modifierGroups.id] }) }));
-export const ordersRelations = relations(orders, ({ one, many }) => ({ branch: one(branches, { fields: [orders.branch_id], references: [branches.id] }), customer: one(customers, { fields: [orders.customer_id], references: [customers.id] }), diningTable: one(restaurantTables, { fields: [orders.dining_table_id], references: [restaurantTables.id] }), orderItems: many(orderItems), statusHistory: many(orderStatusHistory), transactions: many(transactions) }));
+export const ordersRelations = relations(orders, ({ one, many }) => ({ branch: one(branches, { fields: [orders.branch_id], references: [branches.id] }), customer: one(customers, { fields: [orders.customer_id], references: [customers.id] }), diningTable: one(restaurantTables, { fields: [orders.dining_table_id], references: [restaurantTables.id] }), orderItems: many(orderItems), statusHistory: many(orderStatusHistory), transactions: many(transactions), checkouts: many(orderCheckouts), payments: many(orderPayments), cancellations: many(orderCancellations), printJobs: many(printJobs) }));
 export const orderItemsRelations = relations(orderItems, ({ one, many }) => ({ order: one(orders, { fields: [orderItems.order_id], references: [orders.id] }), product: one(products, { fields: [orderItems.product_id], references: [products.id] }), menuItem: one(menuItems, { fields: [orderItems.menu_item_id], references: [menuItems.id] }), variant: one(menuItemVariants, { fields: [orderItems.variant_id], references: [menuItemVariants.id] }), modifiers: many(orderItemModifiers) }));
 export const orderItemModifiersRelations = relations(orderItemModifiers, ({ one }) => ({ orderItem: one(orderItems, { fields: [orderItemModifiers.order_item_id], references: [orderItems.id] }), modifierOption: one(modifierOptions, { fields: [orderItemModifiers.modifier_option_id], references: [modifierOptions.id] }) }));
 export const orderStatusHistoryRelations = relations(orderStatusHistory, ({ one }) => ({ order: one(orders, { fields: [orderStatusHistory.order_id], references: [orders.id] }) }));
@@ -588,10 +658,12 @@ export const customersRelations = relations(customers, ({ many }) => ({ orders: 
 export const productsRelations = relations(products, ({ one, many }) => ({ menuItem: one(menuItems), orderItems: many(orderItems) }));
 export const paymentMethodsRelations = relations(paymentMethods, ({ many }) => ({ transactions: many(transactions) }));
 export const staffAssignmentsRelations = relations(staffAssignments, ({ one }) => ({ branch: one(branches, { fields: [staffAssignments.branch_id], references: [branches.id] }), user: one(user, { fields: [staffAssignments.user_id], references: [user.id] }) }));
-export const cashierRegistersRelations = relations(cashierRegisters, ({ one, many }) => ({ branch: one(branches, { fields: [cashierRegisters.branch_id], references: [branches.id] }), shifts: many(cashierShifts) }));
+export const cashierRegistersRelations = relations(cashierRegisters, ({ one, many }) => ({ branch: one(branches, { fields: [cashierRegisters.branch_id], references: [branches.id] }), shifts: many(cashierShifts), printPreferences: many(registerPrintPreferences), printJobs: many(printJobs) }));
+export const registerPrintPreferencesRelations = relations(registerPrintPreferences, ({ one }) => ({ register: one(cashierRegisters, { fields: [registerPrintPreferences.register_id], references: [cashierRegisters.id] }) }));
 export const cashierShiftsRelations = relations(cashierShifts, ({ one, many }) => ({ branch: one(branches, { fields: [cashierShifts.branch_id], references: [branches.id] }), register: one(cashierRegisters, { fields: [cashierShifts.register_id], references: [cashierRegisters.id] }), movements: many(shiftCashMovements), payments: many(orderPayments), checkouts: many(orderCheckouts) }));
 export const shiftCashMovementsRelations = relations(shiftCashMovements, ({ one }) => ({ shift: one(cashierShifts, { fields: [shiftCashMovements.shift_id], references: [cashierShifts.id] }) }));
 export const orderCheckoutsRelations = relations(orderCheckouts, ({ one, many }) => ({ order: one(orders, { fields: [orderCheckouts.order_id], references: [orders.id] }), shift: one(cashierShifts, { fields: [orderCheckouts.shift_id], references: [cashierShifts.id] }), payments: many(orderPayments) }));
 export const orderPaymentsRelations = relations(orderPayments, ({ one }) => ({ checkout: one(orderCheckouts, { fields: [orderPayments.checkout_id], references: [orderCheckouts.id] }), order: one(orders, { fields: [orderPayments.order_id], references: [orders.id] }), shift: one(cashierShifts, { fields: [orderPayments.shift_id], references: [cashierShifts.id] }), paymentMethod: one(paymentMethods, { fields: [orderPayments.payment_method_id], references: [paymentMethods.id] }), originalPayment: one(orderPayments, { fields: [orderPayments.original_payment_id], references: [orderPayments.id], relationName: "payment_refund" }) }));
 export const orderCancellationsRelations = relations(orderCancellations, ({ one }) => ({ order: one(orders, { fields: [orderCancellations.order_id], references: [orders.id] }), shift: one(cashierShifts, { fields: [orderCancellations.shift_id], references: [cashierShifts.id] }) }));
 export const auditLogsRelations = relations(auditLogs, ({ one }) => ({ branch: one(branches, { fields: [auditLogs.branch_id], references: [branches.id] }), shift: one(cashierShifts, { fields: [auditLogs.shift_id], references: [cashierShifts.id] }), order: one(orders, { fields: [auditLogs.order_id], references: [orders.id] }) }));
+export const printJobsRelations = relations(printJobs, ({ one }) => ({ order: one(orders, { fields: [printJobs.order_id], references: [orders.id] }), station: one(kitchenStations, { fields: [printJobs.station_id], references: [kitchenStations.id] }), register: one(cashierRegisters, { fields: [printJobs.register_id], references: [cashierRegisters.id] }), shift: one(cashierShifts, { fields: [printJobs.shift_id], references: [cashierShifts.id] }) }));

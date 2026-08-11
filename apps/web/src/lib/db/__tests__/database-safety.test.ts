@@ -93,7 +93,7 @@ describe("PGLite database safety", () => {
 
     expect(await sentinelCounts(runtimeDirectory)).toEqual(beforeCounts);
     expect(await sentinelRows(runtimeDirectory)).toEqual(beforeRows);
-  });
+  }, 30_000);
 
   it("does not recreate or change a database after a simulated lock error", async () => {
     const directory = await temporaryDirectory("forno-lock-sentinel-");

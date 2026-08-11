@@ -21,6 +21,7 @@ const TABLES: PgTable[] = [
   schema.menuItemModifierGroups,
   schema.customers,
   schema.cashierRegisters,
+  schema.registerPrintPreferences,
   schema.cashierShifts,
   schema.shiftCashMovements,
   schema.paymentMethods,
@@ -32,6 +33,7 @@ const TABLES: PgTable[] = [
   schema.orderPayments,
   schema.orderCancellations,
   schema.auditLogs,
+  schema.printJobs,
   schema.transactions,
 ];
 
@@ -74,7 +76,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS order_checkouts_order_uidx ON order_checkouts 
 CREATE UNIQUE INDEX IF NOT EXISTS order_checkouts_idempotency_uidx ON order_checkouts (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS order_cancellations_order_uidx ON order_cancellations (order_id);
 CREATE UNIQUE INDEX IF NOT EXISTS order_cancellations_idempotency_uidx ON order_cancellations (idempotency_key);
-CREATE UNIQUE INDEX IF NOT EXISTS order_payments_refund_original_uidx ON order_payments (original_payment_id) WHERE kind = 'refund';`;
+CREATE UNIQUE INDEX IF NOT EXISTS order_payments_refund_original_uidx ON order_payments (original_payment_id) WHERE kind = 'refund';
+CREATE UNIQUE INDEX IF NOT EXISTS register_print_preferences_register_uidx ON register_print_preferences (register_id);
+CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_idempotency_uidx ON print_jobs (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_kot_uidx ON print_jobs (order_id, station_id) WHERE document_type = 'kot' AND is_reprint = false;
+CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_document_uidx ON print_jobs (order_id, document_type) WHERE document_type <> 'kot' AND is_reprint = false;`;
 
 export function createTestDb() {
   const pg = new PGlite();

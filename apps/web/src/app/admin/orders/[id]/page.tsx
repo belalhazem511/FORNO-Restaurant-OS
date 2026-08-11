@@ -17,6 +17,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@forno/ui/components/dialog";
 import { Input } from "@forno/ui/components/input";
 import { Label } from "@forno/ui/components/label";
+import { PrintActions } from "@/components/printing/print-actions";
 
 type OrderItem = NonNullable<RouterOutputs["orders"]["get"]>["orderItems"][number];
 
@@ -43,6 +44,7 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
         queryClient.invalidateQueries({ queryKey: trpc.orders.list.queryOptions().queryKey }),
         queryClient.invalidateQueries({ queryKey: trpc.checkout.financials.queryOptions({ orderId }).queryKey }),
         queryClient.invalidateQueries({ queryKey: trpc.restaurant.model.queryOptions().queryKey }),
+        queryClient.invalidateQueries({ queryKey: trpc.printing.options.queryOptions({ orderId }).queryKey }),
       ]);
     },
     onError: (cause) => setCancelError(cause.message),
@@ -152,6 +154,8 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
           </CardContent>
         </Card>
       )}
+
+      <PrintActions orderId={order.id} />
 
       <Card>
         <CardHeader className="flex-row items-center justify-between"><CardTitle>{t("financialHistory")}</CardTitle>{financialsQuery.data?.canCancel && order.status !== "cancelled" && <Button variant={order.payment_status === "paid" ? "destructive" : "outline"} onClick={() => setCancelOpen(true)}>{order.payment_status === "paid" ? t("reverseAndCancel") : t("cancelOrder")}</Button>}</CardHeader>

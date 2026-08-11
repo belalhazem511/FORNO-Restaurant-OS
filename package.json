@@ -29,7 +29,7 @@
     "build": "turbo build",
     "check-types": "turbo check-types",
     "dev:web": "turbo -F web dev",
-    "db:push": "turbo -F @forno/db db:push",
+    "db:push": "turbo -F web db:push",
     "db:studio": "turbo -F @forno/db db:studio",
     "db:generate": "turbo -F @forno/db db:generate",
     "db:migrate": "turbo -F @forno/db db:migrate",

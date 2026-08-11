@@ -21,6 +21,7 @@ import {
   orderStatusHistory,
   paymentMethods,
   products,
+  registerPrintPreferences,
   restaurantTables,
   staffAssignments,
   transactions,
@@ -232,6 +233,14 @@ export async function seed() {
   const table1 = tables.find((table) => table.code === "T1")!;
   const register = await db.query.cashierRegisters.findFirst({ where: and(eq(cashierRegisters.branch_id, branch.id), eq(cashierRegisters.code, "FRONT")) });
   if (!register) throw new Error("Failed to seed cashier register");
+  await db.insert(registerPrintPreferences).values({
+    register_id: register.id,
+    paper_width: 80,
+    language: "bilingual",
+    receipt_copies: 1,
+    kot_copies: 1,
+    updated_by: userId,
+  }).onConflictDoNothing();
   let demoShift = await db.query.cashierShifts.findFirst({ where: and(
     eq(cashierShifts.register_id, register.id),
     eq(cashierShifts.opened_by, userId),

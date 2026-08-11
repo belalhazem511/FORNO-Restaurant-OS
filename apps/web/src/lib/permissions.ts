@@ -11,13 +11,16 @@ export type Permission =
   | "discount:apply"
   | "order:cancel"
   | "payment:refund"
-  | "cash:adjust";
+  | "cash:adjust"
+  | "print:initial"
+  | "print:reprint"
+  | "print:settings";
 
 const ROLE_PERMISSIONS: Record<StaffRole, ReadonlySet<Permission>> = {
-  owner: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust"]),
-  admin: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust"]),
-  manager: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust"]),
-  cashier: new Set(["order:create", "checkout:create", "shift:own"]),
+  owner: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings"]),
+  admin: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings"]),
+  manager: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings"]),
+  cashier: new Set(["order:create", "checkout:create", "shift:own", "print:initial"]),
 };
 
 export function hasPermission(role: StaffRole, permission: Permission) {
