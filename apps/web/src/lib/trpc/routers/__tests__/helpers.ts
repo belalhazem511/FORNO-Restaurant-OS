@@ -34,6 +34,7 @@ const TABLES: PgTable[] = [
   schema.orderCancellations,
   schema.auditLogs,
   schema.printJobs,
+  schema.offlineSyncRecords,
   schema.transactions,
 ];
 
@@ -80,7 +81,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS order_payments_refund_original_uidx ON order_p
 CREATE UNIQUE INDEX IF NOT EXISTS register_print_preferences_register_uidx ON register_print_preferences (register_id);
 CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_idempotency_uidx ON print_jobs (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_kot_uidx ON print_jobs (order_id, station_id) WHERE document_type = 'kot' AND is_reprint = false;
-CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_document_uidx ON print_jobs (order_id, document_type) WHERE document_type <> 'kot' AND is_reprint = false;`;
+CREATE UNIQUE INDEX IF NOT EXISTS print_jobs_initial_document_uidx ON print_jobs (order_id, document_type) WHERE document_type <> 'kot' AND is_reprint = false;
+CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_operation_uidx ON offline_sync_records (client_operation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS offline_sync_records_checkout_key_uidx ON offline_sync_records (checkout_idempotency_key);`;
 
 export function createTestDb() {
   const pg = new PGlite();

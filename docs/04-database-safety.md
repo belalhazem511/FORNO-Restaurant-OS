@@ -53,3 +53,11 @@ It is disabled when `NODE_ENV=production`, prints the exact target, and requires
 ## Concurrency
 
 Only one application process should use a file-backed runtime PGLite directory. Builds and tests are isolated and safe to run concurrently. Schema migration, seed, backup, restore, and reset should run with the runtime server stopped; lock errors are failures and never trigger deletion.
+
+## Offline synchronization records
+
+`offline_sync_records` is a recovery and idempotency ledger, not a disposable queue mirror. It records the branch, actor, client operation/request keys, optional checkout key, authoritative order/checkout mapping, conflict state, and manager resolution reason. Accepted order-only operations may have no checkout; any record carrying a checkout idempotency key must map to an authoritative checkout before it is accepted.
+
+The browser queue never mutates PGLite directly. Synchronization enters the authenticated API and is revalidated inside a database transaction. Retried operation IDs, order request IDs, checkout keys, KOT keys, and initial receipt constraints prevent duplicate orders, payments, station jobs, and receipts. Needs Review records and browser financial payloads are retained until acknowledged recovery; no automatic cleanup path removes pending or failed cash sales.
+
+Adding this table requires the same explicit, backed-up `bun run db:push` workflow described above. Development startup and production builds do not apply it. Tests construct isolated schemas, and seed/build verification continues to use unique temporary PGLite directories.

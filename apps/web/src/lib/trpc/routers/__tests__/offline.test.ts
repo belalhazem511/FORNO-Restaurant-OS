@@ -1,0 +1,199 @@
+import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
+import { and, eq } from "drizzle-orm";
+import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
+
+const { pg, db } = createTestDb();
+mock.module("@/lib/db", () => ({ db, pglite: pg }));
+
+const { offlineRouter } = await import("../offline");
+const { createCallerFactory } = await import("../../init");
+const schema = await import("@/lib/db/schema");
+const caller = (id: string) => createCallerFactory(offlineRouter)({ user: makeUser(id) });
+const cashier = caller("offline-cashier");
+const manager = caller("offline-manager");
+const outsider = caller("offline-outsider");
+
+let branchId: number;
+let otherBranchId: number;
+let registerId: number;
+let shiftId: number;
+let tableId: number;
+let revision: string;
+let items: Array<{ id: number; stationId: number; price: number }>;
+let sequence = 0;
+
+function operation(overrides: Record<string, unknown> = {}) {
+  const id = ++sequence;
+  const base = {
+    kind: "cash_sale" as const,
+    clientOperationId: `offline-operation-${id.toString().padStart(4, "0")}`,
+    snapshotRevision: revision,
+    branchId,
+    registerId,
+    shiftId,
+    order: {
+      clientRequestId: `offline-order-request-${id.toString().padStart(4, "0")}`,
+      orderType: "takeaway" as "dine_in" | "takeaway" | "delivery",
+      diningTableId: null as number | null,
+      deliveryAddress: null,
+      deliveryContact: null,
+      expectedTotal: items.reduce((sum, item) => sum + item.price, 0),
+      items: items.map((item) => ({ menuItemId: item.id, variantId: null, modifierOptionIds: [], quantity: 1, notes: item.stationId === items[0].stationId ? "No onions" : null })),
+    },
+    cash: { checkoutIdempotencyKey: `offline-checkout-${id.toString().padStart(4, "0")}`, tenderedAmount: 100_000 },
+    kotAcknowledgements: items.map((item) => ({ stationId: item.stationId, idempotencyKey: `offline-kot-${id}-${item.stationId}`, previewed: true, acknowledged: false })),
+  };
+  return { ...base, ...overrides };
+}
+
+beforeAll(async () => {
+  await pg.exec(SCHEMA_DDL);
+  await db.insert(schema.user).values([
+    { id: "offline-cashier", name: "Offline Cashier", email: "offline-cashier@test.local", emailVerified: true, createdAt: new Date(), updatedAt: new Date() },
+    { id: "offline-manager", name: "Offline Manager", email: "offline-manager@test.local", emailVerified: true, createdAt: new Date(), updatedAt: new Date() },
+    { id: "offline-outsider", name: "Outsider", email: "offline-outsider@test.local", emailVerified: true, createdAt: new Date(), updatedAt: new Date() },
+  ]);
+  const branches = await db.insert(schema.branches).values([
+    { code: "OFFLINE", name_en: "Offline Branch", name_ar: "فرع دون اتصال", currency: "EGP", timezone: "Africa/Cairo", is_active: true },
+    { code: "OFFLINE-OTHER", name_en: "Other", name_ar: "آخر", currency: "EGP", timezone: "Africa/Cairo", is_active: true },
+  ]).returning();
+  branchId = branches[0].id;
+  otherBranchId = branches[1].id;
+  await db.insert(schema.staffAssignments).values([
+    { user_id: "offline-cashier", branch_id: branchId, role: "cashier", is_active: true, updated_at: new Date() },
+    { user_id: "offline-manager", branch_id: branchId, role: "manager", is_active: true, updated_at: new Date() },
+    { user_id: "offline-outsider", branch_id: otherBranchId, role: "cashier", is_active: true, updated_at: new Date() },
+  ]);
+  const [register] = await db.insert(schema.cashierRegisters).values({ branch_id: branchId, code: "OFFLINE-POS", name_en: "Offline POS", name_ar: "كاشير", is_active: true }).returning();
+  registerId = register.id;
+  const [shift] = await db.insert(schema.cashierShifts).values({ branch_id: branchId, register_id: registerId, cashier_user_id: "offline-cashier", opened_by: "offline-manager", status: "open", opening_float: 0 }).returning();
+  shiftId = shift.id;
+  await db.insert(schema.registerPrintPreferences).values({ register_id: registerId, paper_width: 80, language: "bilingual", receipt_copies: 1, kot_copies: 1, updated_by: "offline-manager" });
+  await db.insert(schema.paymentMethods).values({ code: "CASH", name: "Cash", affects_drawer: true, is_active: true });
+  const [area] = await db.insert(schema.diningAreas).values({ branch_id: branchId, code: "MAIN", name_en: "Main", name_ar: "رئيسية", is_active: true, sort_order: 1 }).returning();
+  const [table] = await db.insert(schema.restaurantTables).values({ dining_area_id: area.id, code: "T1", name_en: "Table 1", name_ar: "طاولة ١", capacity: 4, status: "available", is_active: true }).returning();
+  tableId = table.id;
+  const stations = await db.insert(schema.kitchenStations).values([
+    { branch_id: branchId, code: "PIZZA", name_en: "Pizza", name_ar: "بيتزا", is_active: true },
+    { branch_id: branchId, code: "DONER", name_en: "Doner", name_ar: "دونر", is_active: true },
+    { branch_id: branchId, code: "CAFE", name_en: "Cafe", name_ar: "كافيه", is_active: true },
+  ]).returning();
+  items = [];
+  for (const [index, station] of stations.entries()) {
+    const code = station.code;
+    const [category] = await db.insert(schema.menuCategories).values({ branch_id: branchId, code, name_en: code, name_ar: code, is_active: true, sort_order: index }).returning();
+    const [product] = await db.insert(schema.products).values({ name: code, price: 10_000 + index * 1_000, in_stock: 100, user_uid: "offline-manager", category: code }).returning();
+    const [item] = await db.insert(schema.menuItems).values({ category_id: category.id, kitchen_station_id: station.id, product_id: product.id, code: `${code}-ITEM`, name_en: `${code} item`, name_ar: code, base_price: product.price, is_available: true, sort_order: 1 }).returning();
+    items.push({ id: item.id, stationId: station.id, price: item.base_price });
+  }
+  revision = (await cashier.bootstrap({ branchId })).revision;
+});
+
+afterAll(async () => { await pg.close(); });
+
+describe("offline POS bootstrap and authoritative synchronization", () => {
+  it("returns a scoped, versioned snapshot with an active shift, register, menu, stations, tables, permissions, and printing preferences", async () => {
+    const snapshot = await cashier.bootstrap({ branchId });
+    expect(snapshot.version).toBe(1);
+    expect(snapshot.userId).toBe("offline-cashier");
+    expect(snapshot.branch.menuCategories).toHaveLength(3);
+    expect(snapshot.branch.kitchenStations.map((station) => station.code)).toEqual(["PIZZA", "DONER", "CAFE"]);
+    expect(snapshot.shift.id).toBe(shiftId);
+    expect(snapshot.register.id).toBe(registerId);
+    expect(snapshot.permissions).toContain("order:create");
+    expect(snapshot.printing).toEqual({ paperWidth: 80, language: "bilingual", receiptCopies: 1, kotCopies: 1 });
+    expect(new Date(snapshot.expiresAt).getTime()).toBeGreaterThan(new Date(snapshot.staleAt).getTime());
+  });
+
+  it("atomically reprices and creates exactly one order, checkout, payment, status history, transaction, receipt, and KOT per station", async () => {
+    const input = operation();
+    const result = await cashier.sync(input);
+    expect(result.status).toBe("accepted");
+    expect(result.receiptJobId).toBeNumber();
+    const orderId = result.orderId!;
+    expect(await db.select().from(schema.orders).where(eq(schema.orders.id, orderId))).toHaveLength(1);
+    expect(await db.select().from(schema.orderCheckouts).where(eq(schema.orderCheckouts.order_id, orderId))).toHaveLength(1);
+    expect(await db.select().from(schema.orderPayments).where(eq(schema.orderPayments.order_id, orderId))).toHaveLength(1);
+    expect(await db.select().from(schema.transactions).where(eq(schema.transactions.order_id, orderId))).toHaveLength(1);
+    expect(await db.select().from(schema.orderStatusHistory).where(eq(schema.orderStatusHistory.order_id, orderId))).toHaveLength(1);
+    const jobs = await db.select().from(schema.printJobs).where(eq(schema.printJobs.order_id, orderId));
+    expect(jobs.filter((job) => job.document_type === "kot")).toHaveLength(3);
+    expect(jobs.filter((job) => job.document_type === "receipt")).toHaveLength(1);
+    expect(await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.order_id, orderId))).not.toHaveLength(0);
+  });
+
+  it("returns the authoritative mapping on duplicate retries without duplicating financial or print records", async () => {
+    const input = operation();
+    const first = await cashier.sync(input);
+    const duplicate = await cashier.sync(input);
+    expect(duplicate.status).toBe("accepted");
+    expect(duplicate.duplicate).toBe(true);
+    expect(duplicate.orderId).toBe(first.orderId);
+    expect(duplicate.checkoutId).toBe(first.checkoutId);
+    expect(await db.select().from(schema.orderPayments).where(eq(schema.orderPayments.order_id, first.orderId!))).toHaveLength(1);
+    expect((await db.select().from(schema.printJobs).where(eq(schema.printJobs.order_id, first.orderId!))).filter((job) => job.document_type === "kot")).toHaveLength(3);
+  });
+
+  it("rejects tampered cached totals into Needs Review before creating an order", async () => {
+    const input = operation();
+    input.order.expectedTotal -= 500;
+    const result = await cashier.sync(input);
+    expect(result.status).toBe("needs_review");
+    expect(result.conflict?.code).toBe("menu_price_changed");
+    expect(result.conflict?.category).toBe("financial");
+    expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
+    expect(await db.select().from(schema.offlineSyncRecords).where(eq(schema.offlineSyncRecords.client_operation_id, input.clientOperationId))).toHaveLength(1);
+  });
+
+  it("moves insufficient cash to financial Needs Review and never writes a partial payment", async () => {
+    const paymentsBefore = (await db.select().from(schema.orderPayments)).length;
+    const input = operation();
+    input.cash!.tenderedAmount = input.order.expectedTotal - 1;
+    const result = await cashier.sync(input);
+    expect(result.status).toBe("needs_review");
+    expect(result.conflict?.code).toBe("cash_insufficient");
+    expect(await db.select().from(schema.orderPayments)).toHaveLength(paymentsBefore);
+    expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
+  });
+
+  it("detects a table conflict", async () => {
+    await db.update(schema.restaurantTables).set({ status: "occupied" }).where(eq(schema.restaurantTables.id, tableId));
+    const input = operation();
+    input.order.orderType = "dine_in";
+    input.order.diningTableId = tableId;
+    const result = await cashier.sync(input);
+    expect(result.status).toBe("needs_review");
+    expect(result.conflict?.code).toBe("table_occupied");
+    await db.update(schema.restaurantTables).set({ status: "available" }).where(eq(schema.restaurantTables.id, tableId));
+  });
+
+  it("detects closed shifts and permission changes", async () => {
+    await db.update(schema.cashierShifts).set({ status: "closed", closed_at: new Date() }).where(eq(schema.cashierShifts.id, shiftId));
+    expect((await cashier.sync(operation())).conflict?.code).toBe("shift_closed");
+    await db.update(schema.cashierShifts).set({ status: "open", closed_at: null }).where(eq(schema.cashierShifts.id, shiftId));
+    await db.update(schema.staffAssignments).set({ is_active: false }).where(and(eq(schema.staffAssignments.user_id, "offline-cashier"), eq(schema.staffAssignments.branch_id, branchId)));
+    expect((await cashier.sync(operation())).conflict?.code).toBe("user_branch_mismatch");
+    await db.update(schema.staffAssignments).set({ is_active: true }).where(and(eq(schema.staffAssignments.user_id, "offline-cashier"), eq(schema.staffAssignments.branch_id, branchId)));
+  });
+
+  it("requires manager review with a durable audit reason, then revalidates the same operation", async () => {
+    const input = operation();
+    input.order.expectedTotal -= 100;
+    const conflict = await cashier.sync(input);
+    await expect(cashier.resolveReview({ recordId: conflict.conflict!.recordId!, reason: "Cashier self approval" })).rejects.toThrow("Manager");
+    await manager.resolveReview({ recordId: conflict.conflict!.recordId!, reason: "Approved server repricing after cash verification" });
+    const accepted = await cashier.sync(input);
+    expect(accepted.status).toBe("accepted");
+    const record = await db.query.offlineSyncRecords.findFirst({ where: eq(schema.offlineSyncRecords.client_operation_id, input.clientOperationId) });
+    expect(record?.resolution_reason).toBe("Approved server repricing after cash verification");
+    expect((await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.action, "offline.sync.review_resolved"))).length).toBeGreaterThan(0);
+  });
+
+  it("enforces branch and user isolation in bootstrap and synchronization", async () => {
+    await expect(outsider.bootstrap({ branchId })).rejects.toThrow("No offline POS permission");
+    const input = operation({ branchId: otherBranchId });
+    const result = await outsider.sync(input);
+    expect(result.status).toBe("needs_review");
+    expect(result.conflict?.code).toBe("shift_closed");
+  });
+});

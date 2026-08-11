@@ -39,6 +39,13 @@ flowchart TD
 - مستندات الطباعة لا تستقبل أسعارًا أو محتوى ماليًا من العميل؛ يعيد الخادم بناءها من snapshots الطلب والدفع، ويحتوي KOT على أصناف محطته فقط.
 - `print_jobs` يسجل الطلب والمعاينة والإقرار اليدوي كحالات مختلفة. لا يعتبر `window.print()` دليلًا على خروج ورق، ويمكن لاحقًا استبدال adapter المتصفح بجسر محلي موثوق دون تغيير منطق المستند.
 
+## Offline POS — Phase 2B2B
+
+- A versioned IndexedDB boundary stores a user/branch-scoped bootstrap snapshot, durable dependency-ordered operations, authoritative ID mappings, and provisional print documents. Cache Storage contains only the application shell and public static assets; API and authentication responses are always network-only.
+- The browser elects one synchronization leader with Web Locks (or a short compatibility lease), retains every unacknowledged operation, and retries temporary failures with bounded exponential backoff and jitter.
+- The server is authoritative for scope, permissions, shift/register/table validity, menu availability, pricing, payment, change, print jobs, and audits. Financial synchronization is transactional and idempotent.
+- Rejected cash sales remain immutable Needs Review records. Manager or Owner/Admin recovery requires an audit reason and full revalidation; pending financial data cannot be cleared by logout or branch/user switching.
+
 ## نموذج المطعم — المرحلة 1
 
 - الفرع يملك مناطق الجلوس، الطاولات، تصنيفات المنيو، مجموعات الإضافات، ومحطات المطبخ.
