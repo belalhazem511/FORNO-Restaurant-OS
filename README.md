@@ -20,6 +20,8 @@
 ```bash
 bun install
 cp apps/web/.env.example apps/web/.env
+bun run db:push
+bun run db:seed
 bun run dev:web
 ```
 
@@ -41,6 +43,8 @@ bun run build         # Production build
 bun run db:seed       # إعادة تحميل بيانات FORNO التجريبية بأمان
 cd apps/web && bun test
 ```
+
+تهيئة قاعدة جديدة والترحيل والـseed عمليات صريحة وليست جزءًا من البناء أو بدء الخادم. لا يحذف النظام قاعدة موجودة تلقائيًا عند الخطأ أو التعارض. راجع [سياسة أمان وتشغيل قاعدة البيانات](docs/04-database-safety.md) قبل الترحيل أو النسخ الاحتياطي أو إعادة الضبط.
 
 ## هيكل المشروع
 

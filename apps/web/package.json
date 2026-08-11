@@ -3,16 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "bun run db:ensure && bun run db:push && next dev --turbo --hostname 127.0.0.1 --port 3001",
-    "build": "bun run db:ensure && bun run db:push && next build",
+    "dev": "bun run db:check && next dev --turbo --hostname 127.0.0.1 --port 3001",
+    "build": "bun scripts/build.ts",
     "start": "next start",
     "lint": "next lint",
     "check-types": "tsc --noEmit",
-    "db:ensure": "bun scripts/ensure-db.ts",
-    "db:push": "drizzle-kit push",
+    "db:check": "bun scripts/ensure-db.ts",
+    "db:push": "bun scripts/push-schema.ts",
     "db:seed": "bun src/lib/db/seed.ts",
-    "test": "bun test src/lib/trpc/routers/__tests__",
-    "test:coverage": "bun test --coverage src/lib/trpc/routers/__tests__",
+    "db:reset:dev": "bun scripts/reset-db.ts --confirm-delete-runtime-database",
+    "test": "bun test src/lib/trpc/routers/__tests__ src/lib/db/__tests__",
+    "test:coverage": "bun test --coverage src/lib/trpc/routers/__tests__ src/lib/db/__tests__",
     "prepare-prod": "bun scripts/prepare-prod.ts"
   },
   "dependencies": {

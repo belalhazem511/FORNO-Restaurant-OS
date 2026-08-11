@@ -5,6 +5,6 @@ export default defineConfig({
   driver: "pglite",
   schema: "./src/lib/db/schema.ts",
   dbCredentials: {
-    url: "./data/pglite",
+    url: process.env.FORNO_DATABASE_DIR ?? "./data/pglite",
   },
 });
