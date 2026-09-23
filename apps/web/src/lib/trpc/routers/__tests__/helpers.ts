@@ -9,6 +9,7 @@ const TABLES: PgTable[] = [
   schema.user,
   schema.branches,
   schema.staffAssignments,
+  schema.suppliers,
   schema.diningAreas,
   schema.restaurantTables,
   schema.kitchenStations,
@@ -24,6 +25,8 @@ const TABLES: PgTable[] = [
   schema.unitsOfMeasure,
   schema.ingredients,
   schema.ingredientPackageConversions,
+  schema.purchaseOrders,
+  schema.purchaseOrderLines,
   schema.stockBalances,
   schema.recipeVersions,
   schema.recipeComponents,
@@ -105,6 +108,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS ingredient_categories_branch_code_uidx ON ingr
 CREATE UNIQUE INDEX IF NOT EXISTS units_of_measure_code_uidx ON units_of_measure (code);
 CREATE UNIQUE INDEX IF NOT EXISTS ingredients_branch_sku_uidx ON ingredients (branch_id, sku);
 CREATE UNIQUE INDEX IF NOT EXISTS ingredient_packages_ingredient_code_uidx ON ingredient_package_conversions (ingredient_id, code);
+CREATE UNIQUE INDEX IF NOT EXISTS suppliers_branch_code_uidx ON suppliers (branch_id, code);
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_orders_branch_number_uidx ON purchase_orders (branch_id, po_number);
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_orders_idempotency_uidx ON purchase_orders (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS stock_balances_location_ingredient_uidx ON stock_balances (location_id, ingredient_id);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_configuration_version_uidx ON recipe_versions (menu_item_id, variant_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_base_version_uidx ON recipe_versions (menu_item_id, version) WHERE variant_id IS NULL;

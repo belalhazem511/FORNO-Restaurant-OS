@@ -23,6 +23,11 @@ import {
   products,
   registerPrintPreferences,
   restaurantTables,
+  suppliers,
+  purchaseOrders,
+  purchaseOrderLines,
+  ingredients,
+  unitsOfMeasure,
   staffAssignments,
   transactions,
   user,
@@ -223,6 +228,63 @@ export async function seed() {
   }
 
   await seedInventory(branch.id, userId);
+
+  const [demoSupplier] = await db.insert(suppliers).values({
+    branch_id: branch.id,
+    code: "FRESH-FOODS",
+    name_en: "Fresh Foods Supplier",
+    name_ar: "مورد الأغذية الطازجة",
+    contact_name: "Ahmed Hassan",
+    phone: "+20 100 111 2222",
+    email: "orders@freshfoods.example",
+    address: "Obour City, Cairo",
+    notes: "Demo procurement supplier",
+    created_by: userId,
+    updated_by: userId,
+  }).onConflictDoNothing().returning();
+  const seededSupplier = demoSupplier ?? await db.query.suppliers.findFirst({
+    where: and(eq(suppliers.branch_id, branch.id), eq(suppliers.code, "FRESH-FOODS")),
+  });
+  const flour = await db.query.ingredients.findFirst({
+    where: and(eq(ingredients.branch_id, branch.id), eq(ingredients.sku, "FLOUR-00")),
+  });
+  const gram = await db.query.unitsOfMeasure.findFirst({ where: eq(unitsOfMeasure.code, "G") });
+  if (seededSupplier && flour && gram) {
+    let demoPurchaseOrder = await db.query.purchaseOrders.findFirst({
+      where: eq(purchaseOrders.idempotency_key, "seed-po-fresh-foods"),
+    });
+    if (!demoPurchaseOrder) {
+      [demoPurchaseOrder] = await db.insert(purchaseOrders).values({
+        branch_id: branch.id,
+        supplier_id: seededSupplier.id,
+        supplier_code_snapshot: seededSupplier.code,
+        supplier_name_en_snapshot: seededSupplier.name_en,
+        supplier_name_ar_snapshot: seededSupplier.name_ar,
+        po_number: "PO-DEMO-001",
+        status: "draft",
+        currency: "EGP",
+        subtotal_amount: 18_000,
+        total_amount: 18_000,
+        notes: "Demo draft — receiving is not part of Phase 3B1",
+        idempotency_key: "seed-po-fresh-foods",
+        created_by: userId,
+      }).returning();
+      await db.insert(purchaseOrderLines).values({
+        purchase_order_id: demoPurchaseOrder.id,
+        ingredient_id: flour.id,
+        unit_id: gram.id,
+        ingredient_sku: flour.sku,
+        ingredient_name_en: flour.name_en,
+        ingredient_name_ar: flour.name_ar,
+        unit_code: gram.code,
+        quantity_input_scaled: 10_000,
+        quantity_base: 10_000_000,
+        unit_price_minor: 1_800,
+        line_total_amount: 18_000,
+        notes: "Demo flour order",
+      });
+    }
+  }
 
   const customerSeeds = [
     { name: "Ahmed Hassan", email: "ahmed@forno.demo", phone: "01000000001", status: "active" },

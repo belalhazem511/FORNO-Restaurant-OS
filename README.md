@@ -45,6 +45,7 @@ FORNO now covers the operational backbone of a restaurant POS:
 - Offline POS application shell, local bootstrap snapshot, durable queue, synchronization engine, conflict recovery, and Sync Center.
 - Immediate offline cash receipts that can be printed before internet connectivity returns.
 - Recipe-driven inventory foundations with exact units, stock movements, current balances, recipe versions, and theoretical COGS.
+- Supplier master data and purchase orders with exact quantities, server-calculated totals, lifecycle approvals, and audit history.
 - Seeded FORNO demo data for realistic restaurant operation.
 - Database-safety guarantees so builds and app startup do not mutate runtime databases.
 
@@ -57,6 +58,7 @@ FORNO now covers the operational backbone of a restaurant POS:
 | Phase 2B2B | Complete | Offline POS operation, PWA support, durable sync queue, Sync Center, conflict recovery, and offline cash synchronization. |
 | Offline receipt fix | Complete | Printable offline cash receipts immediately after cash is accepted offline. |
 | Phase 3A | Complete | Recipe-driven inventory foundations, automatic ingredient consumption, exact quantities, weighted-average cost, and theoretical product cost. |
+| Phase 3B1 | Complete | Branch-scoped suppliers and procurement-only purchase orders. Receiving and stock posting remain deferred. |
 
 ## POS And Kitchen Flow
 
@@ -132,7 +134,7 @@ The receipt is rendered from an immutable local snapshot created when offline ca
 
 ## Inventory And Recipe Foundations
 
-Phase 3A adds the foundation for recipe-driven inventory without adding suppliers, purchase orders, receiving, transfers, full stock counts, forecasting, or full accounting.
+Phase 3A adds the foundation for recipe-driven inventory. Phase 3B1 adds supplier master data and purchase-order planning without adding receiving, transfers, full stock counts, forecasting, or full accounting.
 
 <p align="center">
   <img src="docs/assets/inventory-recipe-flow.svg" alt="Recipe-driven inventory flow" width="900">

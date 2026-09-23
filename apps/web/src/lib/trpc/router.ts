@@ -12,6 +12,7 @@ import { checkoutRouter } from "./routers/checkout";
 import { printingRouter } from "./routers/printing";
 import { offlineRouter } from "./routers/offline";
 import { inventoryRouter } from "./routers/inventory";
+import { procurementRouter } from "./routers/procurement";
 
 export const appRouter = router({
   products: productsRouter,
@@ -26,6 +27,7 @@ export const appRouter = router({
   printing: printingRouter,
   offline: offlineRouter,
   inventory: inventoryRouter,
+  procurement: procurementRouter,
 });
 
 export type AppRouter = typeof appRouter;

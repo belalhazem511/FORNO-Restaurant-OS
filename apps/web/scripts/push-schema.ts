@@ -7,7 +7,7 @@ import { validateExistingDatabase } from "./ensure-db";
 export type SchemaPushRunner = (env: NodeJS.ProcessEnv) => Promise<number>;
 
 const runDrizzlePush: SchemaPushRunner = async (env) => {
-  const child = Bun.spawn(["bun", "x", "drizzle-kit", "push"], {
+  const child = Bun.spawn([process.execPath, "x", "drizzle-kit", "push"], {
     cwd: join(import.meta.dir, ".."),
     env,
     stdin: "inherit",

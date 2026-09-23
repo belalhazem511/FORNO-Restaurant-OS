@@ -57,9 +57,11 @@ export type OfflineSyncStatus = (typeof OFFLINE_SYNC_STATUSES)[number];
 export const INVENTORY_DIMENSIONS = ["mass", "volume", "count"] as const;
 export const STOCK_MOVEMENT_TYPES = ["opening_balance", "manual_positive", "manual_negative", "sale_consumption", "sale_consumption_reversal", "waste_discard", "negative_override"] as const;
 export const RECIPE_STATUSES = ["draft", "active", "retired"] as const;
+export const PURCHASE_ORDER_STATUSES = ["draft", "submitted", "approved", "cancelled"] as const;
 export type InventoryDimension = (typeof INVENTORY_DIMENSIONS)[number];
 export type StockMovementType = (typeof STOCK_MOVEMENT_TYPES)[number];
 export type RecipeStatus = (typeof RECIPE_STATUSES)[number];
+export type PurchaseOrderStatus = (typeof PURCHASE_ORDER_STATUSES)[number];
 
 export const branches = pgTable(
   "branches",
@@ -94,6 +96,31 @@ export const staffAssignments = pgTable(
     uniqueIndex("staff_assignments_user_branch_uidx").on(table.user_id, table.branch_id),
     index("staff_assignments_branch_role_idx").on(table.branch_id, table.role),
     check("staff_assignments_role_check", sql`${table.role} in ('owner', 'admin', 'manager', 'cashier')`),
+  ],
+);
+
+export const suppliers = pgTable(
+  "suppliers",
+  {
+    id: serial("id").primaryKey(),
+    branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+    code: varchar("code", { length: 40 }).notNull(),
+    name_en: varchar("name_en", { length: 160 }).notNull(),
+    name_ar: varchar("name_ar", { length: 160 }).notNull(),
+    contact_name: varchar("contact_name", { length: 120 }),
+    phone: varchar("phone", { length: 32 }),
+    email: varchar("email", { length: 160 }),
+    address: text("address"),
+    notes: text("notes"),
+    is_active: boolean("is_active").default(true).notNull(),
+    created_by: text("created_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+    updated_by: text("updated_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+    updated_at: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("suppliers_branch_code_uidx").on(table.branch_id, table.code),
+    index("suppliers_branch_active_idx").on(table.branch_id, table.is_active),
   ],
 );
 
@@ -683,6 +710,67 @@ export const ingredientPackageConversions = pgTable(
   ],
 );
 
+export const purchaseOrders = pgTable(
+  "purchase_orders",
+  {
+    id: serial("id").primaryKey(),
+    branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+    supplier_id: integer("supplier_id").notNull().references(() => suppliers.id, { onDelete: "restrict" }),
+    supplier_code_snapshot: varchar("supplier_code_snapshot", { length: 40 }).notNull(),
+    supplier_name_en_snapshot: varchar("supplier_name_en_snapshot", { length: 160 }).notNull(),
+    supplier_name_ar_snapshot: varchar("supplier_name_ar_snapshot", { length: 160 }).notNull(),
+    po_number: varchar("po_number", { length: 48 }).notNull(),
+    status: varchar("status", { length: 20 }).$type<PurchaseOrderStatus>().default("draft").notNull(),
+    order_date: timestamp("order_date").defaultNow().notNull(),
+    expected_date: timestamp("expected_date"),
+    currency: varchar("currency", { length: 3 }).default("EGP").notNull(),
+    subtotal_amount: integer("subtotal_amount").default(0).notNull(),
+    total_amount: integer("total_amount").default(0).notNull(),
+    notes: text("notes"),
+    idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+    created_by: text("created_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+    submitted_by: text("submitted_by").references(() => user.id, { onDelete: "restrict" }),
+    approved_by: text("approved_by").references(() => user.id, { onDelete: "restrict" }),
+    cancelled_by: text("cancelled_by").references(() => user.id, { onDelete: "restrict" }),
+    cancellation_reason: text("cancellation_reason"),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+    updated_at: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("purchase_orders_branch_number_uidx").on(table.branch_id, table.po_number),
+    uniqueIndex("purchase_orders_idempotency_uidx").on(table.idempotency_key),
+    index("purchase_orders_branch_status_created_idx").on(table.branch_id, table.status, table.created_at),
+    check("purchase_orders_status_check", sql`${table.status} in ('draft', 'submitted', 'approved', 'cancelled')`),
+    check("purchase_orders_amounts_check", sql`${table.subtotal_amount} >= 0 and ${table.total_amount} = ${table.subtotal_amount} and ${table.subtotal_amount} <= 2147483647`),
+  ],
+);
+
+export const purchaseOrderLines = pgTable(
+  "purchase_order_lines",
+  {
+    id: serial("id").primaryKey(),
+    purchase_order_id: integer("purchase_order_id").notNull().references(() => purchaseOrders.id, { onDelete: "cascade" }),
+    ingredient_id: integer("ingredient_id").notNull().references(() => ingredients.id, { onDelete: "restrict" }),
+    package_conversion_id: integer("package_conversion_id").references(() => ingredientPackageConversions.id, { onDelete: "restrict" }),
+    unit_id: integer("unit_id").notNull().references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+    ingredient_sku: varchar("ingredient_sku", { length: 40 }).notNull(),
+    ingredient_name_en: varchar("ingredient_name_en", { length: 160 }).notNull(),
+    ingredient_name_ar: varchar("ingredient_name_ar", { length: 160 }).notNull(),
+    unit_code: varchar("unit_code", { length: 24 }).notNull(),
+    quantity_input_scaled: bigint("quantity_input_scaled", { mode: "number" }).notNull(),
+    quantity_base: bigint("quantity_base", { mode: "number" }).notNull(),
+    unit_price_minor: integer("unit_price_minor").notNull(),
+    line_total_amount: integer("line_total_amount").notNull(),
+    notes: text("notes"),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("purchase_order_lines_order_idx").on(table.purchase_order_id),
+    index("purchase_order_lines_ingredient_idx").on(table.ingredient_id),
+    check("purchase_order_lines_values_check", sql`${table.quantity_input_scaled} > 0 and ${table.quantity_base} > 0 and ${table.unit_price_minor} >= 0 and ${table.line_total_amount} >= 0 and ${table.line_total_amount} <= 2147483647`),
+  ],
+);
+
 export const stockBalances = pgTable(
   "stock_balances",
   {
@@ -969,7 +1057,7 @@ export const transactions = pgTable(
   ],
 );
 
-export const branchesRelations = relations(branches, ({ many }) => ({ diningAreas: many(diningAreas), kitchenStations: many(kitchenStations), menuCategories: many(menuCategories), modifierGroups: many(modifierGroups), orders: many(orders), registers: many(cashierRegisters) }));
+export const branchesRelations = relations(branches, ({ many }) => ({ diningAreas: many(diningAreas), kitchenStations: many(kitchenStations), menuCategories: many(menuCategories), modifierGroups: many(modifierGroups), orders: many(orders), registers: many(cashierRegisters), suppliers: many(suppliers), purchaseOrders: many(purchaseOrders) }));
 export const diningAreasRelations = relations(diningAreas, ({ one, many }) => ({ branch: one(branches, { fields: [diningAreas.branch_id], references: [branches.id] }), tables: many(restaurantTables) }));
 export const restaurantTablesRelations = relations(restaurantTables, ({ one, many }) => ({ diningArea: one(diningAreas, { fields: [restaurantTables.dining_area_id], references: [diningAreas.id] }), orders: many(orders) }));
 export const kitchenStationsRelations = relations(kitchenStations, ({ one, many }) => ({ branch: one(branches, { fields: [kitchenStations.branch_id], references: [branches.id] }), menuItems: many(menuItems), printJobs: many(printJobs) }));
@@ -1004,6 +1092,9 @@ export const ingredientCategoriesRelations = relations(ingredientCategories, ({ 
 export const unitsOfMeasureRelations = relations(unitsOfMeasure, ({ many }) => ({ ingredients: many(ingredients) }));
 export const ingredientsRelations = relations(ingredients, ({ one, many }) => ({ branch: one(branches, { fields: [ingredients.branch_id], references: [branches.id] }), category: one(ingredientCategories, { fields: [ingredients.category_id], references: [ingredientCategories.id] }), baseUnit: one(unitsOfMeasure, { fields: [ingredients.base_unit_id], references: [unitsOfMeasure.id] }), defaultLocation: one(inventoryLocations, { fields: [ingredients.default_location_id], references: [inventoryLocations.id] }), packages: many(ingredientPackageConversions), balances: many(stockBalances), movements: many(stockMovements), recipeComponents: many(recipeComponents) }));
 export const ingredientPackageConversionsRelations = relations(ingredientPackageConversions, ({ one }) => ({ ingredient: one(ingredients, { fields: [ingredientPackageConversions.ingredient_id], references: [ingredients.id] }) }));
+export const suppliersRelations = relations(suppliers, ({ one, many }) => ({ branch: one(branches, { fields: [suppliers.branch_id], references: [branches.id] }), purchaseOrders: many(purchaseOrders) }));
+export const purchaseOrdersRelations = relations(purchaseOrders, ({ one, many }) => ({ branch: one(branches, { fields: [purchaseOrders.branch_id], references: [branches.id] }), supplier: one(suppliers, { fields: [purchaseOrders.supplier_id], references: [suppliers.id] }), lines: many(purchaseOrderLines) }));
+export const purchaseOrderLinesRelations = relations(purchaseOrderLines, ({ one }) => ({ purchaseOrder: one(purchaseOrders, { fields: [purchaseOrderLines.purchase_order_id], references: [purchaseOrders.id] }), ingredient: one(ingredients, { fields: [purchaseOrderLines.ingredient_id], references: [ingredients.id] }), packageConversion: one(ingredientPackageConversions, { fields: [purchaseOrderLines.package_conversion_id], references: [ingredientPackageConversions.id] }), unit: one(unitsOfMeasure, { fields: [purchaseOrderLines.unit_id], references: [unitsOfMeasure.id] }) }));
 export const stockBalancesRelations = relations(stockBalances, ({ one }) => ({ branch: one(branches, { fields: [stockBalances.branch_id], references: [branches.id] }), location: one(inventoryLocations, { fields: [stockBalances.location_id], references: [inventoryLocations.id] }), ingredient: one(ingredients, { fields: [stockBalances.ingredient_id], references: [ingredients.id] }) }));
 export const recipeVersionsRelations = relations(recipeVersions, ({ one, many }) => ({ menuItem: one(menuItems, { fields: [recipeVersions.menu_item_id], references: [menuItems.id] }), variant: one(menuItemVariants, { fields: [recipeVersions.variant_id], references: [menuItemVariants.id] }), components: many(recipeComponents) }));
 export const recipeComponentsRelations = relations(recipeComponents, ({ one }) => ({ recipeVersion: one(recipeVersions, { fields: [recipeComponents.recipe_version_id], references: [recipeVersions.id] }), ingredient: one(ingredients, { fields: [recipeComponents.ingredient_id], references: [ingredients.id] }), sourceLocation: one(inventoryLocations, { fields: [recipeComponents.source_location_id], references: [inventoryLocations.id] }), modifierOption: one(modifierOptions, { fields: [recipeComponents.modifier_option_id], references: [modifierOptions.id] }), unit: one(unitsOfMeasure, { fields: [recipeComponents.unit_id], references: [unitsOfMeasure.id] }) }));

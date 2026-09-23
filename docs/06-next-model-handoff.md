@@ -508,6 +508,12 @@ Browser smoke tests passed using local Edge or Chromium fallback:
 - Offline cash synchronization consuming stock exactly once.
 - Arabic RTL and English UI.
 
+## Completed Phase 3B1: Suppliers And Purchase Orders
+
+Phase 3B1 is implemented in the current working tree. It adds branch-scoped supplier master data, supplier archiving, exact-quantity purchase-order lines, server-calculated EGP totals, draft/submitted/approved/cancelled lifecycle controls, role permissions, audit records, bilingual inventory navigation and pages, seed examples, and isolated router tests.
+
+Purchase orders are procurement-only documents. They do not create receiving records, stock movements, balance changes, COGS changes, or offline queue operations. Receiving remains deferred to Phase 3B2.
+
 ## GitHub README And Assets
 
 The README was rewritten into a professional project page. It now explains:
@@ -588,8 +594,6 @@ git diff --check
 
 Do not implement these unless the user explicitly asks:
 
-- Suppliers.
-- Purchase orders.
 - Receiving.
 - Stock transfers.
 - Full stock counts.

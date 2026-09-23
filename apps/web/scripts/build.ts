@@ -6,7 +6,7 @@ import { DATABASE_DIR_ENV, DATABASE_ROLE_ENV, defaultRuntimeDatabaseDir } from "
 export type BuildRunner = (env: NodeJS.ProcessEnv) => Promise<number>;
 
 const runNextBuild: BuildRunner = async (env) => {
-  const child = Bun.spawn(["bun", "x", "next", "build"], {
+  const child = Bun.spawn([process.execPath, "x", "next", "build"], {
     cwd: join(import.meta.dir, ".."),
     env,
     stdin: "inherit",

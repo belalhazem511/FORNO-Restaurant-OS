@@ -133,7 +133,7 @@ describe("PGLite database safety", () => {
     await runSchemaPush(undefined, env);
     const webDirectory = resolve(import.meta.dir, "../../../..");
     const runSeed = async () => {
-      const child = Bun.spawn(["bun", "src/lib/db/seed.ts"], {
+      const child = Bun.spawn([process.execPath, "src/lib/db/seed.ts"], {
         cwd: webDirectory,
         env,
         stdout: "pipe",
