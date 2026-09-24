@@ -172,6 +172,50 @@ describe("secure checkout", () => {
     expect(await db.select().from(orderCheckouts).where(inArray(orderCheckouts.order_id, [under.id, over.id, cancelled.id]))).toHaveLength(0);
   });
 
+  it("rolls back checkout, payment, transaction, and paid status when the required audit write fails", async () => {
+    const order = await createOrder();
+    await pg.exec(`
+      CREATE FUNCTION fail_checkout_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.action = 'order.checkout' THEN
+          RAISE EXCEPTION 'forced checkout audit failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+      CREATE TRIGGER fail_checkout_audit_trigger
+      BEFORE INSERT ON audit_logs
+      FOR EACH ROW EXECUTE FUNCTION fail_checkout_audit();
+    `);
+
+    try {
+      await expect(adminCheckout.pay({
+        orderId: order.id,
+        idempotencyKey: `checkout-audit-failure-${sequence}`,
+        payments: [{ paymentMethodId: cashId, amount: 10_000, tenderedAmount: 10_000 }],
+      })).rejects.toThrow('Failed query: insert into "audit_logs"');
+    } finally {
+      await pg.exec("DROP TRIGGER IF EXISTS fail_checkout_audit_trigger ON audit_logs; DROP FUNCTION IF EXISTS fail_checkout_audit();");
+    }
+
+    expect(await db.select().from(orderCheckouts).where(eq(orderCheckouts.order_id, order.id))).toHaveLength(0);
+    expect(await db.select().from(orderPayments).where(eq(orderPayments.order_id, order.id))).toHaveLength(0);
+    expect(await db.select().from(transactions).where(eq(transactions.order_id, order.id))).toHaveLength(0);
+    expect((await db.select().from(orders).where(eq(orders.id, order.id)))[0].payment_status).toBe("unpaid");
+    expect(await db.select().from(auditLogs).where(and(eq(auditLogs.order_id, order.id), eq(auditLogs.action, "order.checkout")))).toHaveLength(0);
+
+    const retried = await adminCheckout.pay({
+      orderId: order.id,
+      idempotencyKey: `checkout-audit-failure-${sequence}`,
+      payments: [{ paymentMethodId: cashId, amount: 10_000, tenderedAmount: 10_000 }],
+    });
+    expect(retried.paymentStatus).toBe("paid");
+    expect(await db.select().from(orderCheckouts).where(eq(orderCheckouts.order_id, order.id))).toHaveLength(1);
+    expect(await db.select().from(orderPayments).where(eq(orderPayments.order_id, order.id))).toHaveLength(1);
+    expect(await db.select().from(transactions).where(eq(transactions.order_id, order.id))).toHaveLength(1);
+    expect(await db.select().from(auditLogs).where(and(eq(auditLogs.order_id, order.id), eq(auditLogs.action, "order.checkout")))).toHaveLength(1);
+  });
+
   it("calculates fixed and basis-point percentage discounts on the server", async () => {
     const fixedOrder = await createOrder();
     const fixed = await adminCheckout.pay({

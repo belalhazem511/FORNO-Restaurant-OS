@@ -216,4 +216,79 @@ describe("purchase-order receiving", () => {
     expect(outcomes.filter((result) => result.status === "rejected")).toHaveLength(1);
     expect((await db.query.purchaseOrders.findFirst({ where: eq(schema.purchaseOrders.id, concurrentOrder!.id) }))?.receiving_status).toBe("fully_received");
   });
+
+  it("rolls back earlier line movements and balance updates when a later movement insert fails, then retries cleanly", async () => {
+    const order = await approvedOrder([
+      { ingredientId, quantityScaled: 1_000, unitPriceMinor: 100 },
+      { ingredientId: secondIngredientId, quantityScaled: 1_000, unitPriceMinor: 200 },
+    ]);
+    const receipt = await draft(order!.id, order!.lines.map((line) => ({ poLineId: line.id, accepted: 1_000 })));
+    await db.update(schema.stockBalances).set({ quantity_base: 0, average_unit_cost_micros: 0 }).where(eq(schema.stockBalances.location_id, locationId));
+    const beforeBalances = await db.select().from(schema.stockBalances).where(eq(schema.stockBalances.branch_id, branchId));
+
+    await pg.exec(`
+      CREATE FUNCTION fail_later_receipt_movement() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.ingredient_id = ${secondIngredientId} THEN
+          RAISE EXCEPTION 'forced later receipt movement failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+      CREATE TRIGGER fail_later_receipt_movement_trigger
+      BEFORE INSERT ON stock_movements
+      FOR EACH ROW EXECUTE FUNCTION fail_later_receipt_movement();
+    `);
+
+    try {
+      await expect(admin.post({ branchId, receiptId: receipt.id })).rejects.toThrow('Failed query: insert into "stock_movements"');
+    } finally {
+      await pg.exec("DROP TRIGGER IF EXISTS fail_later_receipt_movement_trigger ON stock_movements; DROP FUNCTION IF EXISTS fail_later_receipt_movement();");
+    }
+    expect(await db.select().from(schema.stockMovements).where(eq(schema.stockMovements.source_id, String(receipt.id)))).toHaveLength(0);
+    expect(await db.select().from(schema.stockBalances).where(eq(schema.stockBalances.branch_id, branchId))).toEqual(beforeBalances);
+    expect((await db.query.purchaseReceipts.findFirst({ where: eq(schema.purchaseReceipts.id, receipt.id) }))?.status).toBe("draft");
+    expect((await db.query.purchaseOrders.findFirst({ where: eq(schema.purchaseOrders.id, order!.id) }))?.receiving_status).toBe("not_received");
+    expect(await db.select().from(schema.auditLogs).where(and(eq(schema.auditLogs.entity_type, "purchase_receipt"), eq(schema.auditLogs.entity_id, String(receipt.id)), eq(schema.auditLogs.action, "purchase_receipt.post")))).toHaveLength(0);
+
+    const posted = await admin.post({ branchId, receiptId: receipt.id });
+    expect(posted.status).toBe("posted");
+    expect(await db.select().from(schema.stockMovements).where(eq(schema.stockMovements.source_id, String(receipt.id)))).toHaveLength(2);
+    expect((await db.query.purchaseOrders.findFirst({ where: eq(schema.purchaseOrders.id, order!.id) }))?.receiving_status).toBe("fully_received");
+  });
+
+  it("rolls back receipt movements and balances when the required posting audit insert fails", async () => {
+    const order = await approvedOrder([{ ingredientId, quantityScaled: 1_000, unitPriceMinor: 100 }]);
+    const receipt = await draft(order!.id, [{ poLineId: order!.lines[0].id, accepted: 1_000 }]);
+    const beforeBalances = await db.select().from(schema.stockBalances).where(eq(schema.stockBalances.branch_id, branchId));
+    await pg.exec(`
+      CREATE FUNCTION fail_receipt_post_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.action = 'purchase_receipt.post' THEN
+          RAISE EXCEPTION 'forced receipt audit failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+      CREATE TRIGGER fail_receipt_post_audit_trigger
+      BEFORE INSERT ON audit_logs
+      FOR EACH ROW EXECUTE FUNCTION fail_receipt_post_audit();
+    `);
+
+    try {
+      await expect(admin.post({ branchId, receiptId: receipt.id })).rejects.toThrow('Failed query: insert into "audit_logs"');
+    } finally {
+      await pg.exec("DROP TRIGGER IF EXISTS fail_receipt_post_audit_trigger ON audit_logs; DROP FUNCTION IF EXISTS fail_receipt_post_audit();");
+    }
+
+    expect(await db.select().from(schema.stockMovements).where(eq(schema.stockMovements.source_id, String(receipt.id)))).toHaveLength(0);
+    expect(await db.select().from(schema.stockBalances).where(eq(schema.stockBalances.branch_id, branchId))).toEqual(beforeBalances);
+    expect((await db.query.purchaseReceipts.findFirst({ where: eq(schema.purchaseReceipts.id, receipt.id) }))?.status).toBe("draft");
+    expect((await db.query.purchaseOrders.findFirst({ where: eq(schema.purchaseOrders.id, order!.id) }))?.receiving_status).toBe("not_received");
+
+    const posted = await admin.post({ branchId, receiptId: receipt.id });
+    expect(posted.status).toBe("posted");
+    expect(await db.select().from(schema.stockMovements).where(eq(schema.stockMovements.source_id, String(receipt.id)))).toHaveLength(1);
+    expect(await db.select().from(schema.auditLogs).where(and(eq(schema.auditLogs.entity_type, "purchase_receipt"), eq(schema.auditLogs.entity_id, String(receipt.id)), eq(schema.auditLogs.action, "purchase_receipt.post")))).toHaveLength(1);
+  });
 });
