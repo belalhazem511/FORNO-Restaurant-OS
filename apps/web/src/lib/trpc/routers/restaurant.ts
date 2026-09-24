@@ -12,6 +12,7 @@ export const restaurantRouter = router({
           with: {
             menuItems: {
               with: {
+                product: { columns: { image_key: true } },
                 variants: true,
                 kitchenStation: true,
                 modifierGroups: {

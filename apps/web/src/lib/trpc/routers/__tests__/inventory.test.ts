@@ -161,7 +161,7 @@ describe("inventory ledger, recipes, and order consumption", () => {
   it("reports low/out availability and enforces permission and branch isolation", async () => {
     await db.update(schema.stockBalances).set({ quantity_base: 0 }).where(eq(schema.stockBalances.ingredient_id, ingredientId));
     const availability = await db.transaction((tx) => menuAvailability(tx, branchId));
-    expect(availability.find((row) => row.menuItemId === menuItemId)?.status).toBe("out_of_stock");
+    expect(availability.find((row) => row.menuItemId === menuItemId)?.status).toBe("unavailable");
     expect((await cashier.availability({ branchId })).find((row) => row.menuItemId === menuItemId)?.theoreticalCost).toBeNull();
     await expect(cashier.overview({ branchId })).rejects.toThrow();
     await expect(cashier.createIngredient({ branchId, categoryId, sku: "DENIED", nameEn: "Denied", nameAr: "مرفوض", baseUnitId: unitId, dimension: "mass", defaultLocationId: locationId, tracked: true, reorderLevel: 0, lowStockThreshold: 0, allowNegative: false })).rejects.toThrow();
@@ -182,5 +182,66 @@ describe("inventory ledger, recipes, and order consumption", () => {
     expect(active.status).toBe("active");
     expect((await db.select().from(schema.recipeVersions).where(and(eq(schema.recipeVersions.menu_item_id, menuItemId), eq(schema.recipeVersions.status, "active"))))).toHaveLength(1);
     expect((await db.select().from(schema.auditLogs)).some((row) => row.action === "recipe.activate" && row.reason === "Approved after kitchen yield review")).toBe(true);
+  });
+
+  it("returns exact recipe shortages for modifier configurations without exposing costs to cashiers", async () => {
+    const active = await db.query.recipeVersions.findFirst({ where: and(eq(schema.recipeVersions.menu_item_id, menuItemId), eq(schema.recipeVersions.status, "active")) });
+    await db.insert(schema.recipeComponents).values({ recipe_version_id: active!.id, ingredient_id: ingredientId, source_location_id: locationId, modifier_option_id: modifierId, unit_id: unitId, quantity_input_scaled: 20_000, quantity_base: 20_000_000 });
+    await db.update(schema.stockBalances).set({ quantity_base: 300_000_000 }).where(eq(schema.stockBalances.ingredient_id, ingredientId));
+    const rows = await db.transaction((tx) => menuAvailability(tx, branchId, {
+      configurations: [{ menuItemId, variantId: null, modifierOptionIds: [modifierId], quantity: 3 }],
+      includeInventoryDetails: true,
+    }));
+    const configured = rows.find((row) => row.menuItemId === menuItemId && row.modifierOptionIds.includes(modifierId));
+    expect(configured?.status).toBe("unavailable");
+    expect(configured?.maxProducibleQuantity).toBe(2);
+    expect(configured?.blockingIngredients).toEqual([expect.objectContaining({ ingredientId, requiredQuantity: 393_939_394, availableQuantity: 300_000_000, shortageQuantity: 93_939_394, unit: "G", sourceLocationEn: "Kitchen" })]);
+    const cashierRows = await cashier.availability({ branchId, configurations: [{ menuItemId, variantId: null, modifierOptionIds: [modifierId], quantity: 3 }] });
+    const cashierResult = cashierRows.find((row) => row.menuItemId === menuItemId && row.modifierOptionIds.includes(modifierId));
+    expect(cashierResult?.blockingIngredients[0]?.nameEn).toBe("Cheese");
+    expect("unit" in (cashierResult?.blockingIngredients[0] ?? {})).toBe(false);
+    expect(cashierResult?.theoreticalCost).toBeNull();
+
+    const [packaging] = await db.insert(schema.ingredients).values({ branch_id: branchId, category_id: categoryId, sku: "PACKAGING", name_en: "Packaging", name_ar: "تغليف", base_unit_id: unitId, dimension: "mass", default_location_id: locationId, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, allow_negative: false, average_unit_cost_micros: 0, created_by: "inventory-admin", updated_by: "inventory-admin" }).returning();
+    await db.insert(schema.stockBalances).values({ branch_id: branchId, location_id: locationId, ingredient_id: packaging.id, quantity_base: 0, average_unit_cost_micros: 0 });
+    await db.insert(schema.recipeComponents).values({ recipe_version_id: active!.id, ingredient_id: packaging.id, source_location_id: locationId, modifier_option_id: null, unit_id: unitId, quantity_input_scaled: 5_000, quantity_base: 5_000_000 });
+    const packagingResult = (await db.transaction((tx) => menuAvailability(tx, branchId))).find((row) => row.menuItemId === menuItemId && row.variantId == null)!;
+    expect(packagingResult.blockingIngredients.some((ingredient) => ingredient.nameEn === "Packaging" && ingredient.shortageQuantity === 5_050_505)).toBe(true);
+
+    const [variant] = await db.insert(schema.menuItemVariants).values({ menu_item_id: menuItemId, code: "LOW", name_en: "Low stock variant", name_ar: "حجم قليل", price: 12_000, is_default: false, is_available: true, sort_order: 9 }).returning();
+    const [variantRecipe] = await db.insert(schema.recipeVersions).values({ branch_id: branchId, menu_item_id: menuItemId, variant_id: variant.id, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "inventory-admin", approved_by: "inventory-admin", approved_at: new Date() }).returning();
+    const [variantIngredient] = await db.insert(schema.ingredients).values({ branch_id: branchId, category_id: categoryId, sku: "VARIANT-SHORT", name_en: "Variant ingredient", name_ar: "مكون الحجم", base_unit_id: unitId, dimension: "mass", default_location_id: locationId, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, allow_negative: false, average_unit_cost_micros: 0, created_by: "inventory-admin", updated_by: "inventory-admin" }).returning();
+    await db.insert(schema.stockBalances).values({ branch_id: branchId, location_id: locationId, ingredient_id: variantIngredient.id, quantity_base: 0, average_unit_cost_micros: 0 });
+    await db.insert(schema.recipeComponents).values({ recipe_version_id: variantRecipe.id, ingredient_id: variantIngredient.id, source_location_id: locationId, modifier_option_id: null, unit_id: unitId, quantity_input_scaled: 20_000, quantity_base: 20_000_000 });
+    const variantResult = (await db.transaction((tx) => menuAvailability(tx, branchId))).find((row) => row.menuItemId === menuItemId && row.variantId === variant.id)!;
+    expect(variantResult.status).toBe("unavailable");
+    expect(variantResult.blockingIngredients[0]?.nameEn).toBe("Variant ingredient");
+  });
+
+  it("reports missing recipes and manual disablement as distinct availability states", async () => {
+    const [withoutRecipe] = await db.insert(schema.menuItems).values({ category_id: (await db.query.menuItems.findFirst({ where: eq(schema.menuItems.id, menuItemId) }))!.category_id, kitchen_station_id: (await db.query.menuItems.findFirst({ where: eq(schema.menuItems.id, menuItemId) }))!.kitchen_station_id, code: "NO-RECIPE", name_en: "No recipe", name_ar: "بلا وصفة", base_price: 100, is_available: true, sort_order: 2 }).returning();
+    const rows = await db.transaction((tx) => menuAvailability(tx, branchId));
+    expect(rows.find((row) => row.menuItemId === withoutRecipe.id)?.status).toBe("recipe_missing");
+    await db.update(schema.menuItems).set({ is_available: false }).where(eq(schema.menuItems.id, menuItemId));
+    expect((await db.transaction((tx) => menuAvailability(tx, branchId))).find((row) => row.menuItemId === menuItemId)?.status).toBe("manually_disabled");
+  });
+
+  it("accounts for shared ingredient demand across all configured cart lines", async () => {
+    await db.update(schema.menuItems).set({ is_available: true }).where(eq(schema.menuItems.id, menuItemId));
+    const original = (await db.query.menuItems.findFirst({ where: eq(schema.menuItems.id, menuItemId) }))!;
+    const [secondItem] = await db.insert(schema.menuItems).values({ category_id: original.category_id, kitchen_station_id: original.kitchen_station_id, code: "SHARED-STOCK", name_en: "Shared stock item", name_ar: "صنف مخزون مشترك", base_price: 100, is_available: true, sort_order: 20 }).returning();
+    const [secondRecipe] = await db.insert(schema.recipeVersions).values({ branch_id: branchId, menu_item_id: secondItem.id, variant_id: null, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "inventory-admin", approved_by: "inventory-admin", approved_at: new Date() }).returning();
+    await db.insert(schema.recipeComponents).values({ recipe_version_id: secondRecipe.id, ingredient_id: ingredientId, source_location_id: locationId, modifier_option_id: null, unit_id: unitId, quantity_input_scaled: 100_000, quantity_base: 100_000_000 });
+    await db.update(schema.stockBalances).set({ quantity_base: 150_000_000 }).where(eq(schema.stockBalances.ingredient_id, ingredientId));
+    const packageIngredient = await db.query.ingredients.findFirst({ where: eq(schema.ingredients.sku, "PACKAGING") });
+    await db.update(schema.stockBalances).set({ quantity_base: 10_000_000 }).where(eq(schema.stockBalances.ingredient_id, packageIngredient!.id));
+    const requested = await db.transaction((tx) => menuAvailability(tx, branchId, { configurations: [
+      { menuItemId, variantId: null }, { menuItemId: secondItem.id, variantId: null },
+    ] }));
+    const firstDemand = requested.find((row) => row.menuItemId === menuItemId && row.variantId === null && row.status === "unavailable");
+    const secondDemand = requested.find((row) => row.menuItemId === secondItem.id && row.variantId === null && row.status === "unavailable");
+    expect(firstDemand?.status).toBe("unavailable");
+    expect(secondDemand?.status).toBe("unavailable");
+    expect(firstDemand?.blockingIngredients.find((entry) => entry.ingredientId === ingredientId)?.requiredQuantity).toBe(211_111_111);
   });
 });

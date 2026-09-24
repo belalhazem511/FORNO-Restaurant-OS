@@ -38,6 +38,7 @@ export async function loadOfflineBootstrap(userId: string, branchId: number) {
         with: {
           menuItems: {
             with: {
+              product: { columns: { image_key: true } },
               variants: true,
               kitchenStation: true,
               modifierGroups: { with: { modifierGroup: { with: { options: true } } } },
@@ -66,7 +67,7 @@ export async function loadOfflineBootstrap(userId: string, branchId: number) {
     where: eq(registerPrintPreferences.register_id, shift.register_id),
   });
   const createdAt = new Date();
-  const availability = (await db.transaction((tx) => menuAvailability(tx, branchId))).map(({ theoreticalCost: _cost, ...entry }) => entry);
+  const availability = (await db.transaction((tx) => menuAvailability(tx, branchId, { includeInventoryDetails: hasPermission(assignment.role, "inventory:view") }))).map(({ theoreticalCost: _cost, ...entry }) => entry);
   const pricing: OfflinePricingPayload = {
     items: branch.menuCategories.flatMap((category) => category.menuItems.map((item) => ({
       id: item.id,

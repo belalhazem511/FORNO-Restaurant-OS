@@ -153,6 +153,8 @@ beforeAll(async () => {
   await db.insert(stockBalances).values({ branch_id: branchId, location_id: inventoryLocation.id, ingredient_id: cheese.id, quantity_base: 10_000_000_000, average_unit_cost_micros: 10_000 });
   const [recipe] = await db.insert(recipeVersions).values({ branch_id: branchId, menu_item_id: pizzaId, variant_id: smallVariantId, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "user-1", approved_by: "user-1", approved_at: new Date() }).returning();
   await db.insert(recipeComponents).values({ recipe_version_id: recipe.id, ingredient_id: cheese.id, source_location_id: inventoryLocation.id, modifier_option_id: null, unit_id: gram.id, quantity_input_scaled: 100_000, quantity_base: 100_000_000 });
+  const [baseRecipe] = await db.insert(recipeVersions).values({ branch_id: branchId, menu_item_id: pizzaId, variant_id: null, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "user-1", approved_by: "user-1", approved_at: new Date() }).returning();
+  await db.insert(recipeComponents).values({ recipe_version_id: baseRecipe.id, ingredient_id: cheese.id, source_location_id: inventoryLocation.id, modifier_option_id: null, unit_id: gram.id, quantity_input_scaled: 100_000, quantity_base: 100_000_000 });
 
   const [customer] = await db.insert(customers).values({
     name: "Delivery Customer", email: "delivery@example.test", phone: "01000000000",
@@ -196,6 +198,16 @@ describe("secure POS order creation", () => {
     expect(second.id).toBe(first.id);
     expect(second.total_amount).toBe(first.total_amount);
     expect((await db.select().from(orderItems).where(eq(orderItems.order_id, first.id)))).toHaveLength(1);
+  });
+
+  it("revalidates recipe stock inside order creation and writes no order when ingredients are short", async () => {
+    const [balance] = await db.select().from(stockBalances);
+    await db.update(stockBalances).set({ quantity_base: 0 }).where(eq(stockBalances.id, balance.id));
+    const before = (await db.select().from(orders)).length;
+    await expect(caller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("stock-recheck"), items: [pizzaLine()] }))
+      .rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(await db.select().from(orders)).toHaveLength(before);
+    await db.update(stockBalances).set({ quantity_base: 10_000_000_000 }).where(eq(stockBalances.id, balance.id));
   });
 
   it("requires and atomically claims an available table for dine-in", async () => {

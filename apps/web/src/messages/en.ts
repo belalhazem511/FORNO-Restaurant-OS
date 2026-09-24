@@ -259,6 +259,18 @@ const messages = {
     nameRequired: "Name is required",
   },
   pos: {
+    availability: {
+      available: "Available",
+      low_stock: "Low stock",
+      unavailable: "Unavailable",
+      recipe_missing: "Recipe unavailable",
+      manually_disabled: "Disabled",
+    },
+    recipeMissingReason: "This item has no active approved recipe.",
+    manuallyDisabledReason: "This item is disabled by the restaurant.",
+    stockUnavailableReason: "Required ingredient stock is unavailable.",
+    unavailableIngredients: "Unavailable ingredients: {ingredients}",
+    maximumAvailability: "Maximum producible: {quantity}",
     saleDetails: "Sale Details",
     selectCustomer: "Select Customer",
     selectPaymentMethod: "Select Payment Method",

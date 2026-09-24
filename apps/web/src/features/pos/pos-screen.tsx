@@ -56,6 +56,7 @@ import { ItemConfiguratorDialog } from "./item-configurator-dialog";
 import { POSCheckoutDialog } from "./checkout-dialog";
 import { OfflineCashDialog, OfflineKotDialog, type OfflineSuccess } from "./offline-dialogs";
 import { createRequestId } from "./request-id";
+import { ProductImage } from "@/components/products/product-image";
 
 type RestaurantBranch = RouterOutputs["restaurant"]["model"][number];
 type MenuCategory = RestaurantBranch["menuCategories"][number];
@@ -126,6 +127,38 @@ export function PosScreen() {
   const [itemNotes, setItemNotes] = useState("");
   const [configurationError, setConfigurationError] = useState<string | null>(null);
 
+  const configurations = useMemo(() => {
+    const requested = cart.filter((line) => line.key !== editingKey).map((line) => ({ menuItemId: line.menuItemId, variantId: line.variantId, modifierOptionIds: line.modifiers.map((modifier) => modifier.id), quantity: line.quantity }));
+    if (configuringItem) {
+      requested.push({ menuItemId: configuringItem.id, variantId, modifierOptionIds: [...modifierIds], quantity: itemQuantity });
+      for (const link of configuringItem.modifierGroups) for (const option of link.modifierGroup.options.filter((entry) => entry.is_available)) {
+        const selected = modifierIds.includes(option.id);
+        const candidateIds = selected
+          ? modifierIds.filter((id) => id !== option.id)
+          : link.modifierGroup.max_selections === 1
+            ? [...modifierIds.filter((id) => !link.modifierGroup.options.some((entry) => entry.id === id)), option.id]
+            : [...modifierIds, option.id];
+        requested.push({ menuItemId: configuringItem.id, variantId, modifierOptionIds: candidateIds, quantity: itemQuantity });
+      }
+    }
+    return requested;
+  }, [cart, configuringItem, editingKey, itemQuantity, modifierIds, variantId]);
+  const configurationAvailabilityQuery = useQuery({
+    ...trpc.inventory.availability.queryOptions({ branchId: onlineBranch?.id ?? 0, configurations }),
+    enabled: Boolean(onlineBranch && offline.serverReachable),
+  });
+  const detailedAvailability = isOfflineMode ? cachedSnapshot?.availability ?? [] : configurationAvailabilityQuery.data ?? availabilityQuery.data ?? [];
+  const configuredAvailability = (menuItemId: number, selectedVariantId: number | null, selectedModifiers: number[]) => detailedAvailability.filter((row) => row.menuItemId === menuItemId && row.variantId === selectedVariantId && [...(row.modifierOptionIds ?? [])].sort((a, b) => a - b).join(",") === [...selectedModifiers].sort((a, b) => a - b).join(",")).at(-1);
+  const selectedAvailability = configuredAvailability(configuringItem?.id ?? 0, variantId, modifierIds);
+  const candidateAvailability = (optionId: number, group: MenuItem["modifierGroups"][number]["modifierGroup"]) => {
+    if (!configuringItem) return undefined;
+    const groupIds = new Set(group.options.map((option) => option.id));
+    const selected = modifierIds.includes(optionId);
+    const candidateIds = selected ? modifierIds.filter((id) => id !== optionId) : group.max_selections === 1 ? [...modifierIds.filter((id) => !groupIds.has(id)), optionId] : [...modifierIds, optionId];
+    return configuredAvailability(configuringItem.id, variantId, candidateIds);
+  };
+  const cartConfigurationQuantity = (line: CartLine) => cart.filter((entry) => entry.menuItemId === line.menuItemId && entry.variantId === line.variantId && [...entry.modifiers.map((modifier) => modifier.id)].sort((a, b) => a - b).join(",") === [...line.modifiers.map((modifier) => modifier.id)].sort((a, b) => a - b).join(",")).reduce((sum, entry) => sum + entry.quantity, 0);
+
   const categories = useMemo(
     () => [...(branch?.menuCategories ?? [])].filter((category) => category.is_active)
       .sort((a, b) => a.sort_order - b.sort_order),
@@ -133,11 +166,12 @@ export function PosScreen() {
   );
   const menuItems = useMemo(() => categories.flatMap((category) => category.menuItems), [categories]);
   const availability = isOfflineMode ? cachedSnapshot?.availability ?? [] : availabilityQuery.data ?? [];
-  const inventoryStatus = (menuItemId: number, variantId: number | null) => availability.find((row) => row.menuItemId === menuItemId && row.variantId === variantId)?.status ?? "stock_unavailable";
-  const inventoryAllows = (menuItemId: number, variantId: number | null) => ["in_stock", "low_stock"].includes(inventoryStatus(menuItemId, variantId));
+  const inventoryStatus = (menuItemId: number, variantId: number | null) => availability.find((row) => row.menuItemId === menuItemId && row.variantId === variantId && row.requestedQuantity === 1 && !(row.modifierOptionIds?.length))?.status ?? "unavailable";
+  const inventoryAllows = (menuItemId: number, variantId: number | null) => ["available", "low_stock"].includes(inventoryStatus(menuItemId, variantId));
   const itemInventoryStatus = (item: MenuItem) => {
+    if (!item.is_available) return "manually_disabled";
     const statuses = item.variants.length ? item.variants.map((variant) => inventoryStatus(item.id, variant.id)) : [inventoryStatus(item.id, null)];
-    return statuses.includes("in_stock") ? "in_stock" : statuses.includes("low_stock") ? "low_stock" : statuses[0] ?? "stock_unavailable";
+    return statuses.includes("available") ? "available" : statuses.includes("low_stock") ? "low_stock" : statuses[0] ?? "unavailable";
   };
   const visibleItems = useMemo(() => {
     const query = search.trim().toLocaleLowerCase(locale);
@@ -208,6 +242,11 @@ export function PosScreen() {
       return;
     }
 
+    if (!isOfflineMode && (!selectedAvailability || selectedAvailability.status === "unavailable" || selectedAvailability.status === "recipe_missing" || selectedAvailability.status === "manually_disabled")) {
+      const names = selectedAvailability?.blockingIngredients?.map((ingredient) => isArabic ? ingredient.nameAr : ingredient.nameEn).join(isArabic ? "، " : ", ");
+      setConfigurationError(names || t("stockUnavailableReason"));
+      return;
+    }
     for (const link of configuringItem.modifierGroups) {
       const group = link.modifierGroup;
       if (!group.is_active) continue;
@@ -484,9 +523,11 @@ export function PosScreen() {
                 const availableVariants = item.variants.filter((variant) => variant.is_available && inventoryAllows(item.id, variant.id));
                 const fromPrice = availableVariants.length > 0 ? Math.min(...availableVariants.map((variant) => variant.price)) : item.base_price;
                 const stockStatus = itemInventoryStatus(item);
-                const sellable = item.is_available && ["in_stock", "low_stock"].includes(stockStatus);
+                const sellable = item.is_available && ["available", "low_stock"].includes(stockStatus);
+                const availabilityReason = availability.find((row) => row.menuItemId === item.id && row.status !== "available" && row.status !== "low_stock") ?? availability.find((row) => row.menuItemId === item.id);
+                const blockedNames = availabilityReason?.blockingIngredients?.map((ingredient) => isArabic ? ingredient.nameAr : ingredient.nameEn) ?? [];
                 return <button key={item.id} type="button" disabled={!sellable} onClick={() => openConfigurator(item)} className="group min-h-40 rounded-xl border bg-card p-4 text-start shadow-sm transition hover:-translate-y-0.5 hover:border-primary hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
-                  <div className="flex h-full flex-col justify-between gap-4"><div><div className="mb-2 flex items-start justify-between gap-2"><h3 className="font-bold leading-tight">{displayName(item)}</h3><Badge variant={sellable ? "outline" : "destructive"}>{stockStatus.replaceAll("_", " ")}</Badge></div><p className="text-xs text-muted-foreground" dir={isArabic ? "ltr" : "rtl"}>{secondaryName(item)}</p></div><div className="flex items-end justify-between gap-2"><strong className="text-base text-primary">{availableVariants.length > 1 ? t("fromPrice", { price: formatCurrency(fromPrice, locale) }) : formatCurrency(fromPrice, locale)}</strong>{(availableVariants.length > 0 || item.modifierGroups.length > 0) && <ChevronDownIcon className="h-5 w-5 text-muted-foreground transition group-hover:text-primary" />}</div></div>
+                  <div className="flex h-full flex-col justify-between gap-4"><div className="flex items-start gap-3"><ProductImage imageKey={item.product?.image_key} alt={displayName(item)} className="h-16 w-16 shrink-0 rounded-md object-cover" /><div className="min-w-0"><div className="mb-2 flex items-start justify-between gap-2"><h3 className="font-bold leading-tight">{displayName(item)}</h3><Badge variant={sellable ? "outline" : "destructive"}>{t(`availability.${stockStatus}`)}</Badge></div><p className="text-xs text-muted-foreground" dir={isArabic ? "ltr" : "rtl"}>{secondaryName(item)}</p>{!sellable && <p className="mt-2 text-xs text-destructive">{stockStatus === "recipe_missing" ? t("recipeMissingReason") : stockStatus === "manually_disabled" ? t("manuallyDisabledReason") : t("unavailableIngredients", { ingredients: blockedNames.join(isArabic ? "، " : ", ") || t("stockUnavailableReason") })}</p>}</div></div><div className="flex items-end justify-between gap-2"><strong className="text-base text-primary">{availableVariants.length > 1 ? t("fromPrice", { price: formatCurrency(fromPrice, locale) }) : formatCurrency(fromPrice, locale)}</strong>{(availableVariants.length > 0 || item.modifierGroups.length > 0) && <ChevronDownIcon className="h-5 w-5 text-muted-foreground transition group-hover:text-primary" />}</div></div>
                 </button>;
               })}
             </div>
@@ -498,7 +539,7 @@ export function PosScreen() {
             <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-4"><CardTitle className="flex items-center gap-2"><ShoppingCartIcon className="h-5 w-5" />{t("cart")}<Badge variant="secondary">{cart.reduce((sum, line) => sum + line.quantity, 0)}</Badge></CardTitle><Button type="button" variant="ghost" size="sm" disabled={cart.length === 0} onClick={() => setClearOpen(true)}>{t("clearCart")}</Button></CardHeader>
             <CardContent className="p-0">
               {cart.length === 0 ? <div className="flex min-h-52 flex-col items-center justify-center gap-3 p-6 text-center text-muted-foreground"><ShoppingCartIcon className="h-12 w-12 opacity-40" /><p>{t("emptyCart")}</p></div> : <div className="max-h-[50vh] divide-y overflow-y-auto xl:max-h-[calc(100vh-390px)]">
-                {cart.map((line) => <div key={line.key} className="space-y-3 p-4"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><h3 className="font-semibold">{isArabic ? line.nameAr : line.nameEn}</h3>{line.variantId && <p className="text-xs text-muted-foreground">{isArabic ? line.variantNameAr : line.variantNameEn}</p>}{line.modifiers.length > 0 && <p className="mt-1 text-xs text-muted-foreground">{line.modifiers.map((modifier) => isArabic ? modifier.nameAr : modifier.nameEn).join("، ")}</p>}{line.notes && <p className="mt-1 rounded bg-muted px-2 py-1 text-xs">{t("notesLabel", { notes: line.notes })}</p>}</div><strong className="shrink-0">{formatCurrency(calculateLineTotal(line), locale)}</strong></div><div className="flex items-center justify-between gap-2"><div className="flex items-center gap-1"><Button type="button" variant="outline" size="icon" className="h-10 w-10" aria-label={t("decreaseQuantity")} onClick={() => setCart((current) => setCartLineQuantity(current, line.key, line.quantity - 1))}><MinusIcon /></Button><span className="w-10 text-center text-lg font-bold tabular-nums">{line.quantity}</span><Button type="button" variant="outline" size="icon" className="h-10 w-10" aria-label={t("increaseQuantity")} onClick={() => setCart((current) => setCartLineQuantity(current, line.key, line.quantity + 1))}><PlusIcon /></Button></div><div className="flex"><Button type="button" variant="ghost" size="icon" className="h-10 w-10" aria-label={tc("edit")} onClick={() => { const item = menuItems.find((entry) => entry.id === line.menuItemId); if (item) openConfigurator(item, line); }}><PencilIcon /></Button><Button type="button" variant="ghost" size="icon" className="h-10 w-10 text-destructive" aria-label={tc("remove")} onClick={() => setCart((current) => current.filter((entry) => entry.key !== line.key))}><Trash2Icon /></Button></div></div><p className="text-xs text-muted-foreground">{formatCurrency(calculateUnitPrice(line), locale)} × {line.quantity}</p></div>)}
+                {cart.map((line) => { const lineAvailability = configuredAvailability(line.menuItemId, line.variantId, line.modifiers.map((modifier) => modifier.id)); const groupQuantity = cartConfigurationQuantity(line); return <div key={line.key} className="space-y-3 p-4"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><h3 className="font-semibold">{isArabic ? line.nameAr : line.nameEn}</h3>{line.variantId && <p className="text-xs text-muted-foreground">{isArabic ? line.variantNameAr : line.variantNameEn}</p>}{line.modifiers.length > 0 && <p className="mt-1 text-xs text-muted-foreground">{line.modifiers.map((modifier) => isArabic ? modifier.nameAr : modifier.nameEn).join("، ")}</p>}{line.notes && <p className="mt-1 rounded bg-muted px-2 py-1 text-xs">{t("notesLabel", { notes: line.notes })}</p>}</div><strong className="shrink-0">{formatCurrency(calculateLineTotal(line), locale)}</strong></div><div className="flex items-center justify-between gap-2"><div className="flex items-center gap-1"><Button type="button" variant="outline" size="icon" className="h-10 w-10" aria-label={t("decreaseQuantity")} onClick={() => setCart((current) => setCartLineQuantity(current, line.key, line.quantity - 1))}><MinusIcon /></Button><span className="w-10 text-center text-lg font-bold tabular-nums">{line.quantity}</span><Button type="button" variant="outline" size="icon" className="h-10 w-10" aria-label={t("increaseQuantity")} title={lineAvailability && groupQuantity >= lineAvailability.maxProducibleQuantity ? t("maximumAvailability", { quantity: lineAvailability.maxProducibleQuantity }) : undefined} disabled={!lineAvailability || groupQuantity >= lineAvailability.maxProducibleQuantity} onClick={() => setCart((current) => setCartLineQuantity(current, line.key, line.quantity + 1))}><PlusIcon /></Button></div><div className="flex"><Button type="button" variant="ghost" size="icon" className="h-10 w-10" aria-label={tc("edit")} onClick={() => { const item = menuItems.find((entry) => entry.id === line.menuItemId); if (item) openConfigurator(item, line); }}><PencilIcon /></Button><Button type="button" variant="ghost" size="icon" className="h-10 w-10 text-destructive" aria-label={tc("remove")} onClick={() => setCart((current) => current.filter((entry) => entry.key !== line.key))}><Trash2Icon /></Button></div></div>{lineAvailability?.blockingIngredients?.length ? <p role="status" className="text-xs text-destructive">{lineAvailability.blockingIngredients.map((ingredient) => isArabic ? ingredient.nameAr : ingredient.nameEn).join(isArabic ? "، " : ", ")}</p> : null}<p className="text-xs text-muted-foreground">{formatCurrency(calculateUnitPrice(line), locale)} × {line.quantity}</p></div>; })}
               </div>}
               <div className="space-y-3 border-t bg-muted/30 p-4"><div className="flex items-center justify-between text-sm"><span>{t("subtotal")}</span><span>{formatCurrency(cartTotal, locale)}</span></div><div className="flex items-center justify-between text-xl font-bold"><span>{tc("total")}</span><span>{formatCurrency(cartTotal, locale)}</span></div>{submitError && <p role="alert" className="text-sm font-medium text-destructive">{submitError}</p>}<Button type="button" size="lg" className="min-h-14 w-full text-base" disabled={cart.length === 0 || mutation.isPending} onClick={submitOrder}>{mutation.isPending ? t("creatingOrder") : t("sendOrder")}</Button></div>
             </CardContent>
@@ -506,7 +547,7 @@ export function PosScreen() {
         </aside>
       </div>
 
-      <ItemConfiguratorDialog item={configuringItem} editingKey={editingKey} variantId={variantId} modifierIds={modifierIds} quantity={itemQuantity} notes={itemNotes} error={configurationError} inventoryStatus={inventoryStatus} inventoryAllows={inventoryAllows} onClose={() => setConfiguringItem(null)} onVariantChange={setVariantId} onToggleModifier={toggleModifier} onQuantityChange={setItemQuantity} onNotesChange={setItemNotes} onSave={saveConfiguredItem} />
+      <ItemConfiguratorDialog item={configuringItem} editingKey={editingKey} variantId={variantId} modifierIds={modifierIds} quantity={itemQuantity} notes={itemNotes} error={configurationError} inventoryStatus={inventoryStatus} inventoryAllows={inventoryAllows} variantReason={(menuItemId, id) => { const row = availability.find((entry) => entry.menuItemId === menuItemId && entry.variantId === id); const names = row?.blockingIngredients?.map((ingredient) => isArabic ? ingredient.nameAr : ingredient.nameEn).join(isArabic ? "، " : ", "); return names || t(`availability.${row?.status ?? "unavailable"}`); }} optionAllows={(id, group) => { if (isOfflineMode) return true; const result = candidateAvailability(id, group); return Boolean(result && ["available", "low_stock"].includes(result.status)); }} optionReason={(id, group) => candidateAvailability(id, group)?.blockingIngredients?.map((ingredient) => isArabic ? ingredient.nameAr : ingredient.nameEn).join(isArabic ? "، " : ", ") ?? t("stockUnavailableReason")} maximumQuantity={isOfflineMode ? 1_000_000 : selectedAvailability?.maxProducibleQuantity ?? 0} onClose={() => setConfiguringItem(null)} onVariantChange={setVariantId} onToggleModifier={toggleModifier} onQuantityChange={setItemQuantity} onNotesChange={setItemNotes} onSave={saveConfiguredItem} />
 
       <DeleteConfirmationDialog open={clearOpen} onOpenChange={setClearOpen} title={t("clearCartTitle")} description={t("clearCartDescription")} confirmLabel={t("clearCart")} onConfirm={() => { setCart([]); setClearOpen(false); }} />
     </div>

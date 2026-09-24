@@ -259,6 +259,18 @@ const messages = {
     nameRequired: "اسم طريقة الدفع مطلوب",
   },
   pos: {
+    availability: {
+      available: "متاح",
+      low_stock: "مخزون منخفض",
+      unavailable: "غير متاح",
+      recipe_missing: "الوصفة غير متاحة",
+      manually_disabled: "معطل",
+    },
+    recipeMissingReason: "لا توجد وصفة معتمدة ونشطة لهذا الصنف.",
+    manuallyDisabledReason: "هذا الصنف معطل من إدارة المطعم.",
+    stockUnavailableReason: "مخزون المكونات المطلوبة غير متاح.",
+    unavailableIngredients: "المكونات غير المتاحة: {ingredients}",
+    maximumAvailability: "أقصى كمية قابلة للتحضير: {quantity}",
     saleDetails: "تفاصيل الطلب",
     selectCustomer: "اختر العميل",
     selectPaymentMethod: "اختر طريقة الدفع",

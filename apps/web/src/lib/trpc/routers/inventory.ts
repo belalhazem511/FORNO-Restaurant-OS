@@ -90,7 +90,7 @@ export const inventoryRouter = router({
       attention: attention.filter((row) => row.status !== "in_stock"),
       recent,
       recipeCoverage: { covered, total: recipeConfigurations },
-      exceptions: availability.filter((entry) => ["recipe_missing", "stock_unavailable"].includes(entry.status)).length,
+      exceptions: availability.filter((entry) => ["recipe_missing", "unavailable"].includes(entry.status)).length,
     };
   }),
 
@@ -208,7 +208,7 @@ export const inventoryRouter = router({
 
   recipes: protectedProcedure.input(branchInput).query(async ({ ctx, input }) => {
     const assignment = await requireStaff(ctx.user.id, input.branchId, "recipe:manage");
-    const availability = await db.transaction((tx) => menuAvailability(tx, input.branchId));
+    const availability = await db.transaction((tx) => menuAvailability(tx, input.branchId, { includeInventoryDetails: hasPermission(assignment.role, "inventory:view") }));
     const items = await db.query.menuItems.findMany({ with: { category: true, variants: true, recipeVersions: { with: { components: { with: { ingredient: true, sourceLocation: true, unit: true, modifierOption: true } } }, orderBy: [desc(recipeVersions.version)] } } });
     return items.filter((item) => item.category.branch_id === input.branchId).map((item) => ({
       ...item,
@@ -230,9 +230,9 @@ export const inventoryRouter = router({
       availability: availability.filter((row) => row.menuItemId === item.id).map((row) => ({ ...row, theoreticalCost: hasPermission(assignment.role, "inventory:cost:view") ? row.theoreticalCost : null })),
     }));
   }),
-  availability: protectedProcedure.input(branchInput).query(async ({ ctx, input }) => {
+  availability: protectedProcedure.input(branchInput.extend({ configurations: z.array(z.object({ menuItemId: z.number().int().positive(), variantId: z.number().int().positive().nullable(), modifierOptionIds: z.array(z.number().int().positive()).max(30).optional(), quantity: z.number().int().min(1).max(1_000_000).optional() })).max(250).optional() })).query(async ({ ctx, input }) => {
     const assignment = await requireStaff(ctx.user.id, input.branchId, "order:create");
-    const rows = await db.transaction((tx) => menuAvailability(tx, input.branchId));
+    const rows = await db.transaction((tx) => menuAvailability(tx, input.branchId, { configurations: input.configurations, includeInventoryDetails: hasPermission(assignment.role, "inventory:view") }));
     return rows.map((row) => ({ ...row, theoreticalCost: hasPermission(assignment.role, "inventory:cost:view") ? row.theoreticalCost : null }));
   }),
   orderCost: protectedProcedure.input(branchInput.extend({ orderId: z.number().int().positive() })).query(async ({ ctx, input }) => {

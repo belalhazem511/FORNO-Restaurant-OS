@@ -2,6 +2,8 @@ import { and, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { branches, customers, menuItems, orderItemModifiers, orderItems, orders, orderStatusHistory, restaurantTables } from "@/lib/db/schema";
 import { validateOrderFulfilment } from "@/lib/orders/lifecycle";
+import { TRPCError } from "@trpc/server";
+import { menuAvailability } from "@/lib/inventory/service";
 
 type CreateOrderInput = {
   branchId: number;
@@ -129,6 +131,27 @@ export async function createOrder(input: CreateOrderInput, userId: string) {
   );
 
   return db.transaction(async (tx) => {
+    const stockConfigurations = new Map<string, { menuItemId: number; variantId: number | null; modifierOptionIds: number[]; quantity: number }>();
+    for (const item of preparedItems) {
+      const modifierOptionIds = item.selectedModifiers.map((modifier) => modifier.id).sort((a, b) => a - b);
+      const key = `${item.menuItemId}:${item.selectedVariantId ?? "base"}:${modifierOptionIds.join(",")}`;
+      const existing = stockConfigurations.get(key);
+      const quantity = (existing?.quantity ?? 0) + item.requestedItem.quantity;
+      if (!Number.isSafeInteger(quantity) || quantity > 1_000_000) throw new TRPCError({ code: "BAD_REQUEST", message: "Combined menu quantity is outside the supported range" });
+      stockConfigurations.set(key, { menuItemId: item.menuItemId, variantId: item.selectedVariantId, modifierOptionIds, quantity });
+    }
+    const stockAvailability = await menuAvailability(tx, input.branchId, {
+      configurations: [...stockConfigurations.values()],
+    });
+    for (const config of stockConfigurations.values()) {
+      const requested = stockAvailability.find((row) => row.menuItemId === config.menuItemId
+        && row.variantId === config.variantId
+        && row.requestedQuantity === config.quantity
+        && [...row.modifierOptionIds].sort((a, b) => a - b).join(",") === config.modifierOptionIds.join(","));
+      if (!requested || !["available", "low_stock"].includes(requested.status)) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: requested?.status === "recipe_missing" ? "Menu item has no active approved recipe" : "Insufficient recipe ingredients for this order" });
+      }
+    }
     const [orderData] = await tx.insert(orders).values({
       branch_id: input.branchId,
       customer_id: input.customerId ?? null,
