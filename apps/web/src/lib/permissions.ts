@@ -31,12 +31,21 @@ export type Permission =
   | "purchase-receipt:post"
   | "purchase-receipt:reverse"
   | "purchase-receipt:variance:approve"
-  | "purchase-receipt:overreceive";
+  | "purchase-receipt:overreceive"
+  | "supplier-return:view"
+  | "supplier-return:cost:view"
+  | "supplier-return:create"
+  | "supplier-return:submit"
+  | "supplier-return:approve"
+  | "supplier-return:dispatch"
+  | "supplier-return:cancel"
+  | "supplier-return:reverse"
+  | "supplier-return:resolve";
 
 const ROLE_PERMISSIONS: Record<StaffRole, ReadonlySet<Permission>> = {
-  owner: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:configure", "inventory:adjust", "inventory:override", "recipe:manage", "supplier:view", "supplier:manage", "purchase-order:view", "purchase-order:create", "purchase-order:approve", "purchase-receipt:view", "purchase-receipt:create", "purchase-receipt:post", "purchase-receipt:reverse", "purchase-receipt:variance:approve", "purchase-receipt:overreceive"]),
-  admin: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:configure", "inventory:adjust", "inventory:override", "recipe:manage", "supplier:view", "supplier:manage", "purchase-order:view", "purchase-order:create", "purchase-order:approve", "purchase-receipt:view", "purchase-receipt:create", "purchase-receipt:post", "purchase-receipt:reverse", "purchase-receipt:variance:approve", "purchase-receipt:overreceive"]),
-  manager: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:adjust", "inventory:override", "recipe:manage", "supplier:view", "supplier:manage", "purchase-order:view", "purchase-order:create", "purchase-order:approve", "purchase-receipt:view", "purchase-receipt:create", "purchase-receipt:post", "purchase-receipt:overreceive"]),
+  owner: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:configure", "inventory:adjust", "inventory:override", "recipe:manage", "supplier:view", "supplier:manage", "purchase-order:view", "purchase-order:create", "purchase-order:approve", "purchase-receipt:view", "purchase-receipt:create", "purchase-receipt:post", "purchase-receipt:reverse", "purchase-receipt:variance:approve", "purchase-receipt:overreceive", "supplier-return:view", "supplier-return:cost:view", "supplier-return:create", "supplier-return:submit", "supplier-return:approve", "supplier-return:dispatch", "supplier-return:cancel", "supplier-return:reverse", "supplier-return:resolve"]),
+  admin: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:configure", "inventory:adjust", "inventory:override", "recipe:manage", "supplier:view", "supplier:manage", "purchase-order:view", "purchase-order:create", "purchase-order:approve", "purchase-receipt:view", "purchase-receipt:create", "purchase-receipt:post", "purchase-receipt:reverse", "purchase-receipt:variance:approve", "purchase-receipt:overreceive", "supplier-return:view", "supplier-return:cost:view", "supplier-return:create", "supplier-return:submit", "supplier-return:approve", "supplier-return:dispatch", "supplier-return:cancel", "supplier-return:reverse", "supplier-return:resolve"]),
+  manager: new Set(["order:create", "checkout:create", "shift:own", "shift:review", "discount:apply", "order:cancel", "payment:refund", "cash:adjust", "print:initial", "print:reprint", "print:settings", "inventory:view", "inventory:cost:view", "inventory:adjust", "inventory:override", "recipe:manage", "supplier:view", "supplier:manage", "purchase-order:view", "purchase-order:create", "purchase-order:approve", "purchase-receipt:view", "purchase-receipt:create", "purchase-receipt:post", "purchase-receipt:overreceive", "supplier-return:view", "supplier-return:cost:view", "supplier-return:create", "supplier-return:submit", "supplier-return:dispatch", "supplier-return:cancel"]),
   cashier: new Set(["order:create", "checkout:create", "shift:own", "print:initial"]),
 };
 

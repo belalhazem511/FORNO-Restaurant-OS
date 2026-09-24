@@ -197,6 +197,7 @@ export default function PurchaseOrdersPage() {
                   ))}
                 </div>
                 {order.receipts.length > 0 && <div className="mt-2 flex flex-wrap gap-2 border-t pt-2 text-sm"><strong>{ar ? "سجل الاستلام" : "Receiving history"}:</strong>{order.receipts.map((receipt) => <Link key={receipt.id} href={`/admin/inventory/receiving/${receipt.id}`} className="underline">{receipt.receipt_number} · {receipt.status}</Link>)}</div>}
+                {order.receipts.some((receipt) => receipt.status === "posted") && <Link href={`/admin/inventory/returns?purchaseOrderId=${order.id}`} className="mt-2 inline-flex min-h-11 items-center text-sm underline">{ar ? "سجل مرتجعات أمر الشراء" : "Purchase-order return history"}</Link>}
                 <div className="mt-2 flex flex-wrap gap-2">
                   {order.status === "approved" && <Link href="/admin/inventory/receiving" className="inline-flex min-h-11 items-center rounded-md border px-3 text-sm font-medium hover:bg-muted">{ar ? "استلام أمر الشراء" : "Receive purchase order"}</Link>}
                   {order.status === "draft" && context.data?.canCreateOrders && (

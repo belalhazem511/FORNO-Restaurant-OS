@@ -112,6 +112,7 @@ export default function SuppliersPage() {
                   {supplier.contact_name ?? "—"} · {supplier.phone ?? supplier.email ?? "—"}
                 </p>
                 <Link href={`/admin/inventory/receiving?supplierId=${supplier.id}`} className="mt-2 inline-flex min-h-11 items-center text-sm underline">{ar ? "سجل استلامات المورد" : "Supplier receipt history"}</Link>
+                <Link href={`/admin/inventory/returns?supplierId=${supplier.id}`} className="ms-4 mt-2 inline-flex min-h-11 items-center text-sm underline">{ar ? "سجل مرتجعات المورد" : "Supplier return history"}</Link>
                 {!supplier.is_active ? (
                   <p className="text-xs text-amber-700">{ar ? "مؤرشف" : "Archived"}</p>
                 ) : (

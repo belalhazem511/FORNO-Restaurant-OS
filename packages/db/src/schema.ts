@@ -55,17 +55,21 @@ export type PrintLanguage = (typeof PRINT_LANGUAGES)[number];
 export type PrintPaperWidth = (typeof PRINT_PAPER_WIDTHS)[number];
 export type OfflineSyncStatus = (typeof OFFLINE_SYNC_STATUSES)[number];
 export const INVENTORY_DIMENSIONS = ["mass", "volume", "count"] as const;
-export const STOCK_MOVEMENT_TYPES = ["opening_balance", "manual_positive", "manual_negative", "sale_consumption", "sale_consumption_reversal", "waste_discard", "negative_override", "purchase_receipt", "purchase_receipt_reversal"] as const;
+export const STOCK_MOVEMENT_TYPES = ["opening_balance", "manual_positive", "manual_negative", "sale_consumption", "sale_consumption_reversal", "waste_discard", "negative_override", "purchase_receipt", "purchase_receipt_reversal", "supplier_return", "supplier_return_reversal"] as const;
 export const RECIPE_STATUSES = ["draft", "active", "retired"] as const;
 export const PURCHASE_ORDER_STATUSES = ["draft", "submitted", "approved", "cancelled"] as const;
 export const PURCHASE_ORDER_RECEIVING_STATUSES = ["not_received", "partially_received", "fully_received"] as const;
 export const PURCHASE_RECEIPT_STATUSES = ["draft", "posted", "reversed", "needs_review"] as const;
+export const SUPPLIER_RETURN_STATUSES = ["draft", "submitted", "approved", "dispatched", "cancelled", "needs_review", "reversed"] as const;
+export const SUPPLIER_RETURN_REASONS = ["damaged", "expired", "wrong_item", "quality_issue", "over_delivery", "other"] as const;
 export type InventoryDimension = (typeof INVENTORY_DIMENSIONS)[number];
 export type StockMovementType = (typeof STOCK_MOVEMENT_TYPES)[number];
 export type RecipeStatus = (typeof RECIPE_STATUSES)[number];
 export type PurchaseOrderStatus = (typeof PURCHASE_ORDER_STATUSES)[number];
 export type PurchaseOrderReceivingStatus = (typeof PURCHASE_ORDER_RECEIVING_STATUSES)[number];
 export type PurchaseReceiptStatus = (typeof PURCHASE_RECEIPT_STATUSES)[number];
+export type SupplierReturnStatus = (typeof SUPPLIER_RETURN_STATUSES)[number];
+export type SupplierReturnReason = (typeof SUPPLIER_RETURN_REASONS)[number];
 
 export const branches = pgTable(
   "branches",
@@ -879,6 +883,133 @@ export const purchaseReceiptReversals = pgTable(
   ],
 );
 
+export const supplierReturns = pgTable(
+  "supplier_returns",
+  {
+    id: serial("id").primaryKey(),
+    branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+    supplier_id: integer("supplier_id").notNull().references(() => suppliers.id, { onDelete: "restrict" }),
+    purchase_order_id: integer("purchase_order_id").notNull().references(() => purchaseOrders.id, { onDelete: "restrict" }),
+    receipt_id: integer("receipt_id").notNull().references(() => purchaseReceipts.id, { onDelete: "restrict" }),
+    location_id: integer("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "restrict" }),
+    return_number: varchar("return_number", { length: 48 }).notNull(),
+    supplier_code_snapshot: varchar("supplier_code_snapshot", { length: 40 }).notNull(),
+    supplier_name_en_snapshot: varchar("supplier_name_en_snapshot", { length: 160 }).notNull(),
+    supplier_name_ar_snapshot: varchar("supplier_name_ar_snapshot", { length: 160 }).notNull(),
+    po_number_snapshot: varchar("po_number_snapshot", { length: 48 }).notNull(),
+    receipt_number_snapshot: varchar("receipt_number_snapshot", { length: 48 }).notNull(),
+    reason_code: varchar("reason_code", { length: 24 }).$type<SupplierReturnReason>().notNull(),
+    reason: text("reason"),
+    notes: text("notes"),
+    evidence_metadata: text("evidence_metadata"),
+    status: varchar("status", { length: 20 }).$type<SupplierReturnStatus>().default("draft").notNull(),
+    idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+    expected_credit_amount: integer("expected_credit_amount").default(0).notNull(),
+    valuation_amount: integer("valuation_amount"),
+    cost_variance_amount: integer("cost_variance_amount"),
+    created_by: text("created_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+    submitted_by: text("submitted_by").references(() => user.id, { onDelete: "restrict" }),
+    approved_by: text("approved_by").references(() => user.id, { onDelete: "restrict" }),
+    dispatched_by: text("dispatched_by").references(() => user.id, { onDelete: "restrict" }),
+    cancelled_by: text("cancelled_by").references(() => user.id, { onDelete: "restrict" }),
+    reversed_by: text("reversed_by").references(() => user.id, { onDelete: "restrict" }),
+    submitted_at: timestamp("submitted_at"),
+    approved_at: timestamp("approved_at"),
+    dispatched_at: timestamp("dispatched_at"),
+    cancelled_at: timestamp("cancelled_at"),
+    reversed_at: timestamp("reversed_at"),
+    cancellation_reason: text("cancellation_reason"),
+    needs_review_reason: text("needs_review_reason"),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+    updated_at: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("supplier_returns_branch_number_uidx").on(table.branch_id, table.return_number),
+    uniqueIndex("supplier_returns_idempotency_uidx").on(table.idempotency_key),
+    index("supplier_returns_branch_status_created_idx").on(table.branch_id, table.status, table.created_at),
+    index("supplier_returns_receipt_idx").on(table.receipt_id, table.created_at),
+    check("supplier_returns_status_check", sql`${table.status} in ('draft', 'submitted', 'approved', 'dispatched', 'cancelled', 'needs_review', 'reversed')`),
+    check("supplier_returns_reason_check", sql`${table.reason_code} in ('damaged', 'expired', 'wrong_item', 'quality_issue', 'over_delivery', 'other')`),
+    check("supplier_returns_money_check", sql`${table.expected_credit_amount} >= 0 and (${table.valuation_amount} is null or ${table.valuation_amount} >= 0) and (${table.cost_variance_amount} is null or ${table.cost_variance_amount} between -2147483647 and 2147483647)`),
+    check("supplier_returns_review_reason_check", sql`${table.status} <> 'needs_review' or length(trim(coalesce(${table.needs_review_reason}, ''))) > 0`),
+  ],
+);
+
+export const supplierReturnLines = pgTable(
+  "supplier_return_lines",
+  {
+    id: serial("id").primaryKey(),
+    supplier_return_id: integer("supplier_return_id").notNull().references(() => supplierReturns.id, { onDelete: "restrict" }),
+    receipt_line_id: integer("receipt_line_id").notNull().references(() => purchaseReceiptLines.id, { onDelete: "restrict" }),
+    ingredient_id: integer("ingredient_id").notNull().references(() => ingredients.id, { onDelete: "restrict" }),
+    ingredient_sku_snapshot: varchar("ingredient_sku_snapshot", { length: 40 }).notNull(),
+    ingredient_name_en_snapshot: varchar("ingredient_name_en_snapshot", { length: 160 }).notNull(),
+    ingredient_name_ar_snapshot: varchar("ingredient_name_ar_snapshot", { length: 160 }).notNull(),
+    dimension_snapshot: varchar("dimension_snapshot", { length: 16 }).notNull(),
+    unit_id: integer("unit_id").notNull().references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+    unit_code_snapshot: varchar("unit_code_snapshot", { length: 24 }).notNull(),
+    package_conversion_id: integer("package_conversion_id").references(() => ingredientPackageConversions.id, { onDelete: "restrict" }),
+    conversion_numerator_snapshot: bigint("conversion_numerator_snapshot", { mode: "number" }).notNull(),
+    conversion_denominator_snapshot: bigint("conversion_denominator_snapshot", { mode: "number" }).notNull(),
+    quantity_input_scaled: bigint("quantity_input_scaled", { mode: "number" }).notNull(),
+    quantity_base: bigint("quantity_base", { mode: "number" }).notNull(),
+    accepted_quantity_base_snapshot: bigint("accepted_quantity_base_snapshot", { mode: "number" }).notNull(),
+    original_unit_cost_micros_snapshot: bigint("original_unit_cost_micros_snapshot", { mode: "number" }).notNull(),
+    expected_credit_amount: integer("expected_credit_amount").notNull(),
+    dispatch_unit_cost_micros_snapshot: bigint("dispatch_unit_cost_micros_snapshot", { mode: "number" }),
+    dispatch_valuation_amount: integer("dispatch_valuation_amount"),
+    notes: text("notes"),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("supplier_return_lines_return_receipt_line_uidx").on(table.supplier_return_id, table.receipt_line_id),
+    index("supplier_return_lines_receipt_line_idx").on(table.receipt_line_id),
+    check("supplier_return_lines_conversion_check", sql`${table.conversion_numerator_snapshot} > 0 and ${table.conversion_denominator_snapshot} > 0`),
+    check("supplier_return_lines_dimension_check", sql`${table.dimension_snapshot} in ('mass', 'volume', 'count')`),
+    check("supplier_return_lines_quantities_check", sql`${table.quantity_input_scaled} > 0 and ${table.quantity_base} > 0 and ${table.accepted_quantity_base_snapshot} >= ${table.quantity_base}`),
+    check("supplier_return_lines_cost_check", sql`${table.original_unit_cost_micros_snapshot} >= 0 and ${table.expected_credit_amount} >= 0 and (${table.dispatch_unit_cost_micros_snapshot} is null or ${table.dispatch_unit_cost_micros_snapshot} >= 0) and (${table.dispatch_valuation_amount} is null or ${table.dispatch_valuation_amount} >= 0)`),
+  ],
+);
+
+export const supplierReturnStatusHistory = pgTable(
+  "supplier_return_status_history",
+  {
+    id: serial("id").primaryKey(),
+    supplier_return_id: integer("supplier_return_id").notNull().references(() => supplierReturns.id, { onDelete: "restrict" }),
+    branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+    from_status: varchar("from_status", { length: 20 }),
+    to_status: varchar("to_status", { length: 20 }).$type<SupplierReturnStatus>().notNull(),
+    actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+    reason: text("reason"),
+    idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("supplier_return_status_history_idempotency_uidx").on(table.idempotency_key),
+    index("supplier_return_status_history_return_idx").on(table.supplier_return_id, table.created_at),
+  ],
+);
+
+export const supplierReturnReversals = pgTable(
+  "supplier_return_reversals",
+  {
+    id: serial("id").primaryKey(),
+    supplier_return_id: integer("supplier_return_id").notNull().references(() => supplierReturns.id, { onDelete: "restrict" }),
+    branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+    reason: text("reason").notNull(),
+    status: varchar("status", { length: 16 }).notNull(),
+    actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+    idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+    created_at: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("supplier_return_reversals_return_uidx").on(table.supplier_return_id),
+    uniqueIndex("supplier_return_reversals_idempotency_uidx").on(table.idempotency_key),
+    check("supplier_return_reversals_reason_check", sql`length(trim(${table.reason})) >= 3`),
+    check("supplier_return_reversals_status_check", sql`${table.status} in ('reversed', 'needs_review')`),
+  ],
+);
+
 export const stockBalances = pgTable(
   "stock_balances",
   {
@@ -1024,13 +1155,17 @@ export const stockMovements = pgTable(
     order_id: integer("order_id").references(() => orders.id, { onDelete: "restrict" }),
     order_item_id: integer("order_item_id").references(() => orderItems.id, { onDelete: "restrict" }),
     recipe_version_id: integer("recipe_version_id").references(() => recipeVersions.id, { onDelete: "restrict" }),
+    supplier_return_id: integer("supplier_return_id").references(() => supplierReturns.id, { onDelete: "restrict" }),
+    supplier_return_line_id: integer("supplier_return_line_id").references(() => supplierReturnLines.id, { onDelete: "restrict" }),
+    purchase_receipt_id: integer("purchase_receipt_id").references(() => purchaseReceipts.id, { onDelete: "restrict" }),
+    purchase_receipt_line_id: integer("purchase_receipt_line_id").references(() => purchaseReceiptLines.id, { onDelete: "restrict" }),
     created_at: timestamp("created_at").defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex("stock_movements_idempotency_uidx").on(table.idempotency_key),
     index("stock_movements_ingredient_created_idx").on(table.ingredient_id, table.created_at),
     index("stock_movements_order_idx").on(table.order_id),
-    check("stock_movements_type_check", sql`${table.movement_type} in ('opening_balance', 'manual_positive', 'manual_negative', 'sale_consumption', 'sale_consumption_reversal', 'waste_discard', 'negative_override', 'purchase_receipt', 'purchase_receipt_reversal')`),
+    check("stock_movements_type_check", sql`${table.movement_type} in ('opening_balance', 'manual_positive', 'manual_negative', 'sale_consumption', 'sale_consumption_reversal', 'waste_discard', 'negative_override', 'purchase_receipt', 'purchase_receipt_reversal', 'supplier_return', 'supplier_return_reversal')`),
     check("stock_movements_values_check", sql`${table.direction} in (-1, 0, 1) and ${table.quantity_base} > 0 and ${table.unit_cost_micros} >= 0 and ${table.total_cost_amount} >= 0`),
   ],
 );
@@ -1206,6 +1341,10 @@ export const purchaseOrderLinesRelations = relations(purchaseOrderLines, ({ one 
 export const purchaseReceiptsRelations = relations(purchaseReceipts, ({ one, many }) => ({ branch: one(branches, { fields: [purchaseReceipts.branch_id], references: [branches.id] }), purchaseOrder: one(purchaseOrders, { fields: [purchaseReceipts.purchase_order_id], references: [purchaseOrders.id] }), supplier: one(suppliers, { fields: [purchaseReceipts.supplier_id], references: [suppliers.id] }), location: one(inventoryLocations, { fields: [purchaseReceipts.location_id], references: [inventoryLocations.id] }), lines: many(purchaseReceiptLines), reversals: many(purchaseReceiptReversals) }));
 export const purchaseReceiptLinesRelations = relations(purchaseReceiptLines, ({ one }) => ({ receipt: one(purchaseReceipts, { fields: [purchaseReceiptLines.receipt_id], references: [purchaseReceipts.id] }), purchaseOrderLine: one(purchaseOrderLines, { fields: [purchaseReceiptLines.purchase_order_line_id], references: [purchaseOrderLines.id] }), ingredient: one(ingredients, { fields: [purchaseReceiptLines.ingredient_id], references: [ingredients.id] }), packageConversion: one(ingredientPackageConversions, { fields: [purchaseReceiptLines.package_conversion_id], references: [ingredientPackageConversions.id] }), unit: one(unitsOfMeasure, { fields: [purchaseReceiptLines.unit_id], references: [unitsOfMeasure.id] }) }));
 export const purchaseReceiptReversalsRelations = relations(purchaseReceiptReversals, ({ one }) => ({ receipt: one(purchaseReceipts, { fields: [purchaseReceiptReversals.receipt_id], references: [purchaseReceipts.id] }), branch: one(branches, { fields: [purchaseReceiptReversals.branch_id], references: [branches.id] }) }));
+export const supplierReturnsRelations = relations(supplierReturns, ({ one, many }) => ({ branch: one(branches, { fields: [supplierReturns.branch_id], references: [branches.id] }), supplier: one(suppliers, { fields: [supplierReturns.supplier_id], references: [suppliers.id] }), purchaseOrder: one(purchaseOrders, { fields: [supplierReturns.purchase_order_id], references: [purchaseOrders.id] }), receipt: one(purchaseReceipts, { fields: [supplierReturns.receipt_id], references: [purchaseReceipts.id] }), location: one(inventoryLocations, { fields: [supplierReturns.location_id], references: [inventoryLocations.id] }), lines: many(supplierReturnLines), statusHistory: many(supplierReturnStatusHistory), reversals: many(supplierReturnReversals) }));
+export const supplierReturnLinesRelations = relations(supplierReturnLines, ({ one }) => ({ supplierReturn: one(supplierReturns, { fields: [supplierReturnLines.supplier_return_id], references: [supplierReturns.id] }), receiptLine: one(purchaseReceiptLines, { fields: [supplierReturnLines.receipt_line_id], references: [purchaseReceiptLines.id] }), ingredient: one(ingredients, { fields: [supplierReturnLines.ingredient_id], references: [ingredients.id] }), unit: one(unitsOfMeasure, { fields: [supplierReturnLines.unit_id], references: [unitsOfMeasure.id] }), packageConversion: one(ingredientPackageConversions, { fields: [supplierReturnLines.package_conversion_id], references: [ingredientPackageConversions.id] }) }));
+export const supplierReturnStatusHistoryRelations = relations(supplierReturnStatusHistory, ({ one }) => ({ supplierReturn: one(supplierReturns, { fields: [supplierReturnStatusHistory.supplier_return_id], references: [supplierReturns.id] }), branch: one(branches, { fields: [supplierReturnStatusHistory.branch_id], references: [branches.id] }) }));
+export const supplierReturnReversalsRelations = relations(supplierReturnReversals, ({ one }) => ({ supplierReturn: one(supplierReturns, { fields: [supplierReturnReversals.supplier_return_id], references: [supplierReturns.id] }), branch: one(branches, { fields: [supplierReturnReversals.branch_id], references: [branches.id] }) }));
 export const stockBalancesRelations = relations(stockBalances, ({ one }) => ({ branch: one(branches, { fields: [stockBalances.branch_id], references: [branches.id] }), location: one(inventoryLocations, { fields: [stockBalances.location_id], references: [inventoryLocations.id] }), ingredient: one(ingredients, { fields: [stockBalances.ingredient_id], references: [ingredients.id] }) }));
 export const recipeVersionsRelations = relations(recipeVersions, ({ one, many }) => ({ menuItem: one(menuItems, { fields: [recipeVersions.menu_item_id], references: [menuItems.id] }), variant: one(menuItemVariants, { fields: [recipeVersions.variant_id], references: [menuItemVariants.id] }), components: many(recipeComponents) }));
 export const recipeComponentsRelations = relations(recipeComponents, ({ one }) => ({ recipeVersion: one(recipeVersions, { fields: [recipeComponents.recipe_version_id], references: [recipeVersions.id] }), ingredient: one(ingredients, { fields: [recipeComponents.ingredient_id], references: [ingredients.id] }), sourceLocation: one(inventoryLocations, { fields: [recipeComponents.source_location_id], references: [inventoryLocations.id] }), modifierOption: one(modifierOptions, { fields: [recipeComponents.modifier_option_id], references: [modifierOptions.id] }), unit: one(unitsOfMeasure, { fields: [recipeComponents.unit_id], references: [unitsOfMeasure.id] }) }));

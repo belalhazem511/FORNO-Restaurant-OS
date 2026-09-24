@@ -520,9 +520,9 @@ Phase 3B2A adds branch-scoped goods receipt notes for approved purchase orders. 
 
 Drafts do not affect inventory. Posting locks the PO and inventory balances, validates remaining accepted quantities and any authorized overrides, then atomically writes accepted-quantity `purchase_receipt` movements and updates stock balances with the shared exact moving-weighted-average calculation. Rejected and damaged quantities remain recorded without increasing stock. Duplicate posting is idempotent. A later inventory movement or insufficient stock blocks automatic reversal and records `needs_review`; a safe reversal restores its captured prior balance/cost and appends reversal movements without editing the original receipt.
 
-Owner/Admin can approve significant price variance, over-receiving, and reversal. Managers can perform operational receiving and the explicitly granted over-receiving override; Cashiers have neither receiving APIs nor receiving pages. English LTR and Arabic RTL receiving, receipt history, snapshots, and draft editing are available. Receiving is online-only and does not implement supplier returns.
+Owner/Admin can approve significant price variance, over-receiving, and reversal. Managers can perform operational receiving and the explicitly granted over-receiving override; Cashiers have neither receiving APIs nor receiving pages. English LTR and Arabic RTL receiving, receipt history, snapshots, and draft editing are available. Receiving is online-only; supplier returns are implemented separately in Phase 3B2B.
 
-Phase 3B2B supplier returns, transfers/counts/waste, reporting, and all later phases remain deferred.
+Transfers/counts/waste, reporting, and later phases remain deferred.
 
 ## GitHub README And Assets
 
@@ -604,7 +604,6 @@ git diff --check
 
 Do not implement these unless the user explicitly asks:
 
-- Supplier returns (Phase 3B2B).
 - Stock transfers.
 - Full stock counts.
 - Forecasting.
@@ -612,6 +611,10 @@ Do not implement these unless the user explicitly asks:
 - Public website.
 - Delivery marketplace integrations.
 - Later inventory/accounting/reporting phases.
+
+Phase 3B2B Supplier Return Workflows have been implemented after the baseline described above. Returns are branch-scoped to a posted receipt, preserve source/conversion/cost snapshots and append-only status history, and deduct inventory only on authorized physical dispatch. Dispatch movements use current location valuation; expected supplier credit remains informational. Unsafe reversals stay in Needs Review and do not create partial stock movements. No supplier credit, payment, refund, or general-ledger transaction is created.
+
+Still deferred: Phase 3B3 stock transfers, counts, and general waste; Phase 3C forecasting/reporting; supplier credit notes/payments, accounts payable, invoice matching, offline returns, batch/lot allocation, and standalone unlinked returns.
 
 ## How I Worked
 

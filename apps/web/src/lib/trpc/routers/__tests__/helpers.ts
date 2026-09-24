@@ -30,6 +30,10 @@ const TABLES: PgTable[] = [
   schema.purchaseReceipts,
   schema.purchaseReceiptLines,
   schema.purchaseReceiptReversals,
+  schema.supplierReturns,
+  schema.supplierReturnLines,
+  schema.supplierReturnStatusHistory,
+  schema.supplierReturnReversals,
   schema.stockBalances,
   schema.recipeVersions,
   schema.recipeComponents,
@@ -130,6 +134,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS order_inventory_issues_order_uidx ON order_inv
 CREATE UNIQUE INDEX IF NOT EXISTS order_inventory_issues_idempotency_uidx ON order_inventory_issues (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS order_inventory_consumptions_snapshot_uidx ON order_inventory_consumptions (issue_id, order_item_id, ingredient_id, location_id);
 CREATE UNIQUE INDEX IF NOT EXISTS order_item_cogs_item_uidx ON order_item_cogs (order_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS supplier_returns_branch_number_uidx ON supplier_returns (branch_id, return_number);
+CREATE UNIQUE INDEX IF NOT EXISTS supplier_returns_idempotency_uidx ON supplier_returns (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_lines_return_receipt_line_uidx ON supplier_return_lines (supplier_return_id, receipt_line_id);
+CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_status_history_idempotency_uidx ON supplier_return_status_history (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_reversals_return_uidx ON supplier_return_reversals (supplier_return_id);
+CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_reversals_idempotency_uidx ON supplier_return_reversals (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS stock_movements_idempotency_uidx ON stock_movements (idempotency_key);`;
 
 export function createTestDb() {
