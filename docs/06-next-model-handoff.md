@@ -614,7 +614,11 @@ Do not implement these unless the user explicitly asks:
 
 Phase 3B2B Supplier Return Workflows have been implemented after the baseline described above. Returns are branch-scoped to a posted receipt, preserve source/conversion/cost snapshots and append-only status history, and deduct inventory only on authorized physical dispatch. Dispatch movements use current location valuation; expected supplier credit remains informational. Unsafe reversals stay in Needs Review and do not create partial stock movements. No supplier credit, payment, refund, or general-ledger transaction is created.
 
-Still deferred: Phase 3B3 stock transfers, counts, and general waste; Phase 3C forecasting/reporting; supplier credit notes/payments, accounts payable, invoice matching, offline returns, batch/lot allocation, and standalone unlinked returns.
+## Completed Phase 3B3A: Internal Stock Transfers
+
+Phase 3B3A implements branch-scoped location-to-location stock transfers with immutable ingredient/unit/package/conversion snapshots, append-only dispatch and receipt records, exact stock-ledger movements, and status history. Dispatch removes source stock at its current moving-average cost; each receipt adds only confirmed quantities to destination stock using that captured cost and recalculates destination moving-average valuation. Partial receipts remain explicitly in transit. Safe reversals append compensating movements; unsafe reversals remain in Needs Review without partial stock effects. Transfers do not create financial records and are online-only.
+
+Still deferred: Phase 3B3B/3B3C, Phase 3C forecasting/reporting; supplier credit notes/payments, accounts payable, invoice matching, offline transfers/returns, batch/lot allocation, and standalone unlinked supplier returns.
 
 ## How I Worked
 

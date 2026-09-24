@@ -34,6 +34,14 @@ const TABLES: PgTable[] = [
   schema.supplierReturnLines,
   schema.supplierReturnStatusHistory,
   schema.supplierReturnReversals,
+  schema.stockTransfers,
+  schema.stockTransferLines,
+  schema.stockTransferDispatches,
+  schema.stockTransferDispatchLines,
+  schema.stockTransferReceipts,
+  schema.stockTransferReceiptLines,
+  schema.stockTransferReversals,
+  schema.stockTransferStatusHistory,
   schema.stockBalances,
   schema.recipeVersions,
   schema.recipeComponents,
@@ -124,6 +132,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipt_lines_receipt_po_line_uidx ON
 CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipt_reversals_receipt_uidx ON purchase_receipt_reversals (receipt_id);
 CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipt_reversals_idempotency_uidx ON purchase_receipt_reversals (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS stock_balances_location_ingredient_uidx ON stock_balances (location_id, ingredient_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfers_branch_number_uidx ON stock_transfers (branch_id, transfer_number);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfers_idempotency_uidx ON stock_transfers (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_lines_transfer_ingredient_uidx ON stock_transfer_lines (transfer_id, ingredient_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_dispatches_transfer_uidx ON stock_transfer_dispatches (transfer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_dispatches_idempotency_uidx ON stock_transfer_dispatches (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_dispatch_lines_transfer_line_uidx ON stock_transfer_dispatch_lines (transfer_line_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_receipts_idempotency_uidx ON stock_transfer_receipts (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_reversals_transfer_uidx ON stock_transfer_reversals (transfer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_reversals_idempotency_uidx ON stock_transfer_reversals (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_status_history_idempotency_uidx ON stock_transfer_status_history (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_configuration_version_uidx ON recipe_versions (menu_item_id, variant_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_base_version_uidx ON recipe_versions (menu_item_id, version) WHERE variant_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_active_base_uidx ON recipe_versions (menu_item_id) WHERE status = 'active' AND variant_id IS NULL;

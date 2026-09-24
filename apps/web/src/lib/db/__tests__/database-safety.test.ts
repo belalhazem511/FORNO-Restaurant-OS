@@ -144,12 +144,15 @@ describe("PGLite database safety", () => {
     };
     const counts = async () => {
       const database = new PGlite(directory);
-      const rows = await database.query<{ users: number; branches: number; orders: number; payments: number }>(`
+      const rows = await database.query<{ users: number; branches: number; orders: number; payments: number; stock_transfers: number; transfer_lines: number; transfer_movements: number }>(`
         select
           (select count(*)::int from "user") as users,
           (select count(*)::int from branches) as branches,
           (select count(*)::int from orders) as orders,
-          (select count(*)::int from order_payments) as payments
+          (select count(*)::int from order_payments) as payments,
+          (select count(*)::int from stock_transfers where idempotency_key = 'seed-stock-transfer-demo') as stock_transfers,
+          (select count(*)::int from stock_transfer_lines where transfer_id = (select id from stock_transfers where idempotency_key = 'seed-stock-transfer-demo')) as transfer_lines,
+          (select count(*)::int from stock_movements where stock_transfer_id = (select id from stock_transfers where idempotency_key = 'seed-stock-transfer-demo')) as transfer_movements
       `);
       await database.close();
       return rows.rows[0];
@@ -159,5 +162,8 @@ describe("PGLite database safety", () => {
     const firstCounts = await counts();
     await runSeed();
     expect(await counts()).toEqual(firstCounts);
+    expect(firstCounts.stock_transfers).toBe(1);
+    expect(firstCounts.transfer_lines).toBe(2);
+    expect(firstCounts.transfer_movements).toBe(0);
   }, 30_000);
 });
