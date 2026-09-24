@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { desktopPaths } from "./runtime-paths.js";
@@ -48,6 +48,39 @@ async function readOrCreateAuthSecret() {
   const secret = randomBytes(48).toString("base64url");
   await writeFile(secretPath, safeStorage.encryptString(secret), { flag: "wx" });
   return secret;
+}
+
+async function readOrCreateDeviceId() {
+  const path = join(localPaths.sync, "device-id");
+  try {
+    const deviceId = (await readFile(path, "utf8")).trim();
+    if (!/^[0-9a-f-]{36}$/i.test(deviceId)) throw new Error("The local device identity is invalid and was preserved.");
+    return deviceId;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await mkdir(localPaths.sync, { recursive: true });
+  const deviceId = randomUUID();
+  try {
+    await writeFile(path, deviceId, { flag: "wx", mode: 0o600 });
+    return deviceId;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return readOrCreateDeviceId();
+    throw error;
+  }
+}
+
+async function readOrCreateDeviceCredential() {
+  if (!safeStorage.isEncryptionAvailable()) throw new Error("Windows protected credential storage is unavailable.");
+  const path = join(localPaths.sync, "device-credential.bin");
+  try {
+    return safeStorage.decryptString(await readFile(path));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const credential = randomBytes(32).toString("base64url");
+  await writeFile(path, safeStorage.encryptString(credential), { flag: "wx", mode: 0o600 });
+  return credential;
 }
 
 function childEnvironment(secret: string): NodeJS.ProcessEnv {
@@ -187,7 +220,7 @@ async function completeOwnerSetup(input: { name: string; email: string; password
   const response = await fetch(`${SERVER_ORIGIN}/api/desktop/setup`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-forno-desktop-setup": setupToken },
-    body: JSON.stringify(input),
+    body: JSON.stringify({ ...input, deviceId: await readOrCreateDeviceId() }),
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.error ?? "Local Owner setup failed.");
@@ -261,6 +294,39 @@ function createWindow() {
 }
 
 ipcMain.handle("desktop:runtime-status", () => ({ state: runtimeState, version: app.getVersion() }));
+ipcMain.handle("desktop:device-status", async () => ({
+  deviceId: await readOrCreateDeviceId(),
+  paired: await stat(join(localPaths.sync, "remote-organization-id")).then(() => true, () => false),
+  remoteOrganizationId: await readFile(join(localPaths.sync, "remote-organization-id"), "utf8").catch(() => null),
+}));
+ipcMain.handle("desktop:pair-device", async (event, input: { centralUrl: string; pairingCode: string; deviceName: string }) => {
+  assertStoragePage(event);
+  const central = new URL(input.centralUrl);
+  const localHttp = central.protocol === "http:" && ["localhost", "127.0.0.1"].includes(central.hostname);
+  if ((central.protocol !== "https:" && !localHttp) || central.username || central.password || central.search || central.hash || input.pairingCode.trim().length < 16 || input.pairingCode.trim().length > 100 || input.deviceName.trim().length < 2 || input.deviceName.trim().length > 120) {
+    throw new Error("Enter a secure central server URL, valid one-time pairing code, and device name.");
+  }
+  const deviceId = await readOrCreateDeviceId();
+  const credential = await readOrCreateDeviceCredential();
+  const centralBasePath = central.pathname.replace(/\/$/, "");
+  const response = await fetch(new URL(`${centralBasePath}/api/sync/pair`, central.origin), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId, credential, pairingCode: input.pairingCode.trim(), deviceName: input.deviceName.trim() }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const result = await response.json().catch(() => null) as { organizationId?: string; globalBranchId?: string; globalRegisterId?: string; error?: string } | null;
+  if (!response.ok || !result?.organizationId || !result.globalBranchId || !result.globalRegisterId) throw new Error(result?.error ?? "Device pairing failed; local operations remain available.");
+  const localResult = await fetch(`${SERVER_ORIGIN}/api/desktop/pairing-complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-forno-desktop-setup": setupToken },
+    body: JSON.stringify({ deviceId, organizationId: result.organizationId, globalBranchId: result.globalBranchId, globalRegisterId: result.globalRegisterId }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!localResult.ok) throw new Error((await localResult.json().catch(() => null))?.error ?? "Central pairing succeeded, but local identity reconciliation must be retried.");
+  await writeFile(join(localPaths.sync, "remote-organization-id"), result.organizationId, { mode: 0o600 });
+  return { paired: true as const, deviceId, organizationId: result.organizationId };
+});
 ipcMain.handle("desktop:create-backup", async (event) => {
   assertStoragePage(event);
   return withPausedDatabase(() => createLocalBackup(localPaths.root));

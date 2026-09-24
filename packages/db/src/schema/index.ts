@@ -8,5 +8,6 @@ export * from "./recipes";
 export * from "./stock-ledger";
 export * from "./printing";
 export * from "./offline";
+export * from "./device-sync";
 export * from "./constants";
 export * from "./relations";

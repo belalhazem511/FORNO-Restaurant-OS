@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-export const CURRENT_LOCAL_SCHEMA_VERSION = 1;
+export const CURRENT_LOCAL_SCHEMA_VERSION = 2;
 
 export async function readLocalSchemaVersion(path: string): Promise<number | null> {
   try {
