@@ -3,7 +3,7 @@ import { db } from "@/lib/db";
 import { applyCancellationDisposition } from "@/lib/inventory/service";
 import { auditLogs, cashierShifts, orderCancellations, orderPayments, orders, orderStatusHistory, restaurantTables, transactions } from "@/lib/db/schema";
 
-export async function cancelOrder(input: { idempotencyKey: string; reason: string; inventoryDisposition?: "returned_unused" | "prepared_discarded" }, order: typeof orders.$inferSelect & { branch_id: number }, wasPaid: boolean, shift: typeof cashierShifts.$inferSelect | null, actorId: string) {
+export async function cancelOrder(input: { idempotencyKey: string; reason: string; inventoryDisposition?: "returned_unused" | "prepared_discarded" }, order: typeof orders.$inferSelect, wasPaid: boolean, shift: typeof cashierShifts.$inferSelect | null, actorId: string) {
   return db.transaction(async (tx) => {
     const current = await tx.query.orders.findFirst({ where: eq(orders.id, order.id) });
     if (!current || current.status === "cancelled") throw new Error("Order is already cancelled");
@@ -73,7 +73,7 @@ export async function cancelOrder(input: { idempotencyKey: string; reason: strin
       await tx.update(restaurantTables).set({ status: "available" }).where(eq(restaurantTables.id, current.dining_table_id));
     }
     await tx.insert(auditLogs).values({
-      branch_id: order.branch_id, shift_id: shift?.id ?? null, order_id: order.id,
+      branch_id: order.branch_id!, shift_id: shift?.id ?? null, order_id: order.id,
       actor_user_id: actorId, approver_user_id: actorId,
       action: wasPaid ? "order.payment_reversal" : "order.cancel",
       entity_type: "order_cancellation", entity_id: String(cancellation.id),

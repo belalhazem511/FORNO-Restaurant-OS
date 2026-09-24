@@ -6,7 +6,7 @@ import { calculateDiscount } from "@/lib/finance";
 type Discount = { type: "percentage" | "fixed"; value: number; reason: string } | null | undefined;
 type Allocation = { paymentMethodId: number; amount: number; tenderedAmount?: number | null };
 
-export async function payOrder(input: { idempotencyKey: string; discount: Discount; payments: Allocation[] }, order: typeof orders.$inferSelect & { branch_id: number }, shift: typeof cashierShifts.$inferSelect, methodById: Map<number, typeof paymentMethods.$inferSelect>, actorId: string) {
+export async function payOrder(input: { idempotencyKey: string; discount?: Discount; payments: Allocation[] }, order: typeof orders.$inferSelect, shift: typeof cashierShifts.$inferSelect, methodById: Map<number, typeof paymentMethods.$inferSelect>, actorId: string) {
   return db.transaction(async (tx) => {
     const lockedOrder = await tx.query.orders.findFirst({
       where: eq(orders.id, order.id),
@@ -94,7 +94,7 @@ export async function payOrder(input: { idempotencyKey: string; discount: Discou
 
     if (input.discount) {
       await tx.insert(auditLogs).values({
-        branch_id: order.branch_id, shift_id: shift.id, order_id: order.id,
+        branch_id: order.branch_id!, shift_id: shift.id, order_id: order.id,
         actor_user_id: actorId, approver_user_id: actorId,
         action: "order.discount", entity_type: "order", entity_id: String(order.id),
         reason: input.discount.reason,
@@ -102,7 +102,7 @@ export async function payOrder(input: { idempotencyKey: string; discount: Discou
       });
     }
     await tx.insert(auditLogs).values({
-      branch_id: order.branch_id, shift_id: shift.id, order_id: order.id,
+      branch_id: order.branch_id!, shift_id: shift.id, order_id: order.id,
       actor_user_id: actorId,
       action: "order.checkout", entity_type: "order_checkout", entity_id: String(checkout.id),
       details: JSON.stringify({ payableAmount, changeAmount, paymentCount: input.payments.length }),
