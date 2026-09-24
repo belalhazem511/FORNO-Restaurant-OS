@@ -1,5 +1,5 @@
 import { and, eq, isNull } from "drizzle-orm";
-import { db } from ".";
+import { db } from "..";
 import {
   ingredientCategories,
   ingredientPackageConversions,
@@ -11,7 +11,7 @@ import {
   recipeComponents,
   recipeVersions,
   unitsOfMeasure,
-} from "./schema";
+} from "../schema";
 import { convertScaledQuantity, parseDecimalToScaled } from "@/lib/inventory/exact";
 import { postStockIncrease } from "@/lib/inventory/service";
 
