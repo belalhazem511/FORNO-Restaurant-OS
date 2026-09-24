@@ -6,7 +6,7 @@ import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
 
-const { offlineRouter } = await import("../offline");
+const { OFFLINE_CONFLICT_CODES, offlineRouter } = await import("../offline");
 const { createCallerFactory } = await import("../../init");
 const schema = await import("@/lib/db/schema");
 const caller = (id: string) => createCallerFactory(offlineRouter)({ user: makeUser(id) });
@@ -117,8 +117,26 @@ beforeAll(async () => {
 afterAll(async () => { await pg.close(); });
 
 describe("offline POS bootstrap and authoritative synchronization", () => {
+  it("preserves public Offline procedures and ordered conflict-code contract", () => {
+    expect(typeof cashier.health).toBe("function");
+    expect(typeof cashier.bootstrap).toBe("function");
+    expect(typeof cashier.sync).toBe("function");
+    expect(typeof cashier.center).toBe("function");
+    expect(typeof cashier.resolveReview).toBe("function");
+    expect(OFFLINE_CONFLICT_CODES).toEqual([
+      "menu_price_changed", "menu_item_unavailable", "variant_unavailable", "modifier_unavailable", "table_occupied",
+      "shift_closed", "register_unavailable", "permission_changed", "user_branch_mismatch", "cash_insufficient",
+      "price_snapshot_invalid", "price_snapshot_expired", "receipt_payload_tampered", "duplicate_already_accepted",
+      "invalid_order", "recipe_missing", "stock_unavailable", "insufficient_stock", "invalid_recipe",
+    ]);
+  });
+
   it("returns a scoped, versioned snapshot with an active shift, register, menu, stations, tables, permissions, and printing preferences", async () => {
     const snapshot = await cashier.bootstrap({ branchId });
+    expect(Object.keys(snapshot).sort()).toEqual([
+      "availability", "availabilityRevision", "branch", "cashier", "createdAt", "expiresAt", "permissions", "priceSnapshot",
+      "printing", "register", "revision", "role", "shift", "staleAt", "userId", "version",
+    ].sort());
     expect(snapshot.version).toBe(2);
     expect(snapshot.userId).toBe("offline-cashier");
     expect(snapshot.branch.menuCategories).toHaveLength(3);
@@ -134,6 +152,7 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
   it("atomically reprices and creates exactly one order, checkout, payment, status history, transaction, receipt, and KOT per station", async () => {
     const input = operation();
     const result = await cashier.sync(input);
+    expect(Object.keys(result).sort()).toEqual(["checkoutId", "conflict", "duplicate", "operationId", "orderId", "receiptJobId", "status"].sort());
     expect(result.status).toBe("accepted");
     expect(result.receiptJobId).toBeNumber();
     const orderId = result.orderId!;
@@ -152,6 +171,7 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     const input = operation();
     const first = await cashier.sync(input);
     const duplicate = await cashier.sync(input);
+    expect(Object.keys(duplicate).sort()).toEqual(["checkoutId", "conflict", "duplicate", "operationId", "orderId", "receiptJobId", "status"].sort());
     expect(duplicate.status).toBe("accepted");
     expect(duplicate.duplicate).toBe(true);
     expect(duplicate.orderId).toBe(first.orderId);
@@ -178,8 +198,14 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     const expired = operation();
     await db.update(schema.offlinePriceSnapshots).set({ expires_at: new Date("2020-01-01T00:00:00Z") }).where(eq(schema.offlinePriceSnapshots.reference, expired.priceSnapshotReference));
     const expiredResult = await cashier.sync(expired);
+    expect(Object.keys(expiredResult).sort()).toEqual(["checkoutId", "conflict", "duplicate", "operationId", "orderId", "receiptJobId", "status"].sort());
+    expect(Object.keys(expiredResult.conflict!).sort()).toEqual(["category", "code", "message", "recordId"].sort());
     expect(expiredResult.status).toBe("needs_review");
     expect(expiredResult.conflict?.code).toBe("price_snapshot_expired");
+    const reviewRetry = await cashier.sync(expired);
+    expect(reviewRetry.status).toBe("needs_review");
+    expect(reviewRetry.duplicate).toBe(true);
+    expect(Object.keys(reviewRetry.conflict!).sort()).toEqual(["category", "code", "message", "recordId"].sort());
     const record = await db.query.offlineSyncRecords.findFirst({ where: eq(schema.offlineSyncRecords.client_operation_id, expired.clientOperationId) });
     expect(record?.offline_receipt_number).toBe(expired.offlineReceipt.number);
     expect(record?.printed_tendered_amount).toBe(expired.offlineReceipt.cashReceived);
@@ -209,7 +235,9 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     const input = operation();
     input.order.expectedTotal -= 500;
     const result = await cashier.sync(input);
+    expect(Object.keys(result).sort()).toEqual(["checkoutId", "conflict", "duplicate", "operationId", "orderId", "receiptJobId", "status"].sort());
     expect(result.status).toBe("needs_review");
+    expect(Object.keys(result.conflict!).sort()).toEqual(["category", "code", "message", "recordId"].sort());
     expect(result.conflict?.code).toBe("receipt_payload_tampered");
     expect(result.conflict?.category).toBe("financial");
     expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
@@ -225,6 +253,43 @@ describe("offline POS bootstrap and authoritative synchronization", () => {
     expect(result.conflict?.code).toBe("receipt_payload_tampered");
     expect(await db.select().from(schema.orderPayments)).toHaveLength(paymentsBefore);
     expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
+  });
+
+  it("rolls back late sync-record failure across orders, money, printing, inventory, audit, and acceptance, then retries", async () => {
+    const input = operation();
+    const before = {
+      orders: await db.select().from(schema.orders),
+      checkouts: await db.select().from(schema.orderCheckouts),
+      payments: await db.select().from(schema.orderPayments),
+      transactions: await db.select().from(schema.transactions),
+      printJobs: await db.select().from(schema.printJobs),
+      movements: await db.select().from(schema.stockMovements),
+      issues: await db.select().from(schema.orderInventoryIssues),
+      audits: await db.select().from(schema.auditLogs),
+      syncRecords: await db.select().from(schema.offlineSyncRecords),
+      balance: await db.query.stockBalances.findFirst({ where: eq(schema.stockBalances.ingredient_id, inventoryIngredientId) }),
+    };
+    const constraint = "offline_sync_reject_failure_test";
+    await pg.exec(`ALTER TABLE offline_sync_records ADD CONSTRAINT ${constraint} CHECK (client_operation_id <> '${input.clientOperationId}')`);
+    await expect(cashier.sync(input)).rejects.toThrow();
+    await pg.exec(`ALTER TABLE offline_sync_records DROP CONSTRAINT ${constraint}`);
+
+    expect(await db.select().from(schema.orders)).toHaveLength(before.orders.length);
+    expect(await db.select().from(schema.orderCheckouts)).toHaveLength(before.checkouts.length);
+    expect(await db.select().from(schema.orderPayments)).toHaveLength(before.payments.length);
+    expect(await db.select().from(schema.transactions)).toHaveLength(before.transactions.length);
+    expect(await db.select().from(schema.printJobs)).toHaveLength(before.printJobs.length);
+    expect(await db.select().from(schema.stockMovements)).toHaveLength(before.movements.length);
+    expect(await db.select().from(schema.orderInventoryIssues)).toHaveLength(before.issues.length);
+    expect(await db.select().from(schema.auditLogs)).toHaveLength(before.audits.length);
+    expect(await db.select().from(schema.offlineSyncRecords)).toHaveLength(before.syncRecords.length);
+    expect(await db.query.stockBalances.findFirst({ where: eq(schema.stockBalances.ingredient_id, inventoryIngredientId) })).toEqual(before.balance);
+    expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(0);
+
+    const retried = await cashier.sync(input);
+    expect(retried.status).toBe("accepted");
+    expect(await db.select().from(schema.orders).where(eq(schema.orders.client_request_id, input.order.clientRequestId))).toHaveLength(1);
+    expect(await db.select().from(schema.offlineSyncRecords).where(eq(schema.offlineSyncRecords.client_operation_id, input.clientOperationId))).toHaveLength(1);
   });
 
   it("detects a table conflict", async () => {
