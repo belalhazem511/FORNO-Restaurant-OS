@@ -160,13 +160,26 @@ async function pauseLocalServer() {
   localServer = null;
 }
 
-async function withPausedDatabase<T>(operation: () => Promise<T>) {
+async function withPausedDatabase<T>(operation: () => Promise<T>, allowUpgradeGate = false) {
   await pauseLocalServer();
   try {
     return await operation();
   } finally {
-    await startLocalServer();
-    await mainWindow?.loadURL(`${SERVER_ORIGIN}/admin/storage`);
+    if (allowUpgradeGate) {
+      const version = await readLocalSchemaVersion(schemaVersionPath);
+      if (version === null || version < CURRENT_LOCAL_SCHEMA_VERSION) {
+        runtimeState = "upgrade_required";
+        await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(upgradeHtml())}`);
+      } else if (version > CURRENT_LOCAL_SCHEMA_VERSION) {
+        throw new Error("The restored database belongs to a newer FORNO version. Existing recovery data was preserved.");
+      } else {
+        await startLocalServer();
+        await mainWindow?.loadURL(`${SERVER_ORIGIN}/admin/storage`);
+      }
+    } else {
+      await startLocalServer();
+      await mainWindow?.loadURL(`${SERVER_ORIGIN}/admin/storage`);
+    }
   }
 }
 
@@ -262,7 +275,7 @@ ipcMain.handle("desktop:restore-backup", async (event, confirmed: boolean) => {
     filters: [{ name: "FORNO backup", extensions: ["tar"] }],
   });
   if (selection.canceled || selection.filePaths.length !== 1) return { restored: false as const };
-  const result = await withPausedDatabase(() => restoreLocalBackup(localPaths.root, selection.filePaths[0]!));
+  const result = await withPausedDatabase(() => restoreLocalBackup(localPaths.root, selection.filePaths[0]!), true);
   return { restored: true as const, recoveryPath: result.recoveryPath };
 });
 ipcMain.handle("desktop:initialize-local-data", async (_event, input: { confirmed: true; locale: "en" | "ar" }) => {
