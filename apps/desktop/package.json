@@ -1,0 +1,51 @@
+{
+  "name": "@forno/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "build": "bun build src/main.ts --target=node --format=cjs --external electron --outfile=dist/main.cjs && bun build src/preload.ts --target=node --format=cjs --external electron --outfile=dist/preload.cjs",
+    "check-types": "tsc --noEmit",
+    "dev": "bun run build && electron .",
+    "test": "bun test test",
+    "package": "bun run build && electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "electron": "^41.0.0",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5"
+  },
+  "build": {
+    "appId": "com.forno.restaurantos",
+    "productName": "FORNO Restaurant OS",
+    "directories": {
+      "output": "../../release"
+    },
+    "files": [
+      "dist/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../web",
+        "to": "app/apps/web",
+        "filter": [".next/**", "public/**", "src/lib/db/schema.ts", "src/lib/db/schema/**", "node_modules/**", "package.json", "next.config.mjs", "drizzle.config.ts"]
+      },
+      {
+        "from": "../../packages",
+        "to": "app/packages"
+      }
+    ],
+    "win": {
+      "target": ["nsis", "portable"],
+      "artifactName": "FORNO-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

@@ -18,6 +18,7 @@ export async function proxy(request: NextRequest) {
     !pathname.startsWith("/api/auth") &&
     !pathname.startsWith("/api/docs") &&
     !pathname.startsWith("/api/openapi.json") &&
+    !(process.env.FORNO_DESKTOP_MODE === "1" && (pathname === "/setup" || pathname === "/api/desktop/setup" || pathname === "/api/desktop/shutdown")) &&
     pathname !== "/sw.js"
   ) {
     const url = request.nextUrl.clone();

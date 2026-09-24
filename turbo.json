@@ -1,7 +1,7 @@
 {
   "$schema": "https://turbo.build/schema.json",
   "ui": "tui",
-  "globalPassThroughEnv": ["FORNO_DATABASE_DIR", "FORNO_DATABASE_ROLE"],
+  "globalPassThroughEnv": ["FORNO_DATABASE_DIR", "FORNO_DATABASE_ROLE", "FORNO_MEDIA_DIR", "FORNO_DESKTOP_MODE"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],

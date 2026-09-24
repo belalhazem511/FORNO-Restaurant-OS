@@ -9,6 +9,7 @@ export const env = createEnv({
     BASE_URL: z.string().url().default("http://localhost"),
     CORS_ORIGIN: z.string().url().optional(),
     NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+    FORNO_DESKTOP_MODE: z.enum(["1"]).optional(),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
@@ -16,8 +17,9 @@ export const env = createEnv({
 
 const base = env.BASE_URL.replace(/\/$/, "");
 const isDev = base === "http://localhost";
+const isDesktop = env.FORNO_DESKTOP_MODE === "1";
 
 export const serverUrls = {
-  betterAuthUrl: isDev ? "http://localhost:3001" : `${base}/app`,
+  betterAuthUrl: isDesktop ? base : isDev ? "http://localhost:3001" : `${base}/app`,
   landingUrl: isDev ? undefined : base,
 } as const;

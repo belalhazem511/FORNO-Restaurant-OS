@@ -34,6 +34,10 @@
     "db:generate": "turbo -F @forno/db db:generate",
     "db:migrate": "turbo -F @forno/db db:migrate",
     "db:seed": "turbo -F web db:seed",
+    "desktop:dev": "bun run --cwd apps/desktop dev",
+    "desktop:build": "bun run --cwd apps/desktop build",
+    "desktop:test": "bun run --cwd apps/desktop test",
+    "desktop:package": "bun run build && bun run --cwd apps/desktop package",
     "check": "biome check --write ."
   },
   "dependencies": {

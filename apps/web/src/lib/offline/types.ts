@@ -8,7 +8,7 @@ export type OfflineSyncPayload = RouterInputs["offline"]["sync"];
 export type OfflineSyncResponse = RouterOutputs["offline"]["sync"];
 
 export type OfflineQueueState = "pending" | "syncing" | "synced" | "failed" | "needs_review";
-export type ConnectionState = "online" | "offline" | "syncing" | "synced" | "failed" | "needs_review";
+export type ConnectionState = "local" | "online" | "offline" | "syncing" | "synced" | "failed" | "needs_review";
 
 export interface OfflineQueueEntry {
   version: typeof OFFLINE_QUEUE_VERSION;

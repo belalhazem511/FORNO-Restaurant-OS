@@ -25,8 +25,12 @@ interface OfflineContextValue {
 
 const OfflineContext = createContext<OfflineContextValue | null>(null);
 
+function isDesktopRuntime() {
+  return typeof window !== "undefined" && window.fornoDesktop !== undefined;
+}
+
 async function checkServerHealth() {
-  if (typeof navigator !== "undefined" && !navigator.onLine) return { ok: false, userId: null };
+  if (typeof navigator !== "undefined" && !navigator.onLine && !isDesktopRuntime()) return { ok: false, userId: null };
   try {
     const response = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/offline-health`, { cache: "no-store", credentials: "include" });
     if (!response.ok) return { ok: false, userId: null };
@@ -99,7 +103,10 @@ export function OfflineProvider({ children }: { children: React.ReactNode }) {
     ensureEngine().recoverInterrupted().then(refresh).catch(() => undefined);
     health().then((ok) => { if (ok) void syncNow(); });
     const handleOnline = () => { health().then((ok) => { if (ok) void syncNow(); }); };
-    const handleOffline = () => setServerReachable(false);
+    const handleOffline = () => {
+      if (isDesktopRuntime()) void health().then((ok) => { if (ok) void syncNow(); });
+      else setServerReachable(false);
+    };
     const handleRefresh = () => { void refresh(); };
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
@@ -143,7 +150,9 @@ export function OfflineProvider({ children }: { children: React.ReactNode }) {
         ? "failed"
         : !serverReachable
           ? "offline"
-          : queue.some((entry) => entry.state === "synced" && entry.acknowledgedAt)
+          : isDesktopRuntime()
+            ? "local"
+            : queue.some((entry) => entry.state === "synced" && entry.acknowledgedAt)
             ? "synced"
             : "online";
 
