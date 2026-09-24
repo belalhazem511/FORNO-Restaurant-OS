@@ -144,7 +144,7 @@ describe("PGLite database safety", () => {
     };
     const counts = async () => {
       const database = new PGlite(directory);
-      const rows = await database.query<{ users: number; branches: number; orders: number; payments: number; stock_transfers: number; transfer_lines: number; transfer_movements: number }>(`
+      const rows = await database.query<{ users: number; branches: number; orders: number; payments: number; stock_transfers: number; transfer_lines: number; transfer_movements: number; stock_counts: number; count_lines: number; count_entries: number; count_movements: number }>(`
         select
           (select count(*)::int from "user") as users,
           (select count(*)::int from branches) as branches,
@@ -152,7 +152,11 @@ describe("PGLite database safety", () => {
           (select count(*)::int from order_payments) as payments,
           (select count(*)::int from stock_transfers where idempotency_key = 'seed-stock-transfer-demo') as stock_transfers,
           (select count(*)::int from stock_transfer_lines where transfer_id = (select id from stock_transfers where idempotency_key = 'seed-stock-transfer-demo')) as transfer_lines,
-          (select count(*)::int from stock_movements where stock_transfer_id = (select id from stock_transfers where idempotency_key = 'seed-stock-transfer-demo')) as transfer_movements
+          (select count(*)::int from stock_movements where stock_transfer_id = (select id from stock_transfers where idempotency_key = 'seed-stock-transfer-demo')) as transfer_movements,
+          (select count(*)::int from stock_counts where idempotency_key = 'seed-stock-count-demo') as stock_counts,
+          (select count(*)::int from stock_count_lines where count_id = (select id from stock_counts where idempotency_key = 'seed-stock-count-demo')) as count_lines,
+          (select count(*)::int from stock_count_entries where count_id = (select id from stock_counts where idempotency_key = 'seed-stock-count-demo')) as count_entries,
+          (select count(*)::int from stock_movements where stock_count_id = (select id from stock_counts where idempotency_key = 'seed-stock-count-demo')) as count_movements
       `);
       await database.close();
       return rows.rows[0];
@@ -165,5 +169,9 @@ describe("PGLite database safety", () => {
     expect(firstCounts.stock_transfers).toBe(1);
     expect(firstCounts.transfer_lines).toBe(2);
     expect(firstCounts.transfer_movements).toBe(0);
+    expect(firstCounts.stock_counts).toBe(1);
+    expect(firstCounts.count_lines).toBe(0);
+    expect(firstCounts.count_entries).toBe(0);
+    expect(firstCounts.count_movements).toBe(0);
   }, 30_000);
 });

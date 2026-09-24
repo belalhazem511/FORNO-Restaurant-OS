@@ -32,6 +32,8 @@ import {
   stockTransferLines,
   stockTransferStatusHistory,
   stockTransfers,
+  stockCounts,
+  stockCountStatusHistory,
   unitsOfMeasure,
   staffAssignments,
   transactions,
@@ -378,6 +380,15 @@ export async function seed() {
         { transfer_id: transfer.id, ingredient_id: sauce.id, ingredient_sku_snapshot: sauce.sku, ingredient_name_en_snapshot: sauce.name_en, ingredient_name_ar_snapshot: sauce.name_ar, dimension_snapshot: sauce.dimension, unit_id: ml.id, unit_code_snapshot: saucePackage.code, package_conversion_id: saucePackage.id, package_code_snapshot: saucePackage.code, package_name_en_snapshot: saucePackage.name_en, package_name_ar_snapshot: saucePackage.name_ar, conversion_numerator_snapshot: saucePackage.base_numerator, conversion_denominator_snapshot: saucePackage.base_denominator, quantity_input_scaled: 1_000, quantity_base: saucePackage.base_numerator, notes: "Package-conversion sauce movement" },
       ]);
       if (transfer) await db.insert(stockTransferStatusHistory).values({ transfer_id: transfer.id, branch_id: source.branch_id, from_status: null, to_status: "draft", actor_user_id: userId, idempotency_key: "seed-stock-transfer-demo:created", reason: "Deterministic seeded draft" }).onConflictDoNothing();
+    }
+  }
+
+  const countSeed = await db.query.stockCounts.findFirst({ where: eq(stockCounts.idempotency_key, "seed-stock-count-demo") });
+  if (!countSeed) {
+    const countLocation = await db.query.inventoryLocations.findFirst({ where: and(eq(inventoryLocations.branch_id, branch.id), eq(inventoryLocations.code, "MAIN_STORE")) });
+    if (countLocation) {
+      const [count] = await db.insert(stockCounts).values({ branch_id: branch.id, location_id: countLocation.id, count_number: "SC-DEMO-DRAFT-001", status: "draft", notes: "Deterministic demo draft; no inventory effect before approval and posting", idempotency_key: "seed-stock-count-demo", created_by: userId }).onConflictDoNothing().returning();
+      if (count) await db.insert(stockCountStatusHistory).values({ count_id: count.id, branch_id: branch.id, from_status: null, to_status: "draft", actor_user_id: userId, idempotency_key: "seed-stock-count-demo:created", reason: "Deterministic seeded draft" }).onConflictDoNothing();
     }
   }
 

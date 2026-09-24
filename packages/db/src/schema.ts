@@ -55,7 +55,7 @@ export type PrintLanguage = (typeof PRINT_LANGUAGES)[number];
 export type PrintPaperWidth = (typeof PRINT_PAPER_WIDTHS)[number];
 export type OfflineSyncStatus = (typeof OFFLINE_SYNC_STATUSES)[number];
 export const INVENTORY_DIMENSIONS = ["mass", "volume", "count"] as const;
-export const STOCK_MOVEMENT_TYPES = ["opening_balance", "manual_positive", "manual_negative", "sale_consumption", "sale_consumption_reversal", "waste_discard", "negative_override", "purchase_receipt", "purchase_receipt_reversal", "supplier_return", "supplier_return_reversal", "stock_transfer_out", "stock_transfer_in", "stock_transfer_reversal_out", "stock_transfer_reversal_in"] as const;
+export const STOCK_MOVEMENT_TYPES = ["opening_balance", "manual_positive", "manual_negative", "sale_consumption", "sale_consumption_reversal", "waste_discard", "negative_override", "purchase_receipt", "purchase_receipt_reversal", "supplier_return", "supplier_return_reversal", "stock_transfer_out", "stock_transfer_in", "stock_transfer_reversal_out", "stock_transfer_reversal_in", "stock_count_positive", "stock_count_negative", "stock_count_reversal_positive", "stock_count_reversal_negative"] as const;
 export const RECIPE_STATUSES = ["draft", "active", "retired"] as const;
 export const PURCHASE_ORDER_STATUSES = ["draft", "submitted", "approved", "cancelled"] as const;
 export const PURCHASE_ORDER_RECEIVING_STATUSES = ["not_received", "partially_received", "fully_received"] as const;
@@ -63,6 +63,7 @@ export const PURCHASE_RECEIPT_STATUSES = ["draft", "posted", "reversed", "needs_
 export const SUPPLIER_RETURN_STATUSES = ["draft", "submitted", "approved", "dispatched", "cancelled", "needs_review", "reversed"] as const;
 export const SUPPLIER_RETURN_REASONS = ["damaged", "expired", "wrong_item", "quality_issue", "over_delivery", "other"] as const;
 export const STOCK_TRANSFER_STATUSES = ["draft", "submitted", "approved", "dispatched", "partially_received", "received", "cancelled", "needs_review", "reversed"] as const;
+export const STOCK_COUNT_STATUSES = ["draft", "counting", "submitted", "approved", "posted", "cancelled", "needs_review", "reversed"] as const;
 export type InventoryDimension = (typeof INVENTORY_DIMENSIONS)[number];
 export type StockMovementType = (typeof STOCK_MOVEMENT_TYPES)[number];
 export type RecipeStatus = (typeof RECIPE_STATUSES)[number];
@@ -71,6 +72,7 @@ export type PurchaseOrderReceivingStatus = (typeof PURCHASE_ORDER_RECEIVING_STAT
 export type PurchaseReceiptStatus = (typeof PURCHASE_RECEIPT_STATUSES)[number];
 export type SupplierReturnStatus = (typeof SUPPLIER_RETURN_STATUSES)[number];
 export type StockTransferStatus = (typeof STOCK_TRANSFER_STATUSES)[number];
+export type StockCountStatus = (typeof STOCK_COUNT_STATUSES)[number];
 export type SupplierReturnReason = (typeof SUPPLIER_RETURN_REASONS)[number];
 
 export const branches = pgTable(
@@ -1136,6 +1138,121 @@ export const stockTransferStatusHistory = pgTable("stock_transfer_status_history
   created_at: timestamp("created_at").defaultNow().notNull(),
 }, (table) => [uniqueIndex("stock_transfer_status_history_idempotency_uidx").on(table.idempotency_key), index("stock_transfer_status_history_transfer_idx").on(table.transfer_id, table.created_at)]);
 
+export const stockCounts = pgTable("stock_counts", {
+  id: serial("id").primaryKey(),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  location_id: integer("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "restrict" }),
+  count_number: varchar("count_number", { length: 48 }).notNull(),
+  status: varchar("status", { length: 20 }).$type<StockCountStatus>().default("draft").notNull(),
+  notes: text("notes"),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_by: text("created_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+  started_by: text("started_by").references(() => user.id, { onDelete: "restrict" }),
+  started_at: timestamp("started_at"),
+  submitted_by: text("submitted_by").references(() => user.id, { onDelete: "restrict" }),
+  submitted_at: timestamp("submitted_at"),
+  approved_by: text("approved_by").references(() => user.id, { onDelete: "restrict" }),
+  approved_at: timestamp("approved_at"),
+  posted_by: text("posted_by").references(() => user.id, { onDelete: "restrict" }),
+  posted_at: timestamp("posted_at"),
+  posting_watermark: integer("posting_watermark"),
+  cancelled_by: text("cancelled_by").references(() => user.id, { onDelete: "restrict" }),
+  cancellation_reason: text("cancellation_reason"),
+  needs_review_reason: text("needs_review_reason"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+  updated_at: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("stock_counts_branch_number_uidx").on(table.branch_id, table.count_number),
+  uniqueIndex("stock_counts_idempotency_uidx").on(table.idempotency_key),
+  uniqueIndex("stock_counts_active_location_uidx").on(table.branch_id, table.location_id).where(sql`${table.status} in ('draft', 'counting', 'submitted', 'approved', 'needs_review')`),
+  index("stock_counts_branch_status_idx").on(table.branch_id, table.status),
+  check("stock_counts_status_check", sql`${table.status} in ('draft', 'counting', 'submitted', 'approved', 'posted', 'cancelled', 'needs_review', 'reversed')`),
+]);
+
+export const stockCountLines = pgTable("stock_count_lines", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  location_id: integer("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "restrict" }),
+  ingredient_id: integer("ingredient_id").notNull().references(() => ingredients.id, { onDelete: "restrict" }),
+  ingredient_sku_snapshot: varchar("ingredient_sku_snapshot", { length: 40 }).notNull(),
+  ingredient_name_en_snapshot: varchar("ingredient_name_en_snapshot", { length: 160 }).notNull(),
+  ingredient_name_ar_snapshot: varchar("ingredient_name_ar_snapshot", { length: 160 }).notNull(),
+  dimension_snapshot: varchar("dimension_snapshot", { length: 16 }).notNull(),
+  base_unit_id: integer("base_unit_id").notNull().references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+  base_unit_code_snapshot: varchar("base_unit_code_snapshot", { length: 24 }).notNull(),
+  expected_quantity_base: bigint("expected_quantity_base", { mode: "number" }).notNull(),
+  expected_unit_cost_micros: bigint("expected_unit_cost_micros", { mode: "number" }).notNull(),
+  movement_watermark: integer("movement_watermark").notNull(),
+  counted_input_scaled: bigint("counted_input_scaled", { mode: "number" }),
+  counted_unit_id: integer("counted_unit_id").references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+  counted_unit_code_snapshot: varchar("counted_unit_code_snapshot", { length: 24 }),
+  package_conversion_id: integer("package_conversion_id").references(() => ingredientPackageConversions.id, { onDelete: "restrict" }),
+  package_code_snapshot: varchar("package_code_snapshot", { length: 24 }),
+  package_name_en_snapshot: varchar("package_name_en_snapshot", { length: 60 }),
+  package_name_ar_snapshot: varchar("package_name_ar_snapshot", { length: 60 }),
+  conversion_numerator_snapshot: bigint("conversion_numerator_snapshot", { mode: "number" }).notNull(),
+  conversion_denominator_snapshot: bigint("conversion_denominator_snapshot", { mode: "number" }).notNull(),
+  counted_quantity_base: bigint("counted_quantity_base", { mode: "number" }),
+  zero_confirmed: boolean("zero_confirmed").default(false).notNull(),
+  variance_base: bigint("variance_base", { mode: "number" }),
+  valuation_unit_cost_micros: bigint("valuation_unit_cost_micros", { mode: "number" }),
+  valuation_amount: integer("valuation_amount"),
+  posted_balance_quantity: bigint("posted_balance_quantity", { mode: "number" }),
+  notes: text("notes"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+  updated_at: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("stock_count_lines_count_ingredient_uidx").on(table.count_id, table.ingredient_id),
+  index("stock_count_lines_branch_location_idx").on(table.branch_id, table.location_id),
+  check("stock_count_lines_expected_check", sql`${table.expected_quantity_base} >= 0 and ${table.expected_unit_cost_micros} >= 0`),
+  check("stock_count_lines_conversion_check", sql`${table.conversion_numerator_snapshot} > 0 and ${table.conversion_denominator_snapshot} > 0`),
+  check("stock_count_lines_counted_check", sql`${table.counted_quantity_base} is null or ${table.counted_quantity_base} >= 0`),
+  check("stock_count_lines_dimension_check", sql`${table.dimension_snapshot} in ('mass', 'volume', 'count')`),
+]);
+
+export const stockCountEntries = pgTable("stock_count_entries", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  line_id: integer("line_id").notNull().references(() => stockCountLines.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  quantity_input_scaled: bigint("quantity_input_scaled", { mode: "number" }).notNull(),
+  quantity_base: bigint("quantity_base", { mode: "number" }).notNull(),
+  unit_id: integer("unit_id").notNull().references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+  unit_code_snapshot: varchar("unit_code_snapshot", { length: 24 }).notNull(),
+  package_conversion_id: integer("package_conversion_id").references(() => ingredientPackageConversions.id, { onDelete: "restrict" }),
+  package_code_snapshot: varchar("package_code_snapshot", { length: 24 }),
+  conversion_numerator_snapshot: bigint("conversion_numerator_snapshot", { mode: "number" }).notNull(),
+  conversion_denominator_snapshot: bigint("conversion_denominator_snapshot", { mode: "number" }).notNull(),
+  zero_confirmed: boolean("zero_confirmed").notNull(),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_count_entries_idempotency_uidx").on(table.idempotency_key), index("stock_count_entries_line_idx").on(table.count_id, table.line_id, table.created_at), check("stock_count_entries_values_check", sql`${table.quantity_input_scaled} >= 0 and ${table.quantity_base} >= 0 and ${table.conversion_numerator_snapshot} > 0 and ${table.conversion_denominator_snapshot} > 0`)]);
+
+export const stockCountReversals = pgTable("stock_count_reversals", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  status: varchar("status", { length: 16 }).notNull(),
+  reason: text("reason").notNull(),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_count_reversals_count_uidx").on(table.count_id), uniqueIndex("stock_count_reversals_idempotency_uidx").on(table.idempotency_key), check("stock_count_reversals_status_check", sql`${table.status} in ('reversed', 'needs_review')`), check("stock_count_reversals_reason_check", sql`length(trim(${table.reason})) >= 3`)]);
+
+export const stockCountStatusHistory = pgTable("stock_count_status_history", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  from_status: varchar("from_status", { length: 20 }),
+  to_status: varchar("to_status", { length: 20 }).$type<StockCountStatus>().notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  reason: text("reason"),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_count_status_history_idempotency_uidx").on(table.idempotency_key), index("stock_count_status_history_count_idx").on(table.count_id, table.created_at)]);
+
 export const stockBalances = pgTable(
   "stock_balances",
   {
@@ -1292,13 +1409,16 @@ export const stockMovements = pgTable(
     stock_transfer_receipt_id: integer("stock_transfer_receipt_id").references(() => stockTransferReceipts.id, { onDelete: "restrict" }),
     stock_transfer_receipt_line_id: integer("stock_transfer_receipt_line_id").references(() => stockTransferReceiptLines.id, { onDelete: "restrict" }),
     stock_transfer_reversal_id: integer("stock_transfer_reversal_id").references(() => stockTransferReversals.id, { onDelete: "restrict" }),
+    stock_count_id: integer("stock_count_id").references(() => stockCounts.id, { onDelete: "restrict" }),
+    stock_count_line_id: integer("stock_count_line_id").references(() => stockCountLines.id, { onDelete: "restrict" }),
+    stock_count_reversal_id: integer("stock_count_reversal_id").references(() => stockCountReversals.id, { onDelete: "restrict" }),
     created_at: timestamp("created_at").defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex("stock_movements_idempotency_uidx").on(table.idempotency_key),
     index("stock_movements_ingredient_created_idx").on(table.ingredient_id, table.created_at),
     index("stock_movements_order_idx").on(table.order_id),
-    check("stock_movements_type_check", sql`${table.movement_type} in ('opening_balance', 'manual_positive', 'manual_negative', 'sale_consumption', 'sale_consumption_reversal', 'waste_discard', 'negative_override', 'purchase_receipt', 'purchase_receipt_reversal', 'supplier_return', 'supplier_return_reversal', 'stock_transfer_out', 'stock_transfer_in', 'stock_transfer_reversal_out', 'stock_transfer_reversal_in')`),
+    check("stock_movements_type_check", sql`${table.movement_type} in ('opening_balance', 'manual_positive', 'manual_negative', 'sale_consumption', 'sale_consumption_reversal', 'waste_discard', 'negative_override', 'purchase_receipt', 'purchase_receipt_reversal', 'supplier_return', 'supplier_return_reversal', 'stock_transfer_out', 'stock_transfer_in', 'stock_transfer_reversal_out', 'stock_transfer_reversal_in', 'stock_count_positive', 'stock_count_negative', 'stock_count_reversal_positive', 'stock_count_reversal_negative')`),
     check("stock_movements_values_check", sql`${table.direction} in (-1, 0, 1) and ${table.quantity_base} > 0 and ${table.unit_cost_micros} >= 0 and ${table.total_cost_amount} >= 0`),
   ],
 );
@@ -1479,6 +1599,11 @@ export const supplierReturnLinesRelations = relations(supplierReturnLines, ({ on
 export const supplierReturnStatusHistoryRelations = relations(supplierReturnStatusHistory, ({ one }) => ({ supplierReturn: one(supplierReturns, { fields: [supplierReturnStatusHistory.supplier_return_id], references: [supplierReturns.id] }), branch: one(branches, { fields: [supplierReturnStatusHistory.branch_id], references: [branches.id] }) }));
 export const supplierReturnReversalsRelations = relations(supplierReturnReversals, ({ one }) => ({ supplierReturn: one(supplierReturns, { fields: [supplierReturnReversals.supplier_return_id], references: [supplierReturns.id] }), branch: one(branches, { fields: [supplierReturnReversals.branch_id], references: [branches.id] }) }));
 export const stockTransfersRelations = relations(stockTransfers, ({ one, many }) => ({ branch: one(branches, { fields: [stockTransfers.branch_id], references: [branches.id] }), sourceLocation: one(inventoryLocations, { fields: [stockTransfers.source_location_id], references: [inventoryLocations.id], relationName: "transfer_source" }), destinationLocation: one(inventoryLocations, { fields: [stockTransfers.destination_location_id], references: [inventoryLocations.id], relationName: "transfer_destination" }), lines: many(stockTransferLines), dispatches: many(stockTransferDispatches), receipts: many(stockTransferReceipts), reversals: many(stockTransferReversals), statusHistory: many(stockTransferStatusHistory) }));
+export const stockCountsRelations = relations(stockCounts, ({ one, many }) => ({ branch: one(branches, { fields: [stockCounts.branch_id], references: [branches.id] }), location: one(inventoryLocations, { fields: [stockCounts.location_id], references: [inventoryLocations.id] }), lines: many(stockCountLines), entries: many(stockCountEntries), reversals: many(stockCountReversals), statusHistory: many(stockCountStatusHistory) }));
+export const stockCountLinesRelations = relations(stockCountLines, ({ one, many }) => ({ count: one(stockCounts, { fields: [stockCountLines.count_id], references: [stockCounts.id] }), branch: one(branches, { fields: [stockCountLines.branch_id], references: [branches.id] }), location: one(inventoryLocations, { fields: [stockCountLines.location_id], references: [inventoryLocations.id] }), ingredient: one(ingredients, { fields: [stockCountLines.ingredient_id], references: [ingredients.id] }), entries: many(stockCountEntries), movements: many(stockMovements) }));
+export const stockCountEntriesRelations = relations(stockCountEntries, ({ one }) => ({ count: one(stockCounts, { fields: [stockCountEntries.count_id], references: [stockCounts.id] }), line: one(stockCountLines, { fields: [stockCountEntries.line_id], references: [stockCountLines.id] }), branch: one(branches, { fields: [stockCountEntries.branch_id], references: [branches.id] }) }));
+export const stockCountReversalsRelations = relations(stockCountReversals, ({ one, many }) => ({ count: one(stockCounts, { fields: [stockCountReversals.count_id], references: [stockCounts.id] }), movements: many(stockMovements) }));
+export const stockCountStatusHistoryRelations = relations(stockCountStatusHistory, ({ one }) => ({ count: one(stockCounts, { fields: [stockCountStatusHistory.count_id], references: [stockCounts.id] }), branch: one(branches, { fields: [stockCountStatusHistory.branch_id], references: [branches.id] }) }));
 export const stockTransferLinesRelations = relations(stockTransferLines, ({ one, many }) => ({ transfer: one(stockTransfers, { fields: [stockTransferLines.transfer_id], references: [stockTransfers.id] }), ingredient: one(ingredients, { fields: [stockTransferLines.ingredient_id], references: [ingredients.id] }), unit: one(unitsOfMeasure, { fields: [stockTransferLines.unit_id], references: [unitsOfMeasure.id] }), packageConversion: one(ingredientPackageConversions, { fields: [stockTransferLines.package_conversion_id], references: [ingredientPackageConversions.id] }), dispatchLines: many(stockTransferDispatchLines), receiptLines: many(stockTransferReceiptLines) }));
 export const stockTransferDispatchesRelations = relations(stockTransferDispatches, ({ one, many }) => ({ transfer: one(stockTransfers, { fields: [stockTransferDispatches.transfer_id], references: [stockTransfers.id] }), lines: many(stockTransferDispatchLines) }));
 export const stockTransferDispatchLinesRelations = relations(stockTransferDispatchLines, ({ one }) => ({ dispatch: one(stockTransferDispatches, { fields: [stockTransferDispatchLines.dispatch_id], references: [stockTransferDispatches.id] }), transferLine: one(stockTransferLines, { fields: [stockTransferDispatchLines.transfer_line_id], references: [stockTransferLines.id] }) }));
@@ -1492,4 +1617,4 @@ export const recipeComponentsRelations = relations(recipeComponents, ({ one }) =
 export const orderInventoryIssuesRelations = relations(orderInventoryIssues, ({ one, many }) => ({ order: one(orders, { fields: [orderInventoryIssues.order_id], references: [orders.id] }), consumptions: many(orderInventoryConsumptions) }));
 export const orderInventoryConsumptionsRelations = relations(orderInventoryConsumptions, ({ one }) => ({ issue: one(orderInventoryIssues, { fields: [orderInventoryConsumptions.issue_id], references: [orderInventoryIssues.id] }), order: one(orders, { fields: [orderInventoryConsumptions.order_id], references: [orders.id] }), orderItem: one(orderItems, { fields: [orderInventoryConsumptions.order_item_id], references: [orderItems.id] }), recipeVersion: one(recipeVersions, { fields: [orderInventoryConsumptions.recipe_version_id], references: [recipeVersions.id] }), ingredient: one(ingredients, { fields: [orderInventoryConsumptions.ingredient_id], references: [ingredients.id] }), location: one(inventoryLocations, { fields: [orderInventoryConsumptions.location_id], references: [inventoryLocations.id] }) }));
 export const orderItemCogsRelations = relations(orderItemCogs, ({ one }) => ({ order: one(orders, { fields: [orderItemCogs.order_id], references: [orders.id] }), orderItem: one(orderItems, { fields: [orderItemCogs.order_item_id], references: [orderItems.id] }), recipeVersion: one(recipeVersions, { fields: [orderItemCogs.recipe_version_id], references: [recipeVersions.id] }) }));
-export const stockMovementsRelations = relations(stockMovements, ({ one }) => ({ branch: one(branches, { fields: [stockMovements.branch_id], references: [branches.id] }), location: one(inventoryLocations, { fields: [stockMovements.location_id], references: [inventoryLocations.id] }), ingredient: one(ingredients, { fields: [stockMovements.ingredient_id], references: [ingredients.id] }), order: one(orders, { fields: [stockMovements.order_id], references: [orders.id] }), orderItem: one(orderItems, { fields: [stockMovements.order_item_id], references: [orderItems.id] }), recipeVersion: one(recipeVersions, { fields: [stockMovements.recipe_version_id], references: [recipeVersions.id] }), stockTransfer: one(stockTransfers, { fields: [stockMovements.stock_transfer_id], references: [stockTransfers.id] }), stockTransferLine: one(stockTransferLines, { fields: [stockMovements.stock_transfer_line_id], references: [stockTransferLines.id] }), stockTransferDispatch: one(stockTransferDispatches, { fields: [stockMovements.stock_transfer_dispatch_id], references: [stockTransferDispatches.id] }), stockTransferDispatchLine: one(stockTransferDispatchLines, { fields: [stockMovements.stock_transfer_dispatch_line_id], references: [stockTransferDispatchLines.id] }), stockTransferReceipt: one(stockTransferReceipts, { fields: [stockMovements.stock_transfer_receipt_id], references: [stockTransferReceipts.id] }), stockTransferReceiptLine: one(stockTransferReceiptLines, { fields: [stockMovements.stock_transfer_receipt_line_id], references: [stockTransferReceiptLines.id] }), stockTransferReversal: one(stockTransferReversals, { fields: [stockMovements.stock_transfer_reversal_id], references: [stockTransferReversals.id] }) }));
+export const stockMovementsRelations = relations(stockMovements, ({ one }) => ({ branch: one(branches, { fields: [stockMovements.branch_id], references: [branches.id] }), location: one(inventoryLocations, { fields: [stockMovements.location_id], references: [inventoryLocations.id] }), ingredient: one(ingredients, { fields: [stockMovements.ingredient_id], references: [ingredients.id] }), order: one(orders, { fields: [stockMovements.order_id], references: [orders.id] }), orderItem: one(orderItems, { fields: [stockMovements.order_item_id], references: [orderItems.id] }), recipeVersion: one(recipeVersions, { fields: [stockMovements.recipe_version_id], references: [recipeVersions.id] }), stockTransfer: one(stockTransfers, { fields: [stockMovements.stock_transfer_id], references: [stockTransfers.id] }), stockTransferLine: one(stockTransferLines, { fields: [stockMovements.stock_transfer_line_id], references: [stockTransferLines.id] }), stockTransferDispatch: one(stockTransferDispatches, { fields: [stockMovements.stock_transfer_dispatch_id], references: [stockTransferDispatches.id] }), stockTransferDispatchLine: one(stockTransferDispatchLines, { fields: [stockMovements.stock_transfer_dispatch_line_id], references: [stockTransferDispatchLines.id] }), stockTransferReceipt: one(stockTransferReceipts, { fields: [stockMovements.stock_transfer_receipt_id], references: [stockTransferReceipts.id] }), stockTransferReceiptLine: one(stockTransferReceiptLines, { fields: [stockMovements.stock_transfer_receipt_line_id], references: [stockTransferReceiptLines.id] }), stockTransferReversal: one(stockTransferReversals, { fields: [stockMovements.stock_transfer_reversal_id], references: [stockTransferReversals.id] }), stockCount: one(stockCounts, { fields: [stockMovements.stock_count_id], references: [stockCounts.id] }), stockCountLine: one(stockCountLines, { fields: [stockMovements.stock_count_line_id], references: [stockCountLines.id] }), stockCountReversal: one(stockCountReversals, { fields: [stockMovements.stock_count_reversal_id], references: [stockCountReversals.id] }) }));

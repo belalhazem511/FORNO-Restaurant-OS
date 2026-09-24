@@ -42,6 +42,11 @@ const TABLES: PgTable[] = [
   schema.stockTransferReceiptLines,
   schema.stockTransferReversals,
   schema.stockTransferStatusHistory,
+  schema.stockCounts,
+  schema.stockCountLines,
+  schema.stockCountEntries,
+  schema.stockCountReversals,
+  schema.stockCountStatusHistory,
   schema.stockBalances,
   schema.recipeVersions,
   schema.recipeComponents,
@@ -142,6 +147,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_receipts_idempotency_uidx ON st
 CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_reversals_transfer_uidx ON stock_transfer_reversals (transfer_id);
 CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_reversals_idempotency_uidx ON stock_transfer_reversals (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS stock_transfer_status_history_idempotency_uidx ON stock_transfer_status_history (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_counts_branch_number_uidx ON stock_counts (branch_id, count_number);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_counts_idempotency_uidx ON stock_counts (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_counts_active_location_uidx ON stock_counts (branch_id, location_id) WHERE status in ('draft', 'counting', 'submitted', 'approved', 'needs_review');
+CREATE UNIQUE INDEX IF NOT EXISTS stock_count_lines_count_ingredient_uidx ON stock_count_lines (count_id, ingredient_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_count_entries_idempotency_uidx ON stock_count_entries (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_count_reversals_count_uidx ON stock_count_reversals (count_id);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_count_reversals_idempotency_uidx ON stock_count_reversals (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS stock_count_status_history_idempotency_uidx ON stock_count_status_history (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_configuration_version_uidx ON recipe_versions (menu_item_id, variant_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_base_version_uidx ON recipe_versions (menu_item_id, version) WHERE variant_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_active_base_uidx ON recipe_versions (menu_item_id) WHERE status = 'active' AND variant_id IS NULL;

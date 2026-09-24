@@ -16,6 +16,7 @@ import { procurementRouter } from "./routers/procurement";
 import { receivingRouter } from "./routers/receiving";
 import { supplierReturnsRouter } from "./routers/supplier-returns";
 import { stockTransfersRouter } from "./routers/stock-transfers";
+import { stockCountsRouter } from "./routers/stock-counts";
 
 export const appRouter = router({
   products: productsRouter,
@@ -34,6 +35,7 @@ export const appRouter = router({
   receiving: receivingRouter,
   supplierReturns: supplierReturnsRouter,
   stockTransfers: stockTransfersRouter,
+  stockCounts: stockCountsRouter,
 });
 
 export type AppRouter = typeof appRouter;
