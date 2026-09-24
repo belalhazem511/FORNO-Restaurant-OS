@@ -26,6 +26,7 @@ export type OfflineSuccess = {
   tableId: number | null;
   delivery: { name: string; phone: string; address: string } | null;
   receipt: OfflineCashReceiptDocument | null;
+};
 
 export function OfflineKotDialog({ document, onOpenChange }: { document: OfflineKotDocument | null; onOpenChange: (open: boolean) => void }) {
   return <Dialog open={Boolean(document)} onOpenChange={onOpenChange}>
