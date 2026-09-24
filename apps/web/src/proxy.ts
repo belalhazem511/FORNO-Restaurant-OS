@@ -17,7 +17,8 @@ export async function proxy(request: NextRequest) {
     !pathname.startsWith("/auth") &&
     !pathname.startsWith("/api/auth") &&
     !pathname.startsWith("/api/docs") &&
-    !pathname.startsWith("/api/openapi.json")
+    !pathname.startsWith("/api/openapi.json") &&
+    pathname !== "/sw.js"
   ) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";

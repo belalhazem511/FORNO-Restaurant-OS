@@ -3,6 +3,8 @@ import { protectedProcedure, router } from "../init";
 import { db } from "@/lib/db";
 import { products } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
+import { staffAssignments } from "@/lib/db/schema";
+import { hasPermission } from "@/lib/permissions";
 
 const productSchema = z.object({
   id: z.number(),
@@ -13,9 +15,14 @@ const productSchema = z.object({
   category: z.string().nullable(),
   user_uid: z.string(),
   created_at: z.date().nullable(),
+  image_key: z.string().nullable(),
 });
 
 export const productsRouter = router({
+  canManageImages: protectedProcedure.input(z.void()).query(async ({ ctx }) => {
+    const assignments = await db.query.staffAssignments.findMany({ where: and(eq(staffAssignments.user_id, ctx.user.id), eq(staffAssignments.is_active, true)) });
+    return assignments.some((assignment) => hasPermission(assignment.role, "product:manage"));
+  }),
   list: protectedProcedure
     .meta({ openapi: { method: "GET", path: "/products", tags: ["Products"], summary: "List all products" } })
     .input(z.void())

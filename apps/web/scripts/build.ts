@@ -21,19 +21,23 @@ export async function runIsolatedBuild(
   baseEnv: NodeJS.ProcessEnv = process.env,
 ) {
   const buildDatabaseDir = await mkdtemp(join(tmpdir(), "forno-build-pglite-"));
-  if (buildDatabaseDir === defaultRuntimeDatabaseDir) throw new Error("Build database isolation failed.");
+  const buildMediaDir = await mkdtemp(join(tmpdir(), "forno-build-media-"));
+  if (buildDatabaseDir === defaultRuntimeDatabaseDir || buildMediaDir === defaultRuntimeDatabaseDir || buildMediaDir.startsWith(`${defaultRuntimeDatabaseDir}${process.platform === "win32" ? "\\" : "/"}`)) throw new Error("Build database/media isolation failed.");
   const env = {
     ...baseEnv,
     [DATABASE_ROLE_ENV]: "build",
     [DATABASE_DIR_ENV]: buildDatabaseDir,
+    FORNO_MEDIA_DIR: buildMediaDir,
   };
   try {
     console.log(`Building with isolated temporary PGLite database: ${buildDatabaseDir}`);
+    console.log(`Building with isolated temporary product media directory: ${buildMediaDir}`);
     const exitCode = await runner(env);
     if (exitCode !== 0) throw new Error(`Next.js production build failed with exit code ${exitCode}.`);
-    return { buildDatabaseDir };
+    return { buildDatabaseDir, buildMediaDir };
   } finally {
     await rm(buildDatabaseDir, { recursive: true, force: true });
+    await rm(buildMediaDir, { recursive: true, force: true });
   }
 }
 

@@ -99,7 +99,7 @@ describe("isolated database schema contract", () => {
       `);
 
       const digest = createHash("sha256").update(JSON.stringify(result.rows[0]?.contract)).digest("hex");
-      expect(digest).toBe("d9f910cfbdfba209256a1ac44a935b183b99998cc19c6593ab1f79f7603cb009");
+      expect(digest).toBe("c8f1601def0eb8f87b50469ec4e8e334ed3735f0d0718d6e2114874dbe822a75");
     } finally {
       await database.close();
     }

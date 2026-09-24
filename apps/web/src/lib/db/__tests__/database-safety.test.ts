@@ -85,6 +85,8 @@ describe("PGLite database safety", () => {
     await runIsolatedBuild(async (env) => {
       expect(env[DATABASE_ROLE_ENV]).toBe("build");
       expect(resolve(env[DATABASE_DIR_ENV]!)).not.toBe(resolve(runtimeDirectory));
+      expect(env.FORNO_MEDIA_DIR).toBeString();
+      expect(resolve(env.FORNO_MEDIA_DIR!)).not.toBe(resolve(runtimeDirectory));
       const buildDatabase = new PGlite(env[DATABASE_DIR_ENV]!);
       await buildDatabase.exec("create table build_only (id integer primary key); insert into build_only values (1);");
       await buildDatabase.close();

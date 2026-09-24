@@ -1,5 +1,6 @@
 const SHELL_CACHE = "forno-pos-shell-v3";
 const STATIC_CACHE = "forno-pos-static-v3";
+const PRODUCT_MEDIA_CACHE = "forno-pos-product-media-v1";
 // Authenticated HTML is cached only after a successful online navigation. The
 // install step contains public assets exclusively, avoiding cached redirects or
 // authenticated API data.
@@ -10,7 +11,7 @@ self.addEventListener("install", (event) => {
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith("forno-pos-") && ![SHELL_CACHE, STATIC_CACHE].includes(key)).map((key) => caches.delete(key)))).then(() => self.clients.claim()));
+  event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith("forno-pos-") && ![SHELL_CACHE, STATIC_CACHE, PRODUCT_MEDIA_CACHE].includes(key)).map((key) => caches.delete(key)))).then(() => self.clients.claim()));
 });
 
 self.addEventListener("fetch", (event) => {
@@ -20,6 +21,18 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/login") || url.pathname.startsWith("/signup")) {
     event.respondWith(fetch(request));
+    return;
+  }
+  if (url.pathname.startsWith("/media/products/")) {
+    event.respondWith(caches.open(PRODUCT_MEDIA_CACHE).then(async (cache) => {
+      try {
+        const response = await fetch(request);
+        if (response.ok && response.type === "basic") await cache.put(request, response.clone());
+        return response;
+      } catch {
+        return (await cache.match(request)) ?? new Response(null, { status: 404 });
+      }
+    }));
     return;
   }
   if (url.pathname.startsWith("/_next/static/") || url.pathname === "/manifest.webmanifest" || url.pathname === "/forno-pwa-icon.svg") {

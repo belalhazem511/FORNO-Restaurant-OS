@@ -27,18 +27,22 @@ import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialo
 import { Skeleton } from "@forno/ui/components/skeleton";
 import { useTRPC } from "@/lib/trpc/client";
 import { useQuery } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { useCrudMutation } from "@/hooks/use-crud-mutation";
 import { DataTable, TableActions, TableActionButton, type Column, type ExportColumn } from "@forno/ui/components/data-table";
 import { SearchFilter, type FilterOption } from "@forno/ui/components/search-filter";
 import type { RouterOutputs } from "@/lib/trpc/router";
 import { useTranslations, useLocale } from "next-intl";
 import { formatCurrency } from "@/lib/utils";
+import { ProductImage } from "@/components/products/product-image";
 
 type Product = RouterOutputs["products"]["list"][number];
 
 export default function Products() {
   const trpc = useTRPC();
+  const queryClient = useQueryClient();
   const { data: products = [], isLoading } = useQuery(trpc.products.list.queryOptions());
+  const { data: canManageImages = false } = useQuery(trpc.products.canManageImages.queryOptions());
   const t = useTranslations("products");
   const tc = useTranslations("common");
   const locale = useLocale();
@@ -47,7 +51,6 @@ export default function Products() {
     name: z.string().min(1, t("nameRequired")),
     description: z.string(),
     price: z.number().min(0, t("priceMustBePositive")),
-    in_stock: z.number().int().min(0, t("stockMustBeNonNegative")),
     category: z.string(),
   });
 
@@ -57,12 +60,6 @@ export default function Products() {
     { label: t("doner"), value: "doner" },
     { label: t("cafe"), value: "cafe" },
     { label: t("drinks"), value: "drinks" },
-  ];
-
-  const stockFilterOptions: FilterOption[] = [
-    { label: t("allStock"), value: "all" },
-    { label: t("inStock"), value: "in-stock", variant: "success" },
-    { label: t("outOfStock"), value: "out-of-stock", variant: "danger" },
   ];
 
   const columns: Column<Product>[] = [
@@ -75,14 +72,12 @@ export default function Products() {
       accessorFn: (row) => row.price,
       render: (row) => formatCurrency(row.price, locale),
     },
-    { key: "in_stock", header: t("stock"), sortable: true },
   ];
 
   const exportColumns: ExportColumn<Product>[] = [
     { key: "name", header: tc("name"), getValue: (p) => p.name },
     { key: "description", header: tc("description"), getValue: (p) => p.description ?? "" },
     { key: "price", header: tc("price"), getValue: (p) => (p.price / 100).toFixed(2) },
-    { key: "in_stock", header: t("stock"), getValue: (p) => p.in_stock },
     { key: "category", header: tc("category"), getValue: (p) => p.category ?? "" },
   ];
 
@@ -92,7 +87,9 @@ export default function Products() {
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("all");
-  const [stockFilter, setStockFilter] = useState("all");
+  const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [imageBusy, setImageBusy] = useState(false);
+  const [imageError, setImageError] = useState<string | null>(null);
 
   const isEditing = editingId !== null;
   const invalidateKeys = trpc.products.list.queryOptions().queryKey;
@@ -121,7 +118,7 @@ export default function Products() {
   });
 
   const form = useForm({
-    defaultValues: { name: "", description: "", price: 0, in_stock: 0, category: "" },
+    defaultValues: { name: "", description: "", price: 0, category: "" },
     validators: {
       onSubmit: productFormSchema,
     },
@@ -130,13 +127,12 @@ export default function Products() {
         name: value.name,
         description: value.description || undefined,
         price: Math.round(value.price * 100),
-        in_stock: value.in_stock,
         category: value.category || undefined,
       };
       if (isEditing) {
         updateMutation.mutate({ id: editingId, ...payload });
       } else {
-        createMutation.mutate(payload);
+        createMutation.mutate({ ...payload, in_stock: 0 });
       }
     },
   });
@@ -144,27 +140,62 @@ export default function Products() {
   const filteredProducts = useMemo(() => {
     return products.filter((p) => {
       if (categoryFilter !== "all" && p.category !== categoryFilter) return false;
-      if (stockFilter === "in-stock" && p.in_stock === 0) return false;
-      if (stockFilter === "out-of-stock" && p.in_stock > 0) return false;
       return p.name.toLowerCase().includes(searchTerm.toLowerCase());
     });
-  }, [products, categoryFilter, stockFilter, searchTerm]);
+  }, [products, categoryFilter, searchTerm]);
 
   const openCreate = () => {
     setEditingId(null);
+    setEditingProduct(null);
     form.reset();
     setIsDialogOpen(true);
   };
 
   const openEdit = (p: Product) => {
     setEditingId(p.id);
+    setEditingProduct(p);
+    setImageError(null);
     form.reset();
     form.setFieldValue("name", p.name);
     form.setFieldValue("description", p.description ?? "");
     form.setFieldValue("price", p.price / 100);
-    form.setFieldValue("in_stock", p.in_stock);
     form.setFieldValue("category", p.category ?? "");
     setIsDialogOpen(true);
+  };
+
+  const uploadProductImage = async (file: File) => {
+    if (!editingProduct) return;
+    setImageBusy(true);
+    setImageError(null);
+    const body = new FormData();
+    body.set("file", file);
+    try {
+      const response = await fetch(`/api/products/${editingProduct.id}/image`, { method: "POST", body });
+      const result = await response.json() as { imageKey?: string; error?: string };
+      if (!response.ok || !result.imageKey) throw new Error(result.error ?? "Image upload failed");
+      setEditingProduct({ ...editingProduct, image_key: result.imageKey });
+      await queryClient.invalidateQueries({ queryKey: trpc.products.list.queryOptions().queryKey });
+    } catch (error) {
+      setImageError(error instanceof Error ? error.message : "Image upload failed");
+    } finally {
+      setImageBusy(false);
+    }
+  };
+
+  const removeProductImage = async () => {
+    if (!editingProduct) return;
+    setImageBusy(true);
+    setImageError(null);
+    try {
+      const response = await fetch(`/api/products/${editingProduct.id}/image`, { method: "DELETE" });
+      if (!response.ok) throw new Error("Image removal failed");
+      setEditingProduct({ ...editingProduct, image_key: null });
+      await queryClient.invalidateQueries({ queryKey: trpc.products.list.queryOptions().queryKey });
+    } catch (error) {
+      setImageError(error instanceof Error ? error.message : "Image removal failed");
+    } finally {
+      setImageBusy(false);
+    }
   };
 
   const handleDelete = () => {
@@ -207,7 +238,6 @@ export default function Products() {
             searchPlaceholder={t("searchPlaceholder")}
             filters={[
               { options: categoryFilterOptions, value: categoryFilter, onChange: setCategoryFilter },
-              { options: stockFilterOptions, value: stockFilter, onChange: setStockFilter },
             ]}
           >
             <Button size="sm" onClick={openCreate}>
@@ -234,6 +264,16 @@ export default function Products() {
             <DialogTitle>{isEditing ? t("editProduct") : t("addNewProduct")}</DialogTitle>
             <DialogDescription>{isEditing ? t("editDescription") : t("addDescription")}</DialogDescription>
           </DialogHeader>
+          {isEditing && editingProduct && canManageImages && <section className="space-y-3" aria-label={locale.startsWith("ar") ? "صورة المنتج" : "Product image"}>
+            <ProductImage imageKey={editingProduct.image_key} alt={editingProduct.name} className="h-32 w-32 rounded-md object-cover" />
+            <div className="flex flex-wrap items-center gap-2">
+              <Label className="cursor-pointer rounded-md border px-3 py-2 text-sm" htmlFor="product-image-upload">{locale.startsWith("ar") ? "رفع أو استبدال الصورة" : "Upload or replace image"}</Label>
+              <Input id="product-image-upload" type="file" accept="image/jpeg,image/png,image/webp" className="sr-only" disabled={imageBusy} onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadProductImage(file); event.currentTarget.value = ""; }} />
+              {editingProduct.image_key && <Button type="button" variant="outline" disabled={imageBusy} onClick={() => void removeProductImage()}>{locale.startsWith("ar") ? "إزالة" : "Remove"}</Button>}
+              {imageBusy && <span role="status">{locale.startsWith("ar") ? "جارٍ الحفظ…" : "Saving…"}</span>}
+            </div>
+            {imageError && <p role="alert" className="text-sm text-destructive">{imageError}</p>}
+          </section>}
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -275,23 +315,6 @@ export default function Products() {
                         id="price"
                         type="number"
                         step="0.01"
-                        value={field.state.value}
-                        onChange={(e) => field.handleChange(Number(e.target.value))}
-                        onBlur={field.handleBlur}
-                        error={field.state.meta.errors.length > 0 ? field.state.meta.errors.map(e => e?.message ?? e).join(", ") : undefined}
-                      />
-                    </div>
-                  </div>
-                )}
-              </form.Field>
-              <form.Field name="in_stock">
-                {(field) => (
-                  <div className="flex flex-col sm:grid sm:grid-cols-4 sm:items-center gap-2 sm:gap-4">
-                    <Label htmlFor="in_stock" className="sm:text-right">{t("inStock")}</Label>
-                    <div className="col-span-3">
-                      <Input
-                        id="in_stock"
-                        type="number"
                         value={field.state.value}
                         onChange={(e) => field.handleChange(Number(e.target.value))}
                         onBlur={field.handleBlur}

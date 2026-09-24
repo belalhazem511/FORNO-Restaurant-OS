@@ -122,6 +122,7 @@ export const products = pgTable(
     user_uid: varchar("user_uid", { length: 255 }).notNull(),
     category: varchar("category", { length: 50 }),
     created_at: timestamp("created_at").defaultNow(),
+    image_key: varchar("image_key", { length: 200 }),
   },
   (table) => [
     uniqueIndex("products_user_name_uidx").on(table.user_uid, table.name),

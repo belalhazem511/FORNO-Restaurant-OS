@@ -20,7 +20,7 @@ const allPermissions: Permission[] = [
   "stock-transfer:approve", "stock-transfer:dispatch", "stock-transfer:receive", "stock-transfer:cancel", "stock-transfer:reverse",
   "stock-transfer:resolve", "stock-count:view", "stock-count:create", "stock-count:start", "stock-count:enter", "stock-count:submit",
   "stock-count:approve", "stock-count:post", "stock-count:cancel", "stock-count:reverse", "stock-count:resolve",
-  "stock-count:variance:view", "stock-count:cost:resolve",
+  "stock-count:variance:view", "stock-count:cost:resolve", "product:manage",
 ];
 
 const managerPermissions: Permission[] = [
@@ -70,6 +70,8 @@ describe("role permission matrix", () => {
   it("preserves the complete ordered Owner and Admin permission snapshots", () => {
     expect(permissionsForRole("owner")).toEqual(allPermissions);
     expect(permissionsForRole("admin")).toEqual(allPermissions);
+    expect(hasPermission("manager", "product:manage")).toBe(false);
+    expect(hasPermission("cashier", "product:manage")).toBe(false);
     for (const permission of allPermissions) {
       expect(hasPermission("owner", permission)).toBe(true);
       expect(hasPermission("admin", permission)).toBe(true);

@@ -62,6 +62,7 @@ const ALL_PERMISSIONS = [
   "stock-count:resolve",
   "stock-count:variance:view",
   "stock-count:cost:resolve",
+  "product:manage",
 ] as const;
 
 export type Permission = (typeof ALL_PERMISSIONS)[number];

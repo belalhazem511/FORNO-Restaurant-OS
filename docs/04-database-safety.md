@@ -71,3 +71,7 @@ Inventory schema application remains explicit through the backed-up `bun run db:
 Order production issue, manual adjustment, cancellation disposition, offline synchronization, balance projection, movement ledger, consumption snapshot, COGS snapshot, and audit rows share their respective database transaction. Balance rows are locked before availability decisions. Unique order-issue, movement, recipe-configuration, consumption, and COGS indexes make interruption/retry safe and prevent double issue. Concurrent confirmation therefore either observes the locked balance or fails into the authorized override/review workflow; it never silently oversells.
 
 `stock_movements`, `order_inventory_consumptions`, and `order_item_cogs` are historical records. Application APIs provide no update or delete operation. Recipe/cost changes create later versions or movements and cannot rewrite the values issued to an earlier order.
+
+## Product media
+
+Product images are stored as opaque keys in the catalog and as files beneath `FORNO_MEDIA_DIR`, outside the PGLite directory and source-controlled files. Runtime defaults to `apps/web/data/media`; test, build, and isolated verification processes must provide a unique temporary media directory. Production builds receive an isolated temporary media directory and media reads/writes are disabled for the build role. Uploads accept validated JPEG, PNG, and WebP content up to 5 MiB, use server-generated names, and write replacement files before updating the catalog key so a failed replacement preserves the prior image.
