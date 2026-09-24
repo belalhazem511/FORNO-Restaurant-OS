@@ -15,6 +15,8 @@ import {
 import { convertScaledQuantity, multiplyDivide } from "@/lib/inventory/exact";
 import { hasPermission, requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
+import { approvePurchaseOrder, cancelPurchaseOrder, submitPurchaseOrder } from "./procurement/purchase-order-lifecycle";
+import { archiveSupplier, assertSupplier, createSupplier, updateSupplier } from "./procurement/suppliers";
 
 const branchInput = z.object({ branchId: z.number().int().positive() });
 const MAX_POSTGRES_INTEGER = 2_147_483_647;
@@ -36,18 +38,6 @@ const lineInput = z.object({
   unitPriceMinor: z.number().int().nonnegative().max(MAX_POSTGRES_INTEGER),
   notes: z.string().trim().max(500).nullable().optional(),
 });
-
-async function assertSupplier(branchId: number, supplierId: number) {
-  const supplier = await db.query.suppliers.findFirst({
-    where: and(eq(suppliers.id, supplierId), eq(suppliers.branch_id, branchId)),
-  });
-  if (!supplier)
-    throw new TRPCError({
-      code: "NOT_FOUND",
-      message: "Supplier not found in this branch",
-    });
-  return supplier;
-}
 
 async function resolveLines(branchId: number, lines: z.infer<typeof lineInput>[]) {
   if (!lines.length)
@@ -182,34 +172,7 @@ export const procurementRouter = router({
     });
     if (duplicate)
       throw new TRPCError({ code: "CONFLICT", message: "Supplier code already exists in this branch" });
-    return db.transaction(async (tx) => {
-      const [supplier] = await tx
-        .insert(suppliers)
-        .values({
-          branch_id: input.branchId,
-          code: input.code,
-          name_en: input.nameEn,
-          name_ar: input.nameAr,
-          is_active: true,
-          contact_name: input.contactName ?? null,
-          phone: input.phone ?? null,
-          email: input.email ?? null,
-          address: input.address ?? null,
-          notes: input.notes ?? null,
-          created_by: ctx.user.id,
-          updated_by: ctx.user.id,
-        })
-        .returning();
-      await tx.insert(auditLogs).values({
-        branch_id: input.branchId,
-        actor_user_id: ctx.user.id,
-        action: "supplier.create",
-        entity_type: "supplier",
-        entity_id: String(supplier.id),
-        details: JSON.stringify({ code: supplier.code }),
-      });
-      return supplier;
-    });
+    return createSupplier(input, ctx.user.id);
   }),
 
   updateSupplier: protectedProcedure
@@ -230,33 +193,7 @@ export const procurementRouter = router({
       });
       if (duplicate)
         throw new TRPCError({ code: "CONFLICT", message: "Supplier code already exists in this branch" });
-      return db.transaction(async (tx) => {
-        const [supplier] = await tx
-          .update(suppliers)
-          .set({
-            code: input.code,
-            name_en: input.nameEn,
-            name_ar: input.nameAr,
-            contact_name: input.contactName ?? null,
-            phone: input.phone ?? null,
-            email: input.email ?? null,
-            address: input.address ?? null,
-            notes: input.notes ?? null,
-            updated_by: ctx.user.id,
-            updated_at: new Date(),
-          })
-          .where(and(eq(suppliers.id, input.supplierId), eq(suppliers.branch_id, input.branchId)))
-          .returning();
-        if (!supplier) throw new TRPCError({ code: "NOT_FOUND", message: "Supplier not found in this branch" });
-        await tx.insert(auditLogs).values({
-          branch_id: input.branchId,
-          actor_user_id: ctx.user.id,
-          action: "supplier.update",
-          entity_type: "supplier",
-          entity_id: String(supplier.id),
-        });
-        return supplier;
-      });
+      return updateSupplier(input, ctx.user.id);
     }),
 
   archiveSupplier: protectedProcedure
@@ -269,23 +206,7 @@ export const procurementRouter = router({
     .mutation(async ({ ctx, input }) => {
       await requireStaff(ctx.user.id, input.branchId, "supplier:manage");
       await assertSupplier(input.branchId, input.supplierId);
-      return db.transaction(async (tx) => {
-        const [updated] = await tx
-          .update(suppliers)
-          .set({ is_active: false, updated_by: ctx.user.id, updated_at: new Date() })
-          .where(and(eq(suppliers.id, input.supplierId), eq(suppliers.branch_id, input.branchId)))
-          .returning();
-        if (!updated) throw new TRPCError({ code: "NOT_FOUND", message: "Supplier not found in this branch" });
-        await tx.insert(auditLogs).values({
-          branch_id: input.branchId,
-          actor_user_id: ctx.user.id,
-          action: "supplier.archive",
-          entity_type: "supplier",
-          entity_id: String(updated.id),
-          reason: input.reason,
-        });
-        return updated;
-      });
+      return archiveSupplier(input, ctx.user.id);
     }),
 
   purchaseOrders: protectedProcedure.input(branchInput).query(async ({ ctx, input }) => {
@@ -473,36 +394,14 @@ export const procurementRouter = router({
     .input(branchInput.extend({ purchaseOrderId: z.number().int().positive() }))
     .mutation(async ({ ctx, input }) => {
       await requireStaff(ctx.user.id, input.branchId, "purchase-order:create");
-      return db.transaction(async (tx) => {
-        const [order] = await tx.select().from(purchaseOrders).where(and(
-          eq(purchaseOrders.id, input.purchaseOrderId),
-          eq(purchaseOrders.branch_id, input.branchId),
-        )).for("update");
-        if (!order) throw new TRPCError({ code: "NOT_FOUND", message: "Purchase order not found in this branch" });
-        if (order.status !== "draft") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Only draft purchase orders can be submitted" });
-        const [line] = await tx.select({ id: purchaseOrderLines.id }).from(purchaseOrderLines).where(eq(purchaseOrderLines.purchase_order_id, order.id)).limit(1);
-        if (!line || order.total_amount <= 0) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "A purchase order must contain priced lines before submission" });
-        const [updated] = await tx.update(purchaseOrders).set({ status: "submitted", submitted_by: ctx.user.id, updated_at: new Date() }).where(eq(purchaseOrders.id, order.id)).returning();
-        await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "purchase_order.submit", entity_type: "purchase_order", entity_id: String(order.id) });
-        return updated;
-      });
+      return submitPurchaseOrder(input, ctx.user.id);
     }),
 
   approvePurchaseOrder: protectedProcedure
     .input(branchInput.extend({ purchaseOrderId: z.number().int().positive() }))
     .mutation(async ({ ctx, input }) => {
       await requireStaff(ctx.user.id, input.branchId, "purchase-order:approve");
-      return db.transaction(async (tx) => {
-        const [order] = await tx.select().from(purchaseOrders).where(and(
-          eq(purchaseOrders.id, input.purchaseOrderId),
-          eq(purchaseOrders.branch_id, input.branchId),
-        )).for("update");
-        if (!order) throw new TRPCError({ code: "NOT_FOUND", message: "Purchase order not found in this branch" });
-        if (order.status !== "submitted") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Only submitted purchase orders can be approved" });
-        const [updated] = await tx.update(purchaseOrders).set({ status: "approved", approved_by: ctx.user.id, updated_at: new Date() }).where(eq(purchaseOrders.id, order.id)).returning();
-        await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, approver_user_id: ctx.user.id, action: "purchase_order.approve", entity_type: "purchase_order", entity_id: String(order.id) });
-        return updated;
-      });
+      return approvePurchaseOrder(input, ctx.user.id);
     }),
 
   cancelPurchaseOrder: protectedProcedure
@@ -514,16 +413,6 @@ export const procurementRouter = router({
     )
     .mutation(async ({ ctx, input }) => {
       await requireStaff(ctx.user.id, input.branchId, "purchase-order:approve");
-      return db.transaction(async (tx) => {
-        const [order] = await tx.select().from(purchaseOrders).where(and(
-          eq(purchaseOrders.id, input.purchaseOrderId),
-          eq(purchaseOrders.branch_id, input.branchId),
-        )).for("update");
-        if (!order) throw new TRPCError({ code: "NOT_FOUND", message: "Purchase order not found in this branch" });
-        if (order.status === "cancelled" || order.status === "approved") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "This purchase order cannot be cancelled" });
-        const [updated] = await tx.update(purchaseOrders).set({ status: "cancelled", cancelled_by: ctx.user.id, cancellation_reason: input.reason, updated_at: new Date() }).where(eq(purchaseOrders.id, order.id)).returning();
-        await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "purchase_order.cancel", entity_type: "purchase_order", entity_id: String(order.id), reason: input.reason });
-        return updated;
-      });
+      return cancelPurchaseOrder(input, ctx.user.id);
     }),
 });
