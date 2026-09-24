@@ -43,6 +43,21 @@ export function multiplyDivide(value: number, numerator: number, denominator: nu
   return roundHalfAwayFromZero(exact(reducedValue * factor.numerator, "converted quantity"), reducedDenominator);
 }
 
+export function multiplyDivideFactors(value: number, numerators: number[], denominators: number[]) {
+  exact(value, "quantity");
+  let top = [value, ...numerators].map((part) => exact(part, "multiplication factor"));
+  let bottom = denominators.map((part) => exact(part, "division factor"));
+  if (bottom.some((part) => part <= 0)) throw new Error("Division factors must be positive");
+  for (let i = 0; i < top.length; i++) for (let j = 0; j < bottom.length; j++) {
+    const divisor = gcd(Math.abs(top[i]), bottom[j]);
+    top[i] /= divisor;
+    bottom[j] /= divisor;
+  }
+  const numerator = top.reduce((product, part) => exact(product * part, "rational product"), 1);
+  const denominator = bottom.reduce((product, part) => exact(product * part, "rational divisor"), 1);
+  return roundHalfAwayFromZero(numerator, denominator);
+}
+
 export function convertScaledQuantity(input: {
   quantityScaled: number;
   fromDimension: Dimension;

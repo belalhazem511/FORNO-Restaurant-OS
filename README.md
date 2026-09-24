@@ -58,7 +58,8 @@ FORNO now covers the operational backbone of a restaurant POS:
 | Phase 2B2B | Complete | Offline POS operation, PWA support, durable sync queue, Sync Center, conflict recovery, and offline cash synchronization. |
 | Offline receipt fix | Complete | Printable offline cash receipts immediately after cash is accepted offline. |
 | Phase 3A | Complete | Recipe-driven inventory foundations, automatic ingredient consumption, exact quantities, weighted-average cost, and theoretical product cost. |
-| Phase 3B1 | Complete | Branch-scoped suppliers and procurement-only purchase orders. Receiving and stock posting remain deferred. |
+| Phase 3B1 | Complete | Branch-scoped suppliers and purchase-order lifecycle. |
+| Phase 3B2A | Complete | Approved-PO goods receipts, partial receiving, exact package snapshots, transactional stock posting, weighted-average costing, and safe reversals. |
 
 ## POS And Kitchen Flow
 
@@ -134,7 +135,7 @@ The receipt is rendered from an immutable local snapshot created when offline ca
 
 ## Inventory And Recipe Foundations
 
-Phase 3A adds the foundation for recipe-driven inventory. Phase 3B1 adds supplier master data and purchase-order planning without adding receiving, transfers, full stock counts, forecasting, or full accounting.
+Phase 3A adds the foundation for recipe-driven inventory. Phase 3B1 adds supplier master data and purchase-order planning. Phase 3B2A adds approved purchase-order receiving while supplier returns, transfers, full stock counts, forecasting, and full accounting remain deferred.
 
 <p align="center">
   <img src="docs/assets/inventory-recipe-flow.svg" alt="Recipe-driven inventory flow" width="900">
@@ -148,6 +149,7 @@ Inventory capabilities:
 - Immutable stock movement ledger.
 - Current-balance projection maintained transactionally from posted movements.
 - Opening balances, manual adjustments, sale consumption, sale-consumption reversal, waste/discard, and negative-stock override movements.
+- Accepted purchase-receipt movements with atomic balance updates, immutable cost snapshots, and moving weighted-average cost; rejected and damaged deliveries do not increase stock.
 - Moving weighted-average ingredient cost.
 - Recipe versions with base components, variant deltas, modifier deltas, effective time, approval metadata, and historical immutability.
 - Order-level inventory consumption snapshots and order-item COGS snapshots.
@@ -274,9 +276,7 @@ The current implementation has been verified with:
 
 The following work is intentionally outside the current completed scope:
 
-- Supplier management.
-- Purchase orders.
-- Receiving.
+- Supplier returns (Phase 3B2B).
 - Stock transfers.
 - Full stock counts.
 - Forecasting.

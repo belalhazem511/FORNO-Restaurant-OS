@@ -27,6 +27,9 @@ const TABLES: PgTable[] = [
   schema.ingredientPackageConversions,
   schema.purchaseOrders,
   schema.purchaseOrderLines,
+  schema.purchaseReceipts,
+  schema.purchaseReceiptLines,
+  schema.purchaseReceiptReversals,
   schema.stockBalances,
   schema.recipeVersions,
   schema.recipeComponents,
@@ -111,6 +114,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS ingredient_packages_ingredient_code_uidx ON in
 CREATE UNIQUE INDEX IF NOT EXISTS suppliers_branch_code_uidx ON suppliers (branch_id, code);
 CREATE UNIQUE INDEX IF NOT EXISTS purchase_orders_branch_number_uidx ON purchase_orders (branch_id, po_number);
 CREATE UNIQUE INDEX IF NOT EXISTS purchase_orders_idempotency_uidx ON purchase_orders (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipts_branch_number_uidx ON purchase_receipts (branch_id, receipt_number);
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipts_idempotency_uidx ON purchase_receipts (idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipt_lines_receipt_po_line_uidx ON purchase_receipt_lines (receipt_id, purchase_order_line_id);
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipt_reversals_receipt_uidx ON purchase_receipt_reversals (receipt_id);
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_receipt_reversals_idempotency_uidx ON purchase_receipt_reversals (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS stock_balances_location_ingredient_uidx ON stock_balances (location_id, ingredient_id);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_configuration_version_uidx ON recipe_versions (menu_item_id, variant_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS recipe_versions_base_version_uidx ON recipe_versions (menu_item_id, version) WHERE variant_id IS NULL;

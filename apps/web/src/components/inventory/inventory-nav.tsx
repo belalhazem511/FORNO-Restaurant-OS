@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useLocale } from "next-intl";
-import { BoxesIcon, ChefHatIcon, ClipboardListIcon, FactoryIcon, HistoryIcon, LayoutDashboardIcon } from "lucide-react";
+import { BoxesIcon, ChefHatIcon, ClipboardListIcon, FactoryIcon, HistoryIcon, LayoutDashboardIcon, PackageCheckIcon } from "lucide-react";
 
 const links = [
   { href: "/admin/inventory", en: "Overview", ar: "نظرة عامة", icon: LayoutDashboardIcon },
@@ -11,6 +11,7 @@ const links = [
   { href: "/admin/inventory/movements", en: "Movement ledger", ar: "سجل الحركات", icon: HistoryIcon },
   { href: "/admin/inventory/suppliers", en: "Suppliers", ar: "الموردون", icon: FactoryIcon },
   { href: "/admin/inventory/purchase-orders", en: "Purchase orders", ar: "أوامر الشراء", icon: ClipboardListIcon },
+  { href: "/admin/inventory/receiving", en: "Receiving / GRNs", ar: "استلام المشتريات", icon: PackageCheckIcon },
 ];
 
 export function InventoryNav() {

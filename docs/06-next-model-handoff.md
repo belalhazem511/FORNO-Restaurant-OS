@@ -512,7 +512,17 @@ Browser smoke tests passed using local Edge or Chromium fallback:
 
 Phase 3B1 is implemented in the current working tree. It adds branch-scoped supplier master data, supplier archiving, exact-quantity purchase-order lines, server-calculated EGP totals, draft/submitted/approved/cancelled lifecycle controls, role permissions, audit records, bilingual inventory navigation and pages, seed examples, and isolated router tests.
 
-Purchase orders are procurement-only documents. They do not create receiving records, stock movements, balance changes, COGS changes, or offline queue operations. Receiving remains deferred to Phase 3B2.
+Purchase orders are still inventory-neutral until a receipt is explicitly posted. Purchase-order authorization (`draft`, `submitted`, `approved`, `cancelled`) is separate from receiving progress (`not_received`, `partially_received`, `fully_received`).
+
+## Completed Phase 3B2A: Purchase Order Receiving
+
+Phase 3B2A adds branch-scoped goods receipt notes for approved purchase orders. `purchase_receipts`, `purchase_receipt_lines`, and append-only `purchase_receipt_reversals` retain supplier, PO, destination, delivery-note/invoice, user, quantity, price, ingredient, and rational package-conversion snapshots. Receipt numbers are unique per branch.
+
+Drafts do not affect inventory. Posting locks the PO and inventory balances, validates remaining accepted quantities and any authorized overrides, then atomically writes accepted-quantity `purchase_receipt` movements and updates stock balances with the shared exact moving-weighted-average calculation. Rejected and damaged quantities remain recorded without increasing stock. Duplicate posting is idempotent. A later inventory movement or insufficient stock blocks automatic reversal and records `needs_review`; a safe reversal restores its captured prior balance/cost and appends reversal movements without editing the original receipt.
+
+Owner/Admin can approve significant price variance, over-receiving, and reversal. Managers can perform operational receiving and the explicitly granted over-receiving override; Cashiers have neither receiving APIs nor receiving pages. English LTR and Arabic RTL receiving, receipt history, snapshots, and draft editing are available. Receiving is online-only and does not implement supplier returns.
+
+Phase 3B2B supplier returns, transfers/counts/waste, reporting, and all later phases remain deferred.
 
 ## GitHub README And Assets
 
@@ -594,7 +604,7 @@ git diff --check
 
 Do not implement these unless the user explicitly asks:
 
-- Receiving.
+- Supplier returns (Phase 3B2B).
 - Stock transfers.
 - Full stock counts.
 - Forecasting.

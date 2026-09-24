@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@forno/ui/components/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@forno/ui/components/card";
@@ -11,7 +12,7 @@ import { toast } from "sonner";
 import { useTRPC } from "@/lib/trpc/client";
 import { multiplyDivide, parseDecimalToScaled } from "@/lib/inventory/exact";
 import { formatCurrency } from "@/lib/utils";
-import { InventoryNav, InventoryPageHeader } from "@/components/inventory/inventory-nav";
+import { InventoryNav, InventoryPageHeader, formatExactQuantity } from "@/components/inventory/inventory-nav";
 
 type DraftLine = {
   ingredientId: string;
@@ -160,8 +161,8 @@ export default function PurchaseOrdersPage() {
       <InventoryPageHeader
         titleEn="Purchase orders"
         titleAr="أوامر الشراء"
-        descriptionEn="Plan supplier purchases without changing stock. Receiving is intentionally deferred to a later phase."
-        descriptionAr="تخطيط مشتريات الموردين دون تغيير المخزون. الاستلام مؤجل لمرحلة لاحقة."
+        descriptionEn="Plan supplier purchases, then receive approved orders through audited goods-receipt notes."
+        descriptionAr="خطط لمشتريات الموردين واستلم الأوامر المعتمدة بإشعارات استلام موثقة."
       />
       <div className="grid gap-4 xl:grid-cols-[1fr_480px]">
         <Card>
@@ -181,7 +182,7 @@ export default function PurchaseOrdersPage() {
                   <span className="rounded bg-muted px-2 py-1 text-xs font-semibold">{order.status}</span>
                 </div>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  {order.lines.length} {ar ? "بنود" : "lines"} · {formatCurrency(order.total_amount, locale)}
+                  {order.lines.length} {ar ? "بنود" : "lines"} · {formatCurrency(order.total_amount, locale)} · {ar ? "الاستلام" : "receiving"}: {order.receiving_status.replaceAll("_", " ")}
                 </p>
                 <div className="mt-3 space-y-1 border-t pt-2 text-sm">
                   {order.lines.map((line) => (
@@ -189,12 +190,15 @@ export default function PurchaseOrdersPage() {
                       <span>
                         {ar ? line.ingredient_name_ar : line.ingredient_name_en} · {formatQuantity(line.quantity_input_scaled)}{" "}
                         {line.unit_code}
+                        <small className="ms-2 block text-muted-foreground">{ar ? "مقبول / متبقٍ" : "Received / remaining"}: {formatExactQuantity(order.receipts.filter((receipt) => ["posted", "needs_review"].includes(receipt.status)).flatMap((receipt) => receipt.lines).filter((receiptLine) => receiptLine.purchase_order_line_id === line.id).reduce((sum, receiptLine) => sum + receiptLine.accepted_quantity_base, 0), line.ingredient.dimension)} / {formatExactQuantity(Math.max(0, line.quantity_base - order.receipts.filter((receipt) => ["posted", "needs_review"].includes(receipt.status)).flatMap((receipt) => receipt.lines).filter((receiptLine) => receiptLine.purchase_order_line_id === line.id).reduce((sum, receiptLine) => sum + receiptLine.accepted_quantity_base, 0)), line.ingredient.dimension)}</small>
                       </span>
                       <span>{formatCurrency(line.line_total_amount, locale)}</span>
                     </div>
                   ))}
                 </div>
+                {order.receipts.length > 0 && <div className="mt-2 flex flex-wrap gap-2 border-t pt-2 text-sm"><strong>{ar ? "سجل الاستلام" : "Receiving history"}:</strong>{order.receipts.map((receipt) => <Link key={receipt.id} href={`/admin/inventory/receiving/${receipt.id}`} className="underline">{receipt.receipt_number} · {receipt.status}</Link>)}</div>}
                 <div className="mt-2 flex flex-wrap gap-2">
+                  {order.status === "approved" && <Link href="/admin/inventory/receiving" className="inline-flex min-h-11 items-center rounded-md border px-3 text-sm font-medium hover:bg-muted">{ar ? "استلام أمر الشراء" : "Receive purchase order"}</Link>}
                   {order.status === "draft" && context.data?.canCreateOrders && (
                     <Button size="sm" onClick={() => submit.mutate({ branchId, purchaseOrderId: order.id })}>
                       {ar ? "إرسال" : "Submit"}

@@ -109,6 +109,8 @@ async function resolveLines(branchId: number, lines: z.infer<typeof lineInput>[]
       ingredient,
       unit,
       packageConversion,
+      conversionNumeratorSnapshot: factor.numerator,
+      conversionDenominatorSnapshot: factor.denominator,
       quantityBase,
       lineTotalAmount,
     };
@@ -290,7 +292,7 @@ export const procurementRouter = router({
     await requireStaff(ctx.user.id, input.branchId, "purchase-order:view");
     return db.query.purchaseOrders.findMany({
       where: eq(purchaseOrders.branch_id, input.branchId),
-      with: { supplier: true, lines: true },
+      with: { supplier: true, lines: { with: { ingredient: true } }, receipts: { with: { lines: true } } },
       orderBy: [desc(purchaseOrders.created_at)],
     });
   }),
@@ -306,6 +308,7 @@ export const procurementRouter = router({
           lines: {
             with: { ingredient: true, unit: true, packageConversion: true },
           },
+          receipts: { with: { lines: true } },
         },
       });
       if (!order)
@@ -357,6 +360,7 @@ export const procurementRouter = router({
             supplier_name_ar_snapshot: supplier.name_ar,
             po_number: input.poNumber,
             status: "draft",
+            receiving_status: "not_received",
             order_date: new Date(),
             currency: "EGP",
             expected_date: input.expectedDate ? new Date(input.expectedDate) : null,
@@ -379,6 +383,8 @@ export const procurementRouter = router({
             unit_code: line.packageConversion?.code ?? line.unit.code,
             quantity_input_scaled: line.quantityScaled,
             quantity_base: line.quantityBase,
+            conversion_numerator_snapshot: line.conversionNumeratorSnapshot,
+            conversion_denominator_snapshot: line.conversionDenominatorSnapshot,
             unit_price_minor: line.unitPriceMinor,
             line_total_amount: line.lineTotalAmount,
             notes: line.notes ?? null,
@@ -432,6 +438,8 @@ export const procurementRouter = router({
             unit_code: line.packageConversion?.code ?? line.unit.code,
             quantity_input_scaled: line.quantityScaled,
             quantity_base: line.quantityBase,
+            conversion_numerator_snapshot: line.conversionNumeratorSnapshot,
+            conversion_denominator_snapshot: line.conversionDenominatorSnapshot,
             unit_price_minor: line.unitPriceMinor,
             line_total_amount: line.lineTotalAmount,
             notes: line.notes ?? null,

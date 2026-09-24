@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@forno/ui/components/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@forno/ui/components/card";
@@ -110,6 +111,7 @@ export default function SuppliersPage() {
                 <p className="mt-1 text-sm text-muted-foreground">
                   {supplier.contact_name ?? "—"} · {supplier.phone ?? supplier.email ?? "—"}
                 </p>
+                <Link href={`/admin/inventory/receiving?supplierId=${supplier.id}`} className="mt-2 inline-flex min-h-11 items-center text-sm underline">{ar ? "سجل استلامات المورد" : "Supplier receipt history"}</Link>
                 {!supplier.is_active ? (
                   <p className="text-xs text-amber-700">{ar ? "مؤرشف" : "Archived"}</p>
                 ) : (
