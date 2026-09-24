@@ -30,6 +30,7 @@ import {
   CreditCardIcon,
   RefreshCwIcon,
   WarehouseIcon,
+  SettingsIcon,
   MenuIcon,
   XIcon,
   type LucideIcon,
@@ -42,7 +43,7 @@ import { logout } from "@/app/login/actions";
 
 interface NavItem {
   href: string;
-  labelKey: "dashboard" | "cashier" | "products" | "customers" | "orders" | "paymentMethods" | "pos" | "syncCenter" | "inventory";
+  labelKey: "dashboard" | "cashier" | "products" | "customers" | "orders" | "paymentMethods" | "pos" | "syncCenter" | "inventory" | "settings";
   icon: LucideIcon;
 }
 
@@ -56,6 +57,7 @@ const navItems: NavItem[] = [
   { href: "/admin/payment-methods", labelKey: "paymentMethods", icon: CreditCardIcon },
   { href: "/admin/pos", labelKey: "pos", icon: ShoppingCartIcon },
   { href: "/admin/sync", labelKey: "syncCenter", icon: RefreshCwIcon },
+  { href: "/admin/storage", labelKey: "settings", icon: SettingsIcon },
 ];
 
 export function AdminLayout({ children }: { children: React.ReactNode }) {

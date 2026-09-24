@@ -1,9 +1,11 @@
-import { app, BrowserWindow, ipcMain, safeStorage } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, safeStorage } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { desktopPaths } from "./runtime-paths.js";
+import { createLocalBackup, restoreLocalBackup } from "./local-backups.js";
+import { CURRENT_LOCAL_SCHEMA_VERSION, readLocalSchemaVersion, writeLocalSchemaVersion } from "./local-schema-version.js";
 
 app.setName("FORNO Restaurant OS");
 if (process.env.NODE_ENV === "test" && process.env.FORNO_DESKTOP_DATA_DIR) {
@@ -15,9 +17,10 @@ const localPaths = desktopPaths(app.getPath("appData"));
 const hasSingleInstance = app.requestSingleInstanceLock();
 let localServer: ChildProcess | null = null;
 let mainWindow: BrowserWindow | null = null;
-let runtimeState: "setup_required" | "starting" | "ready" | "failed" = "setup_required";
+let runtimeState: "setup_required" | "upgrade_required" | "starting" | "ready" | "failed" = "setup_required";
 let shutdownStarted = false;
 const setupToken = randomBytes(32).toString("hex");
+const schemaVersionPath = join(localPaths.sync, "schema-version.json");
 
 if (!hasSingleInstance) app.quit();
 
@@ -93,6 +96,7 @@ async function applyInitialSchema() {
   await mkdir(localPaths.logs, { recursive: true });
   await runElectronNode(join(webRoot, "node_modules", "drizzle-kit", "bin.cjs"), ["push"], webRoot, env);
   if (!(await isDatabasePresent())) throw new Error("Schema setup completed without creating a verifiable PGLite database.");
+  await writeLocalSchemaVersion(schemaVersionPath);
 }
 
 async function startLocalServer() {
@@ -100,6 +104,12 @@ async function startLocalServer() {
   runtimeState = "starting";
   const webRoot = packagedWebRoot();
   const env = childEnvironment(await readOrCreateAuthSecret());
+  await Promise.all([
+    mkdir(join(localPaths.root, "data"), { recursive: true }),
+    mkdir(join(localPaths.root, "media"), { recursive: true }),
+    mkdir(localPaths.documents, { recursive: true }),
+    mkdir(localPaths.backups, { recursive: true }),
+  ]);
   await mkdir(localPaths.logs, { recursive: true });
   localServer = spawn(process.execPath, [join(webRoot, "node_modules", "next", "dist", "bin", "next"), "start", "--hostname", "127.0.0.1", "--port", String(SERVER_PORT)], {
     cwd: webRoot,
@@ -126,6 +136,40 @@ async function startLocalServer() {
   throw new Error("The local application server did not become ready.");
 }
 
+function assertStoragePage(event: Electron.IpcMainInvokeEvent) {
+  const frame = event.senderFrame;
+  if (!frame || frame !== event.sender.mainFrame || new URL(frame.url).origin !== SERVER_ORIGIN || new URL(frame.url).pathname !== "/admin/storage") {
+    throw new Error("Local storage actions are available only from the protected storage page.");
+  }
+}
+
+async function pauseLocalServer() {
+  const child = localServer;
+  if (!child || child.exitCode !== null) throw new Error("The local application server is not running.");
+  const response = await fetch(`${SERVER_ORIGIN}/api/desktop/shutdown`, {
+    method: "POST",
+    headers: { "x-forno-desktop-setup": setupToken },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error("The database could not be safely paused.");
+  child.kill();
+  await new Promise<void>((resolveExit, reject) => {
+    const timeout = setTimeout(() => reject(new Error("The local server did not stop after database shutdown.")), 10_000);
+    child.once("exit", () => { clearTimeout(timeout); resolveExit(); });
+  });
+  localServer = null;
+}
+
+async function withPausedDatabase<T>(operation: () => Promise<T>) {
+  await pauseLocalServer();
+  try {
+    return await operation();
+  } finally {
+    await startLocalServer();
+    await mainWindow?.loadURL(`${SERVER_ORIGIN}/admin/storage`);
+  }
+}
+
 async function completeOwnerSetup(input: { name: string; email: string; password: string; branchName: string; registerName: string; locale: "en" | "ar" }) {
   const response = await fetch(`${SERVER_ORIGIN}/api/desktop/setup`, {
     method: "POST",
@@ -148,6 +192,10 @@ function setupHtmlDocument() {
 function startupErrorHtml(message: string) {
   const escaped = message.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]!);
   return `<!doctype html><html lang="en"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>FORNO local data needs attention</title><body style="font:16px system-ui;max-width:46rem;margin:4rem auto;padding:0 1rem"><h1>Local data was preserved</h1><p>FORNO could not start its local application. It did not delete, reset, or replace the database.</p><pre style="white-space:pre-wrap">${escaped}</pre><p>Logs: ${localPaths.logs}</p><p>Restore only from a verified backup or contact support. Do not remove the local data directory.</p></body></html>`;
+}
+
+function upgradeHtml() {
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><title>FORNO database upgrade</title><body style="font:16px system-ui;max-width:46rem;margin:4rem auto;padding:0 1rem"><h1>Database upgrade requires confirmation</h1><p>This device already contains local data. FORNO will first create and verify a complete backup, then apply the application schema update.</p><p>If an update fails, the original database and backup are preserved. FORNO will not reset this database.</p><p><label><input id="confirm" type="checkbox"> I confirm that FORNO may back up and update this local database.</label></p><button id="upgrade" disabled>Back up and upgrade</button><p id="result" role="status" aria-live="polite"></p><script>const c=document.querySelector('#confirm'),b=document.querySelector('#upgrade'),o=document.querySelector('#result');c.onchange=()=>b.disabled=!c.checked;b.onclick=async()=>{b.disabled=true;o.textContent='Creating and verifying backup…';try{const r=await window.fornoDesktop.upgradeLocalDatabase(true);if(!r.ready)throw new Error(r.error||'Upgrade did not complete.');location.href='/login';}catch(e){o.textContent=e.message||'Upgrade failed. Existing data was preserved.';b.disabled=false;}}</script></body></html>`;
 }
 
 function createWindow() {
@@ -179,6 +227,13 @@ function createWindow() {
   });
   void (async () => {
     if (await isDatabasePresent()) {
+      const version = await readLocalSchemaVersion(schemaVersionPath);
+      if (version === null || version < CURRENT_LOCAL_SCHEMA_VERSION) {
+        runtimeState = "upgrade_required";
+        await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(upgradeHtml())}`);
+        return;
+      }
+      if (version > CURRENT_LOCAL_SCHEMA_VERSION) throw new Error("This local database was opened by a newer FORNO version. It was preserved; install a compatible application version.");
       await startLocalServer();
       const setupResponse = await fetch(`${SERVER_ORIGIN}/api/desktop/setup`, { headers: { "x-forno-desktop-setup": setupToken } });
       const setup = await setupResponse.json() as { complete: boolean };
@@ -193,6 +248,23 @@ function createWindow() {
 }
 
 ipcMain.handle("desktop:runtime-status", () => ({ state: runtimeState, version: app.getVersion() }));
+ipcMain.handle("desktop:create-backup", async (event) => {
+  assertStoragePage(event);
+  return withPausedDatabase(() => createLocalBackup(localPaths.root));
+});
+ipcMain.handle("desktop:restore-backup", async (event, confirmed: boolean) => {
+  assertStoragePage(event);
+  if (confirmed !== true) throw new Error("Explicit restore confirmation is required.");
+  const selection = await dialog.showOpenDialog(mainWindow!, {
+    title: "Select a FORNO backup",
+    defaultPath: localPaths.backups,
+    properties: ["openFile"],
+    filters: [{ name: "FORNO backup", extensions: ["tar"] }],
+  });
+  if (selection.canceled || selection.filePaths.length !== 1) return { restored: false as const };
+  const result = await withPausedDatabase(() => restoreLocalBackup(localPaths.root, selection.filePaths[0]!));
+  return { restored: true as const, recoveryPath: result.recoveryPath };
+});
 ipcMain.handle("desktop:initialize-local-data", async (_event, input: { confirmed: true; locale: "en" | "ar" }) => {
   if (input?.confirmed !== true || !["en", "ar"].includes(input.locale)) throw new Error("Explicit local setup confirmation is required.");
   try {
@@ -203,6 +275,24 @@ ipcMain.handle("desktop:initialize-local-data", async (_event, input: { confirme
   } catch (error) {
     runtimeState = "failed";
     return { ready: false as const, error: error instanceof Error ? error.message : "Local setup failed." };
+  }
+});
+
+ipcMain.handle("desktop:upgrade-local-database", async (_event, confirmed: boolean) => {
+  if (confirmed !== true || runtimeState !== "upgrade_required") throw new Error("Explicit database upgrade confirmation is required.");
+  try {
+    const backup = await createLocalBackup(localPaths.root);
+    const webRoot = packagedWebRoot();
+    const env = childEnvironment(await readOrCreateAuthSecret());
+    await runElectronNode(join(webRoot, "node_modules", "drizzle-kit", "bin.cjs"), ["push"], webRoot, env);
+    await writeLocalSchemaVersion(schemaVersionPath);
+    await startLocalServer();
+    const setupResponse = await fetch(`${SERVER_ORIGIN}/api/desktop/setup`, { headers: { "x-forno-desktop-setup": setupToken } });
+    const setup = await setupResponse.json() as { complete: boolean };
+    await mainWindow?.loadURL(`${SERVER_ORIGIN}/${setup.complete ? "login" : "setup"}`);
+    return { ready: true as const, backup: backup.filename };
+  } catch (error) {
+    return { ready: false as const, error: error instanceof Error ? error.message : "Upgrade failed; local data was preserved." };
   }
 });
 
