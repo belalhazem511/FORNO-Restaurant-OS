@@ -191,7 +191,7 @@ describe("offline documents and PWA policy", () => {
   });
 
   it("POS and Sync Center expose immediate offline receipt actions with popup-blocked recovery", async () => {
-    const pos = await Bun.file(`${process.cwd()}/src/app/admin/pos/page.tsx`).text();
+    const pos = await Bun.file(`${process.cwd()}/src/features/pos/pos-screen.tsx`).text();
     const sync = await Bun.file(`${process.cwd()}/src/app/admin/sync/page.tsx`).text();
     const action = await Bun.file(`${process.cwd()}/src/components/offline/offline-receipt-action.tsx`).text();
     expect(pos).toContain("Print Offline Cash Receipt");
@@ -201,12 +201,13 @@ describe("offline documents and PWA policy", () => {
   });
 
   it("POS source explicitly blocks unsupported offline actions and final receipts", async () => {
-    const source = await Bun.file(`${process.cwd()}/src/app/admin/pos/page.tsx`).text();
+    const source = await Bun.file(`${process.cwd()}/src/features/pos/pos-screen.tsx`).text();
+    const offlineDialogs = await Bun.file(`${process.cwd()}/src/features/pos/offline-dialogs.tsx`).text();
     for (const blocked of ["Card", "InstaPay", "split", "discounts", "cancellation", "refund", "shift changes", "reprints"]) expect(source).toContain(blocked);
     expect(source).toContain("not a final receipt");
-    expect(source).toContain("cash_sale");
+    expect(offlineDialogs).toContain("cash_sale");
     expect(source).toContain("OfflineKotDialog");
-    expect(source).toContain("NO PRICES — KITCHEN USE ONLY");
+    expect(offlineDialogs).toContain("NO PRICES — KITCHEN USE ONLY");
   });
 
   it("recovers a unique cached user identity for a full offline reload", async () => {
