@@ -39,31 +39,6 @@ export const staffAssignments = pgTable(
   ],
 );
 
-export const suppliers = pgTable(
-  "suppliers",
-  {
-    id: serial("id").primaryKey(),
-    branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
-    code: varchar("code", { length: 40 }).notNull(),
-    name_en: varchar("name_en", { length: 160 }).notNull(),
-    name_ar: varchar("name_ar", { length: 160 }).notNull(),
-    contact_name: varchar("contact_name", { length: 120 }),
-    phone: varchar("phone", { length: 32 }),
-    email: varchar("email", { length: 160 }),
-    address: text("address"),
-    notes: text("notes"),
-    is_active: boolean("is_active").default(true).notNull(),
-    created_by: text("created_by").notNull().references(() => user.id, { onDelete: "restrict" }),
-    updated_by: text("updated_by").notNull().references(() => user.id, { onDelete: "restrict" }),
-    created_at: timestamp("created_at").defaultNow().notNull(),
-    updated_at: timestamp("updated_at").defaultNow().notNull(),
-  },
-  (table) => [
-    uniqueIndex("suppliers_branch_code_uidx").on(table.branch_id, table.code),
-    index("suppliers_branch_active_idx").on(table.branch_id, table.is_active),
-  ],
-);
-
 export const diningAreas = pgTable(
   "dining_areas",
   {
@@ -135,6 +110,7 @@ export const menuCategories = pgTable(
 );
 
 // Kept as a backwards-compatible inventory/POS view of saleable menu items.
+
 export const products = pgTable(
   "products",
   {

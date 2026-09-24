@@ -1,0 +1,265 @@
+import {
+  bigint,
+  boolean,
+  check,
+  index,
+  integer,
+  pgTable,
+  serial,
+  text,
+  timestamp,
+  uniqueIndex,
+  varchar,
+} from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import type {
+  StockTransferStatus,
+  StockCountStatus,
+} from "./constants";
+import { branches } from "./restaurant";
+import {
+  inventoryLocations,
+  ingredients,
+  ingredientPackageConversions,
+  unitsOfMeasure,
+} from "./inventory";
+import { user } from "../auth-schema";
+
+export const stockTransfers = pgTable("stock_transfers", {
+  id: serial("id").primaryKey(),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  transfer_number: varchar("transfer_number", { length: 48 }).notNull(),
+  source_location_id: integer("source_location_id").notNull().references(() => inventoryLocations.id, { onDelete: "restrict" }),
+  destination_location_id: integer("destination_location_id").notNull().references(() => inventoryLocations.id, { onDelete: "restrict" }),
+  source_code_snapshot: varchar("source_code_snapshot", { length: 32 }).notNull(),
+  source_name_en_snapshot: varchar("source_name_en_snapshot", { length: 100 }).notNull(),
+  source_name_ar_snapshot: varchar("source_name_ar_snapshot", { length: 100 }).notNull(),
+  destination_code_snapshot: varchar("destination_code_snapshot", { length: 32 }).notNull(),
+  destination_name_en_snapshot: varchar("destination_name_en_snapshot", { length: 100 }).notNull(),
+  destination_name_ar_snapshot: varchar("destination_name_ar_snapshot", { length: 100 }).notNull(),
+  status: varchar("status", { length: 24 }).$type<StockTransferStatus>().default("draft").notNull(),
+  notes: text("notes"),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_by: text("created_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+  submitted_by: text("submitted_by").references(() => user.id, { onDelete: "restrict" }),
+  approved_by: text("approved_by").references(() => user.id, { onDelete: "restrict" }),
+  cancelled_by: text("cancelled_by").references(() => user.id, { onDelete: "restrict" }),
+  dispatched_by: text("dispatched_by").references(() => user.id, { onDelete: "restrict" }),
+  dispatched_at: timestamp("dispatched_at"),
+  received_at: timestamp("received_at"),
+  cancellation_reason: text("cancellation_reason"),
+  needs_review_reason: text("needs_review_reason"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+  updated_at: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("stock_transfers_branch_number_uidx").on(table.branch_id, table.transfer_number),
+  uniqueIndex("stock_transfers_idempotency_uidx").on(table.idempotency_key),
+  index("stock_transfers_branch_status_idx").on(table.branch_id, table.status),
+  check("stock_transfers_locations_check", sql`${table.source_location_id} <> ${table.destination_location_id}`),
+  check("stock_transfers_status_check", sql`${table.status} in ('draft', 'submitted', 'approved', 'dispatched', 'partially_received', 'received', 'cancelled', 'needs_review', 'reversed')`),
+]);
+
+export const stockTransferLines = pgTable("stock_transfer_lines", {
+  id: serial("id").primaryKey(),
+  transfer_id: integer("transfer_id").notNull().references(() => stockTransfers.id, { onDelete: "restrict" }),
+  ingredient_id: integer("ingredient_id").notNull().references(() => ingredients.id, { onDelete: "restrict" }),
+  ingredient_sku_snapshot: varchar("ingredient_sku_snapshot", { length: 40 }).notNull(),
+  ingredient_name_en_snapshot: varchar("ingredient_name_en_snapshot", { length: 160 }).notNull(),
+  ingredient_name_ar_snapshot: varchar("ingredient_name_ar_snapshot", { length: 160 }).notNull(),
+  dimension_snapshot: varchar("dimension_snapshot", { length: 16 }).notNull(),
+  unit_id: integer("unit_id").notNull().references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+  unit_code_snapshot: varchar("unit_code_snapshot", { length: 24 }).notNull(),
+  package_conversion_id: integer("package_conversion_id").references(() => ingredientPackageConversions.id, { onDelete: "restrict" }),
+  package_code_snapshot: varchar("package_code_snapshot", { length: 24 }),
+  package_name_en_snapshot: varchar("package_name_en_snapshot", { length: 60 }),
+  package_name_ar_snapshot: varchar("package_name_ar_snapshot", { length: 60 }),
+  conversion_numerator_snapshot: bigint("conversion_numerator_snapshot", { mode: "number" }).notNull(),
+  conversion_denominator_snapshot: bigint("conversion_denominator_snapshot", { mode: "number" }).notNull(),
+  quantity_input_scaled: bigint("quantity_input_scaled", { mode: "number" }).notNull(),
+  quantity_base: bigint("quantity_base", { mode: "number" }).notNull(),
+  notes: text("notes"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("stock_transfer_lines_transfer_ingredient_uidx").on(table.transfer_id, table.ingredient_id),
+  check("stock_transfer_lines_conversion_check", sql`${table.conversion_numerator_snapshot} > 0 and ${table.conversion_denominator_snapshot} > 0`),
+  check("stock_transfer_lines_quantity_check", sql`${table.quantity_input_scaled} > 0 and ${table.quantity_base} > 0`),
+  check("stock_transfer_lines_dimension_check", sql`${table.dimension_snapshot} in ('mass', 'volume', 'count')`),
+]);
+
+export const stockTransferDispatches = pgTable("stock_transfer_dispatches", {
+  id: serial("id").primaryKey(),
+  transfer_id: integer("transfer_id").notNull().references(() => stockTransfers.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  reason: text("reason"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_transfer_dispatches_transfer_uidx").on(table.transfer_id), uniqueIndex("stock_transfer_dispatches_idempotency_uidx").on(table.idempotency_key)]);
+
+export const stockTransferDispatchLines = pgTable("stock_transfer_dispatch_lines", {
+  id: serial("id").primaryKey(),
+  dispatch_id: integer("dispatch_id").notNull().references(() => stockTransferDispatches.id, { onDelete: "restrict" }),
+  transfer_line_id: integer("transfer_line_id").notNull().references(() => stockTransferLines.id, { onDelete: "restrict" }),
+  quantity_base: bigint("quantity_base", { mode: "number" }).notNull(),
+  unit_cost_micros_snapshot: bigint("unit_cost_micros_snapshot", { mode: "number" }).notNull(),
+  total_cost_amount: integer("total_cost_amount").notNull(),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_transfer_dispatch_lines_transfer_line_uidx").on(table.transfer_line_id), check("stock_transfer_dispatch_lines_values_check", sql`${table.quantity_base} > 0 and ${table.unit_cost_micros_snapshot} >= 0 and ${table.total_cost_amount} >= 0`)]);
+
+export const stockTransferReceipts = pgTable("stock_transfer_receipts", {
+  id: serial("id").primaryKey(),
+  transfer_id: integer("transfer_id").notNull().references(() => stockTransfers.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  reason: text("reason"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_transfer_receipts_idempotency_uidx").on(table.idempotency_key), index("stock_transfer_receipts_transfer_idx").on(table.transfer_id, table.created_at)]);
+
+export const stockTransferReceiptLines = pgTable("stock_transfer_receipt_lines", {
+  id: serial("id").primaryKey(),
+  receipt_id: integer("receipt_id").notNull().references(() => stockTransferReceipts.id, { onDelete: "restrict" }),
+  transfer_line_id: integer("transfer_line_id").notNull().references(() => stockTransferLines.id, { onDelete: "restrict" }),
+  quantity_base: bigint("quantity_base", { mode: "number" }).notNull(),
+  unit_cost_micros_snapshot: bigint("unit_cost_micros_snapshot", { mode: "number" }).notNull(),
+  total_cost_amount: integer("total_cost_amount").notNull(),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [check("stock_transfer_receipt_lines_values_check", sql`${table.quantity_base} > 0 and ${table.unit_cost_micros_snapshot} >= 0 and ${table.total_cost_amount} >= 0`)]);
+
+export const stockTransferReversals = pgTable("stock_transfer_reversals", {
+  id: serial("id").primaryKey(),
+  transfer_id: integer("transfer_id").notNull().references(() => stockTransfers.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  status: varchar("status", { length: 16 }).notNull(),
+  reason: text("reason").notNull(),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_transfer_reversals_transfer_uidx").on(table.transfer_id), uniqueIndex("stock_transfer_reversals_idempotency_uidx").on(table.idempotency_key), check("stock_transfer_reversals_status_check", sql`${table.status} in ('reversed', 'needs_review')`)]);
+
+export const stockTransferStatusHistory = pgTable("stock_transfer_status_history", {
+  id: serial("id").primaryKey(),
+  transfer_id: integer("transfer_id").notNull().references(() => stockTransfers.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  from_status: varchar("from_status", { length: 24 }),
+  to_status: varchar("to_status", { length: 24 }).$type<StockTransferStatus>().notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  reason: text("reason"),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_transfer_status_history_idempotency_uidx").on(table.idempotency_key), index("stock_transfer_status_history_transfer_idx").on(table.transfer_id, table.created_at)]);
+
+export const stockCounts = pgTable("stock_counts", {
+  id: serial("id").primaryKey(),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  location_id: integer("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "restrict" }),
+  count_number: varchar("count_number", { length: 48 }).notNull(),
+  status: varchar("status", { length: 20 }).$type<StockCountStatus>().default("draft").notNull(),
+  notes: text("notes"),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_by: text("created_by").notNull().references(() => user.id, { onDelete: "restrict" }),
+  started_by: text("started_by").references(() => user.id, { onDelete: "restrict" }),
+  started_at: timestamp("started_at"),
+  submitted_by: text("submitted_by").references(() => user.id, { onDelete: "restrict" }),
+  submitted_at: timestamp("submitted_at"),
+  approved_by: text("approved_by").references(() => user.id, { onDelete: "restrict" }),
+  approved_at: timestamp("approved_at"),
+  posted_by: text("posted_by").references(() => user.id, { onDelete: "restrict" }),
+  posted_at: timestamp("posted_at"),
+  posting_watermark: integer("posting_watermark"),
+  cancelled_by: text("cancelled_by").references(() => user.id, { onDelete: "restrict" }),
+  cancellation_reason: text("cancellation_reason"),
+  needs_review_reason: text("needs_review_reason"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+  updated_at: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("stock_counts_branch_number_uidx").on(table.branch_id, table.count_number),
+  uniqueIndex("stock_counts_idempotency_uidx").on(table.idempotency_key),
+  uniqueIndex("stock_counts_active_location_uidx").on(table.branch_id, table.location_id).where(sql`${table.status} in ('draft', 'counting', 'submitted', 'approved', 'needs_review')`),
+  index("stock_counts_branch_status_idx").on(table.branch_id, table.status),
+  check("stock_counts_status_check", sql`${table.status} in ('draft', 'counting', 'submitted', 'approved', 'posted', 'cancelled', 'needs_review', 'reversed')`),
+]);
+
+export const stockCountLines = pgTable("stock_count_lines", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  location_id: integer("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "restrict" }),
+  ingredient_id: integer("ingredient_id").notNull().references(() => ingredients.id, { onDelete: "restrict" }),
+  ingredient_sku_snapshot: varchar("ingredient_sku_snapshot", { length: 40 }).notNull(),
+  ingredient_name_en_snapshot: varchar("ingredient_name_en_snapshot", { length: 160 }).notNull(),
+  ingredient_name_ar_snapshot: varchar("ingredient_name_ar_snapshot", { length: 160 }).notNull(),
+  dimension_snapshot: varchar("dimension_snapshot", { length: 16 }).notNull(),
+  base_unit_id: integer("base_unit_id").notNull().references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+  base_unit_code_snapshot: varchar("base_unit_code_snapshot", { length: 24 }).notNull(),
+  expected_quantity_base: bigint("expected_quantity_base", { mode: "number" }).notNull(),
+  expected_unit_cost_micros: bigint("expected_unit_cost_micros", { mode: "number" }).notNull(),
+  movement_watermark: integer("movement_watermark").notNull(),
+  counted_input_scaled: bigint("counted_input_scaled", { mode: "number" }),
+  counted_unit_id: integer("counted_unit_id").references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+  counted_unit_code_snapshot: varchar("counted_unit_code_snapshot", { length: 24 }),
+  package_conversion_id: integer("package_conversion_id").references(() => ingredientPackageConversions.id, { onDelete: "restrict" }),
+  package_code_snapshot: varchar("package_code_snapshot", { length: 24 }),
+  package_name_en_snapshot: varchar("package_name_en_snapshot", { length: 60 }),
+  package_name_ar_snapshot: varchar("package_name_ar_snapshot", { length: 60 }),
+  conversion_numerator_snapshot: bigint("conversion_numerator_snapshot", { mode: "number" }).notNull(),
+  conversion_denominator_snapshot: bigint("conversion_denominator_snapshot", { mode: "number" }).notNull(),
+  counted_quantity_base: bigint("counted_quantity_base", { mode: "number" }),
+  zero_confirmed: boolean("zero_confirmed").default(false).notNull(),
+  variance_base: bigint("variance_base", { mode: "number" }),
+  valuation_unit_cost_micros: bigint("valuation_unit_cost_micros", { mode: "number" }),
+  valuation_amount: integer("valuation_amount"),
+  posted_balance_quantity: bigint("posted_balance_quantity", { mode: "number" }),
+  notes: text("notes"),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+  updated_at: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("stock_count_lines_count_ingredient_uidx").on(table.count_id, table.ingredient_id),
+  index("stock_count_lines_branch_location_idx").on(table.branch_id, table.location_id),
+  check("stock_count_lines_expected_check", sql`${table.expected_quantity_base} >= 0 and ${table.expected_unit_cost_micros} >= 0`),
+  check("stock_count_lines_conversion_check", sql`${table.conversion_numerator_snapshot} > 0 and ${table.conversion_denominator_snapshot} > 0`),
+  check("stock_count_lines_counted_check", sql`${table.counted_quantity_base} is null or ${table.counted_quantity_base} >= 0`),
+  check("stock_count_lines_dimension_check", sql`${table.dimension_snapshot} in ('mass', 'volume', 'count')`),
+]);
+
+export const stockCountEntries = pgTable("stock_count_entries", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  line_id: integer("line_id").notNull().references(() => stockCountLines.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  quantity_input_scaled: bigint("quantity_input_scaled", { mode: "number" }).notNull(),
+  quantity_base: bigint("quantity_base", { mode: "number" }).notNull(),
+  unit_id: integer("unit_id").notNull().references(() => unitsOfMeasure.id, { onDelete: "restrict" }),
+  unit_code_snapshot: varchar("unit_code_snapshot", { length: 24 }).notNull(),
+  package_conversion_id: integer("package_conversion_id").references(() => ingredientPackageConversions.id, { onDelete: "restrict" }),
+  package_code_snapshot: varchar("package_code_snapshot", { length: 24 }),
+  conversion_numerator_snapshot: bigint("conversion_numerator_snapshot", { mode: "number" }).notNull(),
+  conversion_denominator_snapshot: bigint("conversion_denominator_snapshot", { mode: "number" }).notNull(),
+  zero_confirmed: boolean("zero_confirmed").notNull(),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_count_entries_idempotency_uidx").on(table.idempotency_key), index("stock_count_entries_line_idx").on(table.count_id, table.line_id, table.created_at), check("stock_count_entries_values_check", sql`${table.quantity_input_scaled} >= 0 and ${table.quantity_base} >= 0 and ${table.conversion_numerator_snapshot} > 0 and ${table.conversion_denominator_snapshot} > 0`)]);
+
+export const stockCountReversals = pgTable("stock_count_reversals", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  status: varchar("status", { length: 16 }).notNull(),
+  reason: text("reason").notNull(),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_count_reversals_count_uidx").on(table.count_id), uniqueIndex("stock_count_reversals_idempotency_uidx").on(table.idempotency_key), check("stock_count_reversals_status_check", sql`${table.status} in ('reversed', 'needs_review')`), check("stock_count_reversals_reason_check", sql`length(trim(${table.reason})) >= 3`)]);
+
+export const stockCountStatusHistory = pgTable("stock_count_status_history", {
+  id: serial("id").primaryKey(),
+  count_id: integer("count_id").notNull().references(() => stockCounts.id, { onDelete: "restrict" }),
+  branch_id: integer("branch_id").notNull().references(() => branches.id, { onDelete: "restrict" }),
+  from_status: varchar("from_status", { length: 20 }),
+  to_status: varchar("to_status", { length: 20 }).$type<StockCountStatus>().notNull(),
+  actor_user_id: text("actor_user_id").notNull().references(() => user.id, { onDelete: "restrict" }),
+  reason: text("reason"),
+  idempotency_key: varchar("idempotency_key", { length: 140 }).notNull(),
+  created_at: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [uniqueIndex("stock_count_status_history_idempotency_uidx").on(table.idempotency_key), index("stock_count_status_history_count_idx").on(table.count_id, table.created_at)]);
