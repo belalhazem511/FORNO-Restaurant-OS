@@ -64,6 +64,7 @@ export type MenuAvailabilityConfiguration = {
   variantId: number | null;
   modifierOptionIds?: number[];
   quantity?: number;
+  alternative?: boolean;
 };
 
 type MenuAvailabilityStatus = "available" | "low_stock" | "unavailable" | "recipe_missing" | "manually_disabled" | "out_of_stock";
@@ -99,7 +100,7 @@ export async function menuAvailability(
   const unitById = new Map(units.map((row) => [row.id, row]));
   const componentsByRecipe = new Map<number, typeof components>();
   for (const component of components) componentsByRecipe.set(component.recipe_version_id, [...(componentsByRecipe.get(component.recipe_version_id) ?? []), component]);
-  const configurationKey = (config: MenuAvailabilityConfiguration) => `${config.menuItemId}:${config.variantId ?? "base"}:${[...new Set(config.modifierOptionIds ?? [])].sort((a, b) => a - b).join(",")}`;
+  const configurationKey = (config: MenuAvailabilityConfiguration) => `${config.menuItemId}:${config.variantId ?? "base"}:${[...new Set(config.modifierOptionIds ?? [])].sort((a, b) => a - b).join(",")}:${config.alternative ? "alternative" : "required"}`;
   const requestedConfigurations = new Map<string, MenuAvailabilityConfiguration>();
   for (const config of options.configurations ?? []) {
     if (!menuIds.includes(config.menuItemId)) continue;
@@ -126,6 +127,7 @@ export async function menuAvailability(
   }> = [];
   const requestedResults: Array<{
     row: (typeof output)[number];
+    alternative: boolean;
     requirements: Map<string, { required: number; perItem: number; perItemBase: number; yieldLossBps: number; available: number; ingredient: typeof ingredientRows[number]; location: typeof locations[number] }>;
   }> = [];
   for (const { config, requested } of configurations) {
@@ -208,18 +210,18 @@ export async function menuAvailability(
       theoreticalCost,
     };
     output.push(row);
-    if (requested) requestedResults.push({ row, requirements });
+    if (requested) requestedResults.push({ row, alternative: config.alternative === true, requirements });
   }
   const totalRequirements = new Map<string, number>();
-  for (const result of requestedResults) for (const [key, requirement] of result.requirements) {
+  for (const result of requestedResults.filter((entry) => !entry.alternative)) for (const [key, requirement] of result.requirements) {
     const total = (totalRequirements.get(key) ?? 0) + requirement.required;
     if (!Number.isSafeInteger(total)) throw new InventoryConflict("invalid_recipe", "Combined cart quantity exceeds exact integer range");
     totalRequirements.set(key, total);
   }
   for (const result of requestedResults) for (const [key, requirement] of result.requirements) {
     const totalRequired = totalRequirements.get(key) ?? 0;
-    if (totalRequired <= requirement.available) continue;
-    const reservedForOthers = totalRequired - requirement.required;
+    const combinedRequired = result.alternative ? totalRequired + requirement.required : totalRequired;
+    const reservedForOthers = result.alternative ? totalRequired : totalRequired - requirement.required;
     const availableForConfiguration = Math.max(0, requirement.available - reservedForOthers);
     const fits = (count: number) => applyYieldLoss(multiplyDivide(requirement.perItemBase, count, 1), requirement.yieldLossBps) <= availableForConfiguration;
     let maximum = Math.floor(availableForConfiguration / requirement.perItem);
@@ -228,15 +230,16 @@ export async function menuAvailability(
     result.row.maxProducibleQuantity = Math.min(result.row.maxProducibleQuantity, maximum);
     result.row.maxProducible = result.row.maxProducibleQuantity;
     if (result.row.requestedQuantity > result.row.maxProducibleQuantity) result.row.status = "unavailable";
+    if (combinedRequired <= requirement.available) continue;
     const unit = unitById.get(requirement.ingredient.base_unit_id);
     result.row.blockingIngredients = result.row.blockingIngredients.filter((entry) => entry.ingredientId !== requirement.ingredient.id);
     result.row.blockingIngredients.push({
       ingredientId: requirement.ingredient.id,
       nameEn: requirement.ingredient.name_en,
       nameAr: requirement.ingredient.name_ar,
-      requiredQuantity: totalRequired,
+      requiredQuantity: combinedRequired,
       availableQuantity: requirement.available,
-      shortageQuantity: totalRequired - requirement.available,
+      shortageQuantity: combinedRequired - requirement.available,
       ...(options.includeInventoryDetails ? { unit: unit?.code ?? null, sourceLocationEn: requirement.location.name_en, sourceLocationAr: requirement.location.name_ar } : {}),
     });
   }

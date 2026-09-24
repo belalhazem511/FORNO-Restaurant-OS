@@ -243,5 +243,15 @@ describe("inventory ledger, recipes, and order consumption", () => {
     expect(firstDemand?.status).toBe("unavailable");
     expect(secondDemand?.status).toBe("unavailable");
     expect(firstDemand?.blockingIngredients.find((entry) => entry.ingredientId === ingredientId)?.requiredQuantity).toBe(211_111_111);
+    const alternatives = await db.transaction((tx) => menuAvailability(tx, branchId, { configurations: [
+      { menuItemId, variantId: null, alternative: true },
+      { menuItemId: secondItem.id, variantId: null, alternative: true },
+    ] }));
+    const firstAlternative = alternatives.filter((row) => row.menuItemId === menuItemId).at(-1)!;
+    const secondAlternative = alternatives.filter((row) => row.menuItemId === secondItem.id).at(-1)!;
+    expect(firstAlternative.status).not.toBe("unavailable");
+    expect(secondAlternative.status).not.toBe("unavailable");
+    expect(firstAlternative.maxProducibleQuantity).toBe(1);
+    expect(secondAlternative.maxProducibleQuantity).toBe(1);
   });
 });

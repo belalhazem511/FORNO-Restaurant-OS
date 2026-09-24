@@ -128,9 +128,9 @@ export function PosScreen() {
   const [configurationError, setConfigurationError] = useState<string | null>(null);
 
   const configurations = useMemo(() => {
-    const requested = cart.filter((line) => line.key !== editingKey).map((line) => ({ menuItemId: line.menuItemId, variantId: line.variantId, modifierOptionIds: line.modifiers.map((modifier) => modifier.id), quantity: line.quantity }));
+    const requested: Array<{ menuItemId: number; variantId: number | null; modifierOptionIds: number[]; quantity: number; alternative?: boolean }> = cart.filter((line) => line.key !== editingKey).map((line) => ({ menuItemId: line.menuItemId, variantId: line.variantId, modifierOptionIds: line.modifiers.map((modifier) => modifier.id), quantity: line.quantity }));
     if (configuringItem) {
-      requested.push({ menuItemId: configuringItem.id, variantId, modifierOptionIds: [...modifierIds], quantity: itemQuantity });
+      requested.push({ menuItemId: configuringItem.id, variantId, modifierOptionIds: [...modifierIds], quantity: itemQuantity, alternative: true });
       for (const link of configuringItem.modifierGroups) for (const option of link.modifierGroup.options.filter((entry) => entry.is_available)) {
         const selected = modifierIds.includes(option.id);
         const candidateIds = selected
@@ -138,7 +138,7 @@ export function PosScreen() {
           : link.modifierGroup.max_selections === 1
             ? [...modifierIds.filter((id) => !link.modifierGroup.options.some((entry) => entry.id === id)), option.id]
             : [...modifierIds, option.id];
-        requested.push({ menuItemId: configuringItem.id, variantId, modifierOptionIds: candidateIds, quantity: itemQuantity });
+        requested.push({ menuItemId: configuringItem.id, variantId, modifierOptionIds: candidateIds, quantity: itemQuantity, alternative: true });
       }
     }
     return requested;
