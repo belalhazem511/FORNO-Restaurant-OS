@@ -133,15 +133,20 @@ async function synchronizeDevice() {
           });
           if (!mediaUpload.ok) throw new Error("Central product media upload failed.");
         }
-        await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { method: "POST", headers: { ...localHeaders, "content-type": "application/json" }, body: JSON.stringify({ results: response.results ?? [] }), signal: AbortSignal.timeout(10_000) });
+        const acknowledged = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { method: "POST", headers: { ...localHeaders, "content-type": "application/json" }, body: JSON.stringify({ results: response.results ?? [] }), signal: AbortSignal.timeout(10_000) });
+        if (!acknowledged.ok) throw new Error("Local command acknowledgements could not be saved.");
       } else throw new Error("Central command upload failed.");
     }
-    const pull = await fetch(`${centralUrl}/api/sync/commands?cursor=${encodeURIComponent(queue.cursor)}`, {
-      headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId },
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (pull.ok) {
-      const page = await pull.json() as { changes: unknown[]; nextCursor: number };
+    let cursor = queue.cursor;
+    let hasMore = true;
+    while (hasMore) {
+      const pull = await fetch(`${centralUrl}/api/sync/commands?cursor=${encodeURIComponent(cursor)}`, {
+        headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId },
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!pull.ok) throw new Error("Central change download failed.");
+      const page = await pull.json() as { changes: unknown[]; nextCursor: number; hasMore: boolean };
+      if (!page.changes.length && page.hasMore) throw new Error("Central change pagination did not advance.");
       for (const raw of page.changes as Array<{ domain?: string; entityType?: string; snapshot?: { imageKey?: unknown } | null }>) {
         const key = raw.domain === "products" && raw.entityType === "product" && typeof raw.snapshot?.imageKey === "string" ? raw.snapshot.imageKey : null;
         if (!key) continue;
@@ -164,7 +169,10 @@ async function synchronizeDevice() {
       }
       const applied = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/apply`, { method: "POST", headers: { ...localHeaders, "content-type": "application/json" }, body: JSON.stringify(page), signal: AbortSignal.timeout(30_000) });
       if (!applied.ok) throw new Error("Pulled changes could not be applied locally.");
-    } else throw new Error("Central change download failed.");
+      if (page.nextCursor < cursor || (page.hasMore && page.nextCursor === cursor)) throw new Error("Central change cursor did not advance.");
+      cursor = page.nextCursor;
+      hasMore = page.hasMore;
+    }
     const latest = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { headers: localHeaders, signal: AbortSignal.timeout(10_000) });
     if (!latest.ok) throw new Error("Local synchronization state could not be read.");
     const finalQueue = await latest.json() as { paired: boolean; pendingCount: number; needsReviewCount: number; rejectedCount: number };
