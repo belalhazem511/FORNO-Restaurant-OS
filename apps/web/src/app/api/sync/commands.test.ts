@@ -285,6 +285,7 @@ describe("paired customer command processing", () => {
     expect((await db.select().from(syncConflicts).where(eq(syncConflicts.entity_global_id, overlapping.payload.shiftGlobalId))).length).toBe(1);
     const staleClose = makeShiftCloseCommand({ operationId: "baf18b5f-63b9-4023-bc28-91018a73a2ce", idempotencyKey: "af7d25e7-3f37-4bd9-875a-1f12e1227e15", shiftGlobalId, expectedCash: 3500, dependency: cashMovement.operationId });
     expect((await (await postCommands([staleClose])).json()).results[0].status).toBe("needs_review");
+    expect((await (await postCommands([staleClose])).json()).results[0].status).toBe("needs_review");
     expect((await db.select().from(cashierShifts).where(eq(cashierShifts.status, "open"))).length).toBe(1);
     const close = makeShiftCloseCommand({ operationId: "a4153b68-5f30-4126-b04f-69a57c012cab", idempotencyKey: "2f23bb93-0e17-4334-88d2-679bb3c81c10", shiftGlobalId, expectedCash: 4000, dependency: cashMovement.operationId });
     expect((await (await postCommands([close])).json()).results[0].status).toBe("accepted");

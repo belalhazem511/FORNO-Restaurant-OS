@@ -149,7 +149,8 @@ export async function POST(request: NextRequest) {
             if (owner) await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: owner.local_id, action: "sync.command.identity_mismatch", entity_type: "sync_device", entity_id: device.id, details: JSON.stringify({ operationId: command.operationId }) });
             return { operationId: command.operationId, status: "rejected", error: "Operation or idempotency key was reused with different content." };
           }
-          return { operationId: command.operationId, status: "already_applied", result: existingKey.result ?? undefined };
+          const status = existingKey.state === "needs_review" ? "needs_review" : existingKey.state === "rejected" ? "rejected" : "already_applied";
+          return { operationId: command.operationId, status, result: existingKey.result ?? undefined };
         }
         const [branchMapping] = await tx.select().from(syncGlobalEntities).where(and(
           eq(syncGlobalEntities.organization_id, device.organization_id),
