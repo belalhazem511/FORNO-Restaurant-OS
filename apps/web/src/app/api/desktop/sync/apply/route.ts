@@ -3,12 +3,13 @@ import { and, eq, or } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
-import { auditLogs, cashierShifts, customers, products, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox } from "@/lib/db/schema";
+import { auditLogs, cashierShifts, customers, paymentMethods, products, shiftCashMovements, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox, transactions } from "@/lib/db/schema";
 
 export const runtime = "nodejs";
 const customerSnapshot = z.object({ name: z.string(), email: z.string().email(), phone: z.string().nullable(), status: z.string().nullable() });
 const productSnapshot = z.object({ name: z.string(), description: z.string().nullable(), price: z.number().int().nonnegative(), in_stock: z.number().int().nonnegative(), category: z.string().nullable(), imageKey: z.string().max(200).nullable() });
 const shiftSnapshot = z.object({ registerGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() });
+const cashMovementSnapshot = z.object({ shiftGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), type: z.enum(["cash_in", "cash_out"]), amount: z.number().int().positive(), reason: z.string().min(3).max(500), createdAt: z.string().datetime() });
 const changeSchema = z.object({ cursor: z.number().int().positive(), domain: z.string(), entityType: z.string(), entityGlobalId: z.string().uuid(), action: z.string(), revision: z.number().int().positive(), snapshot: z.unknown().nullable() });
 
 function authorized(request: NextRequest) {
@@ -38,17 +39,18 @@ export async function POST(request: NextRequest) {
         const isCustomer = change.domain === "customers" && change.entityType === "customer";
         const isProduct = change.domain === "products" && change.entityType === "product";
         const isShift = change.domain === "shifts" && change.entityType === "cashier_shift";
-        if (!isCustomer && !isProduct && !isShift) continue;
+        const isCashMovement = change.domain === "shifts" && change.entityType === "cash_movement";
+        if (!isCustomer && !isProduct && !isShift && !isCashMovement) continue;
         const isDelete = change.action === "delete" && change.snapshot === null;
         if (!isDelete && !change.snapshot) continue;
-        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : shiftSnapshot.safeParse(change.snapshot);
+        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : cashMovementSnapshot.safeParse(change.snapshot);
         if (parsedSnapshot && !parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
         const snapshot = parsedSnapshot?.success ? parsedSnapshot.data : null;
         const entityType = change.entityType;
         const mapping = await tx.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, entityType), eq(syncEntityMappings.global_id, change.entityGlobalId)) });
         if (mapping) {
           const queuedCommands = await tx.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.state, "pending")));
-          const globalKey = isShift ? "shiftGlobalId" : `${entityType}GlobalId`;
+          const globalKey = isShift ? "shiftGlobalId" : isCashMovement ? "cashMovementGlobalId" : `${entityType}GlobalId`;
           const queued = queuedCommands.find((item) => item.domain === change.domain && item.payload[globalKey] === change.entityGlobalId);
           if (queued) {
             const operationId = randomUUID();
@@ -62,7 +64,7 @@ export async function POST(request: NextRequest) {
             if (actor) await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: `sync.${entityType}.needs_review`, entity_type: entityType, entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
             continue;
           }
-          if (isShift) {
+          if (isShift || isCashMovement) {
             await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
             continue;
           }
@@ -95,6 +97,20 @@ export async function POST(request: NextRequest) {
             await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "cashier_shift", global_id: change.entityGlobalId, local_id: localId, local_revision: 1, server_revision: change.revision });
             await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "cashier_shift", global_id: change.entityGlobalId, local_id: localId, server_revision: change.revision });
             await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: created!.id, actor_user_id: actor.local_id, action: "sync.cashier_shift.imported", entity_type: "cashier_shift", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
+            continue;
+          }
+          if (isCashMovement) {
+            const movement = snapshot as z.infer<typeof cashMovementSnapshot>;
+            const [shiftMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "cashier_shift"), eq(syncEntityMappings.global_id, movement.shiftGlobalId))).limit(1);
+            const [actor] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, movement.actorGlobalId))).limit(1);
+            const cashMethod = await tx.query.paymentMethods.findFirst({ where: and(eq(paymentMethods.code, "CASH"), eq(paymentMethods.is_active, true)) });
+            if (!shiftMapping || !actor || !cashMethod) throw new Error("Pulled cash adjustment references an unmapped shift, actor, or CASH method.");
+            const [created] = await tx.insert(shiftCashMovements).values({ shift_id: Number(shiftMapping.local_id), type: movement.type, amount: movement.amount, reason: movement.reason, created_by: actor.local_id, created_at: new Date(movement.createdAt) }).returning();
+            await tx.insert(transactions).values({ shift_id: Number(shiftMapping.local_id), payment_method_id: cashMethod.id, amount: movement.amount, user_uid: actor.local_id, type: movement.type === "cash_in" ? "income" : "expense", category: movement.type, status: "completed", description: movement.reason });
+            const localId = String(created!.id);
+            await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "cash_movement", global_id: change.entityGlobalId, local_id: localId, local_revision: 1, server_revision: change.revision });
+            await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "cash_movement", global_id: change.entityGlobalId, local_id: localId, server_revision: change.revision });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: Number(shiftMapping.local_id), actor_user_id: actor.local_id, action: `sync.shift.${movement.type}`, entity_type: "cash_movement", entity_id: change.entityGlobalId, reason: movement.reason, details: JSON.stringify({ cursor: change.cursor, amount: movement.amount }) });
             continue;
           }
           const [owner] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"))).limit(1);

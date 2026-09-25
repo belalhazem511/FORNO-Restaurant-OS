@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { NextRequest } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, SCHEMA_DDL } from "@/lib/trpc/routers/__tests__/helpers";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, products, staffAssignments, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, paymentMethods, products, shiftCashMovements, staffAssignments, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, user } from "@/lib/db/schema";
 import { productImagePath } from "@/lib/media/product-images";
 
 const { pg, db } = createTestDb();
@@ -73,6 +73,11 @@ function makeProductCommand(input: { operationId: string; idempotencyKey: string
 function makeShiftCommand(input: { operationId: string; idempotencyKey: string; shiftGlobalId: string }) {
   const payload = { shiftGlobalId: input.shiftGlobalId, registerGlobalId, openingFloat: 3500, openedAt: new Date().toISOString() };
   return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "shifts", action: "open", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+}
+
+function makeCashMovementCommand(input: { operationId: string; idempotencyKey: string; movementGlobalId: string; shiftGlobalId: string; dependency: string }) {
+  const payload = { cashMovementGlobalId: input.movementGlobalId, shiftGlobalId: input.shiftGlobalId, type: "cash_in", amount: 500, reason: "Drawer top up", createdAt: new Date().toISOString() };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "shifts", action: "drawer_adjust", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: [input.dependency], deviceTimestamp: new Date().toISOString() };
 }
 
 async function postCommands(commands: unknown[]) {
@@ -248,6 +253,7 @@ describe("paired customer command processing", () => {
   });
 
   it("applies a shift-open command once and preserves register-overlap conflicts", async () => {
+    await db.insert(paymentMethods).values({ code: "CASH", name: "Cash", affects_drawer: true, is_active: true });
     const shiftGlobalId = "aa988aab-2770-4e50-b098-ccab0ace21b1";
     const command = makeShiftCommand({ operationId: "a3d24ee8-2975-4109-8cd1-59998b97ab8d", idempotencyKey: "a1d96d93-48bb-4456-9741-ad4465ef1845", shiftGlobalId });
     expect((await (await postCommands([command])).json()).results[0].status).toBe("accepted");
@@ -257,6 +263,17 @@ describe("paired customer command processing", () => {
     expect(shiftChange.snapshot.registerGlobalId).toBe(registerGlobalId);
     expect(shiftChange.snapshot.openingFloat).toBe(3500);
     expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
+    const cashMovement = makeCashMovementCommand({ operationId: "c117ee8d-6e0e-454a-9204-f39c42f1267d", idempotencyKey: "b223645c-2d0e-423d-bc67-56be5a6a12cc", movementGlobalId: "6d332b5a-6085-4c84-848f-f1953c8f8aed", shiftGlobalId, dependency: command.operationId });
+    expect((await (await postCommands([cashMovement])).json()).results[0].status).toBe("accepted");
+    expect((await db.select().from(shiftCashMovements)).length).toBe(1);
+    expect((await db.select().from(transactions).where(eq(transactions.category, "cash_in"))).length).toBe(1);
+    expect((await (await postCommands([cashMovement])).json()).results[0].status).toBe("already_applied");
+    await db.update(staffAssignments).set({ role: "cashier" }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
+    const deniedMovement = makeCashMovementCommand({ operationId: "3461d3c0-f6b3-4fcf-b70d-b44ae5f530c2", idempotencyKey: "1c29c75e-4b08-4905-8b12-c559ff6cf604", movementGlobalId: "622cefea-121f-4b94-901a-06f8fce4a22d", shiftGlobalId, dependency: command.operationId });
+    expect((await (await postCommands([deniedMovement])).json()).results[0].status).toBe("rejected");
+    expect((await db.select().from(shiftCashMovements)).length).toBe(1);
+    expect((await db.select().from(auditLogs).where(eq(auditLogs.action, "sync.permission_denied"))).length).toBe(1);
+    await db.update(staffAssignments).set({ role: "owner" }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
     const overlapping = makeShiftCommand({ operationId: "37d7334d-a8dc-4f05-96b7-a1903ea7077f", idempotencyKey: "ad4bdcf0-f748-458c-bc12-4a80e7749455", shiftGlobalId: "9c7dc744-a4b3-4a22-86c1-0256adac36ea" });
     expect((await (await postCommands([overlapping])).json()).results[0].status).toBe("needs_review");
     expect((await db.select().from(cashierShifts).where(eq(cashierShifts.status, "open"))).length).toBe(1);

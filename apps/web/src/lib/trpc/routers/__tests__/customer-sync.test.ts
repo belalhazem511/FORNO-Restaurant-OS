@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 import { NextRequest } from "next/server";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, products, staffAssignments, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, paymentMethods, products, shiftCashMovements, staffAssignments, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, transactions, user } from "@/lib/db/schema";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
@@ -181,6 +181,13 @@ describe("desktop customer command boundary", () => {
     expect(command?.payload.shiftGlobalId).toBe(mapping?.global_id);
     expect(command?.payload.registerGlobalId).toBe(registerGlobalId);
     expect(command?.payload.openingFloat).toBe(1200);
+    await db.insert(paymentMethods).values({ code: "CASH", name: "Cash", affects_drawer: true, is_active: true });
+    await shiftCaller.moveCash({ shiftId: shift.id, type: "cash_in", amount: 500, reason: "Local drawer top up" });
+    const movementCommand = (await db.select().from(syncOutbox).where(eq(syncOutbox.domain, "shifts"))).at(-1);
+    expect(movementCommand?.action).toBe("drawer_adjust");
+    expect(movementCommand?.dependencies).toEqual([command!.operation_id]);
+    expect((await db.select().from(shiftCashMovements)).length).toBe(1);
+    expect((await db.select().from(transactions).where(eq(transactions.category, "cash_in"))).length).toBe(1);
     const remoteShiftGlobalId = "7501a95a-c582-4a3d-921f-c06d28053a77";
     const applied = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
       method: "POST",

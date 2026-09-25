@@ -213,7 +213,11 @@ export const shiftsRouter = router({
       await requireStaff(ctx.user.id, shift.branch_id, "cash:adjust");
       const cashMethod = await db.query.paymentMethods.findFirst({ where: and(eq(paymentMethods.code, "CASH"), eq(paymentMethods.is_active, true)) });
       if (!cashMethod) throw new Error("Cash payment method is not configured");
-      await db.transaction(async (tx) => {
+      const shiftIdentity = process.env.FORNO_DESKTOP_MODE === "1"
+        ? await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, process.env.FORNO_DESKTOP_DEVICE_ID ?? ""), eq(syncEntityMappings.entity_type, "cashier_shift"), eq(syncEntityMappings.local_id, String(shift.id))) })
+        : null;
+      if (process.env.FORNO_DESKTOP_MODE === "1" && !shiftIdentity) throw new Error("The local shift synchronization identity is unavailable.");
+      const moveCash = async (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => {
         const [movement] = await tx.insert(shiftCashMovements).values({
           shift_id: shift.id, type: input.type, amount: input.amount, reason: input.reason, created_by: ctx.user.id,
         }).returning();
@@ -232,7 +236,19 @@ export const shiftsRouter = router({
           action: `shift.${input.type}`, entity_type: "cash_movement", entity_id: String(movement.id),
           reason: input.reason, details: JSON.stringify({ amount: input.amount }),
         });
-      });
+        return movement!;
+      };
+      await db.transaction(async (tx) => process.env.FORNO_DESKTOP_MODE === "1"
+        ? executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "shifts",
+          action: "drawer_adjust",
+          entityType: "cash_movement",
+          localId: (movement) => String(movement.id),
+          dependsOnGlobalIds: () => [shiftIdentity!.global_id],
+          payload: (movementGlobalId, movement) => ({ cashMovementGlobalId: movementGlobalId, shiftGlobalId: shiftIdentity!.global_id, type: movement.type, amount: movement.amount, reason: movement.reason, createdAt: movement.created_at.toISOString() }),
+        }, moveCash)
+        : moveCash(tx));
       const refreshed = await db.query.cashierShifts.findFirst({ where: eq(cashierShifts.id, shift.id) });
       return hydrateShift(db, refreshed!);
     }),

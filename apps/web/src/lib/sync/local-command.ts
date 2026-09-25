@@ -12,6 +12,7 @@ type LocalCommandInput<Result> = {
   entityType: string;
   localId(result: Result): string | null;
   payload(globalId: string, result: Result): Record<string, unknown>;
+  dependsOnGlobalIds?(result: Result): string[];
 };
 
 function stableJson(value: unknown): string {
@@ -73,7 +74,9 @@ export async function executeLocalCommand<Result>(
   const pendingCommands = await tx.select({ operation_id: syncOutbox.operation_id, payload: syncOutbox.payload })
     .from(syncOutbox)
     .where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.domain, input.domain), eq(syncOutbox.state, "pending")));
-  const dependencies = pendingCommands.filter((command) => command.payload[`${input.entityType}GlobalId`] === entityMapping!.global_id).map((command) => command.operation_id);
+  const relatedGlobalIds = new Set([entityMapping.global_id, ...(input.dependsOnGlobalIds?.(result) ?? [])]);
+  const dependencies = pendingCommands.filter((command) => Object.values(command.payload).some((value) => typeof value === "string" && relatedGlobalIds.has(value))).map((command) => command.operation_id);
+  const entityDependencies = pendingCommands.filter((command) => command.payload[`${input.entityType}GlobalId`] === entityMapping!.global_id).length;
   await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: input.actorId, action: `sync.${input.domain}.${input.action}.queued`, entity_type: input.entityType, entity_id: entityMapping.global_id, details: JSON.stringify({ operationId, payloadHash }) });
   await tx.insert(syncOutbox).values({
     operation_id: operationId,
@@ -88,7 +91,7 @@ export async function executeLocalCommand<Result>(
     payload,
     payload_hash: payloadHash,
     idempotency_key: idempotencyKey,
-    base_revision: entityMapping.server_revision + dependencies.length,
+    base_revision: entityMapping.server_revision + entityDependencies,
     dependencies,
     device_timestamp: new Date(),
   });
