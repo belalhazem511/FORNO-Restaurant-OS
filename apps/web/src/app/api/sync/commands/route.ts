@@ -73,6 +73,25 @@ async function authenticateDevice(request: NextRequest) {
   return device;
 }
 
+async function auditRejectedCommand(device: { id: string; organization_id: string; branch_id: number }, actorGlobalId: string, operationId: string, reason: string) {
+  await db.transaction(async (tx) => {
+    const [actor] = await tx.select().from(syncGlobalEntities).where(and(
+      eq(syncGlobalEntities.organization_id, device.organization_id),
+      eq(syncGlobalEntities.entity_type, "user"),
+      eq(syncGlobalEntities.global_id, actorGlobalId),
+    )).limit(1);
+    if (!actor) return;
+    await tx.insert(auditLogs).values({
+      branch_id: device.branch_id,
+      actor_user_id: actor.local_id,
+      action: "sync.command.rejected",
+      entity_type: "sync_device",
+      entity_id: device.id,
+      details: JSON.stringify({ operationId, reason }),
+    });
+  });
+}
+
 export async function POST(request: NextRequest) {
   const device = await authenticateDevice(request);
   if (!device) return NextResponse.json({ error: "Paired device authentication failed." }, { status: 401, headers: { "cache-control": "no-store" } });
@@ -92,11 +111,13 @@ export async function POST(request: NextRequest) {
     }
     const command = parsed.data;
     if (command.deviceId !== device.id || command.organizationId !== device.organization_id || command.branchGlobalId.length !== 36) {
+      await auditRejectedCommand(device, command.actorGlobalId, command.operationId, "scope_mismatch");
       results.set(command.operationId, { operationId: command.operationId, status: "rejected", error: "Command scope does not match the paired device." });
       continue;
     }
     const computedHash = createHash("sha256").update(stableJson(command.payload)).digest("hex");
     if (computedHash !== command.payloadHash) {
+      await auditRejectedCommand(device, command.actorGlobalId, command.operationId, "payload_hash_mismatch");
       results.set(command.operationId, { operationId: command.operationId, status: "rejected", error: "Payload hash mismatch." });
       continue;
     }

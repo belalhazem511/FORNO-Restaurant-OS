@@ -158,6 +158,16 @@ describe("paired customer command processing", () => {
     await db.update(staffAssignments).set({ is_active: true }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
   });
 
+  it("audits a payload hash mismatch without applying the command", async () => {
+    const command = makeCommand({ operationId: "99b10866-c83b-47bb-85ba-f4847cc85ced", idempotencyKey: "40cc081e-a9e9-4b6a-9ba0-a5e663de00ca", customerGlobalId: "9191052f-c5bb-4670-aeb1-117ca0efecb2", name: "Tampered Payload" });
+    command.payloadHash = "0".repeat(64);
+    const beforeCustomers = (await db.select().from(customers)).length;
+    const result = (await (await postCommands([command])).json()).results[0];
+    expect(result.status).toBe("rejected");
+    expect((await db.select().from(customers)).length).toBe(beforeCustomers);
+    expect((await db.select().from(auditLogs).where(eq(auditLogs.action, "sync.command.rejected"))).length).toBe(1);
+  });
+
   it("applies product commands and publishes an opaque media reference without local integer IDs", async () => {
     const productGlobalId = "247d2eca-7c10-4dc2-867f-af94dd7b5c8c";
     const command = makeProductCommand({ operationId: "76fa5c16-9a0a-4c69-b806-9b439c45cb8d", idempotencyKey: "f818e481-a04c-40ab-98ab-5f4fd0d1b447", productGlobalId, name: "Synced Product" });
