@@ -9,6 +9,7 @@ export const runtime = "nodejs";
 const customerSnapshot = z.object({ name: z.string(), email: z.string().email(), phone: z.string().nullable(), status: z.string().nullable() });
 const productSnapshot = z.object({ name: z.string(), description: z.string().nullable(), price: z.number().int().nonnegative(), in_stock: z.number().int().nonnegative(), category: z.string().nullable(), imageKey: z.string().max(200).nullable() });
 const shiftSnapshot = z.object({ registerGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() });
+const shiftCloseSnapshot = z.object({ closedByGlobalId: z.string().uuid(), expectedCash: z.number().int(), closingCash: z.number().int().nonnegative(), variance: z.number().int(), closedAt: z.string().datetime() });
 const cashMovementSnapshot = z.object({ shiftGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), type: z.enum(["cash_in", "cash_out"]), amount: z.number().int().positive(), reason: z.string().min(3).max(500), createdAt: z.string().datetime() });
 const changeSchema = z.object({ cursor: z.number().int().positive(), domain: z.string(), entityType: z.string(), entityGlobalId: z.string().uuid(), action: z.string(), revision: z.number().int().positive(), snapshot: z.unknown().nullable() });
 
@@ -43,7 +44,8 @@ export async function POST(request: NextRequest) {
         if (!isCustomer && !isProduct && !isShift && !isCashMovement) continue;
         const isDelete = change.action === "delete" && change.snapshot === null;
         if (!isDelete && !change.snapshot) continue;
-        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : cashMovementSnapshot.safeParse(change.snapshot);
+        const isShiftClose = isShift && change.action === "close";
+        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShiftClose ? shiftCloseSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : cashMovementSnapshot.safeParse(change.snapshot);
         if (parsedSnapshot && !parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
         const snapshot = parsedSnapshot?.success ? parsedSnapshot.data : null;
         const entityType = change.entityType;
@@ -62,6 +64,15 @@ export async function POST(request: NextRequest) {
             await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: entityType, entity_global_id: change.entityGlobalId, local_payload: localPayload, server_snapshot: remotePayload, reason: `A local ${entityType} edit is pending while an authoritative server change arrived.` });
             const [actor] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"))).limit(1);
             if (actor) await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: `sync.${entityType}.needs_review`, entity_type: entityType, entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
+            continue;
+          }
+          if (isShiftClose) {
+            const close = snapshot as z.infer<typeof shiftCloseSnapshot>;
+            const [closedBy] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, close.closedByGlobalId))).limit(1);
+            if (!closedBy) throw new Error("Pulled shift close references an unmapped actor.");
+            await tx.update(cashierShifts).set({ status: "closed", expected_cash: close.expectedCash, closing_cash: close.closingCash, variance: close.variance, closed_by: closedBy.local_id, closed_at: new Date(close.closedAt) }).where(eq(cashierShifts.id, Number(mapping.local_id)));
+            await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: Number(mapping.local_id), actor_user_id: closedBy.local_id, action: "sync.cashier_shift.closed", entity_type: "cashier_shift", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor, expectedCash: close.expectedCash, closingCash: close.closingCash, variance: close.variance }) });
             continue;
           }
           if (isShift || isCashMovement) {

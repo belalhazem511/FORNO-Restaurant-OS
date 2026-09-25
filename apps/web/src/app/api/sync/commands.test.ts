@@ -80,6 +80,11 @@ function makeCashMovementCommand(input: { operationId: string; idempotencyKey: s
   return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "shifts", action: "drawer_adjust", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: [input.dependency], deviceTimestamp: new Date().toISOString() };
 }
 
+function makeShiftCloseCommand(input: { operationId: string; idempotencyKey: string; shiftGlobalId: string; expectedCash: number; dependency: string }) {
+  const payload = { shiftGlobalId: input.shiftGlobalId, expectedCash: input.expectedCash, closingCash: input.expectedCash, closedAt: new Date().toISOString() };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "shifts", action: "close", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: [input.dependency], deviceTimestamp: new Date().toISOString() };
+}
+
 async function postCommands(commands: unknown[]) {
   return POST(new NextRequest("http://localhost/api/sync/commands", {
     method: "POST",
@@ -278,5 +283,17 @@ describe("paired customer command processing", () => {
     expect((await (await postCommands([overlapping])).json()).results[0].status).toBe("needs_review");
     expect((await db.select().from(cashierShifts).where(eq(cashierShifts.status, "open"))).length).toBe(1);
     expect((await db.select().from(syncConflicts).where(eq(syncConflicts.entity_global_id, overlapping.payload.shiftGlobalId))).length).toBe(1);
+    const staleClose = makeShiftCloseCommand({ operationId: "baf18b5f-63b9-4023-bc28-91018a73a2ce", idempotencyKey: "af7d25e7-3f37-4bd9-875a-1f12e1227e15", shiftGlobalId, expectedCash: 3500, dependency: cashMovement.operationId });
+    expect((await (await postCommands([staleClose])).json()).results[0].status).toBe("needs_review");
+    expect((await db.select().from(cashierShifts).where(eq(cashierShifts.status, "open"))).length).toBe(1);
+    const close = makeShiftCloseCommand({ operationId: "a4153b68-5f30-4126-b04f-69a57c012cab", idempotencyKey: "2f23bb93-0e17-4334-88d2-679bb3c81c10", shiftGlobalId, expectedCash: 4000, dependency: cashMovement.operationId });
+    expect((await (await postCommands([close])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([close])).json()).results[0].status).toBe("already_applied");
+    const closedShift = await db.query.cashierShifts.findFirst({ where: eq(cashierShifts.status, "closed") });
+    expect(closedShift?.expected_cash).toBe(4000);
+    expect(closedShift?.closing_cash).toBe(4000);
+    const closeChanges = await (await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }))).json();
+    const closeChange = closeChanges.changes.find((change: { action: string; entityGlobalId: string }) => change.action === "close" && change.entityGlobalId === shiftGlobalId);
+    expect(closeChange.snapshot.expectedCash).toBe(4000);
   });
 });

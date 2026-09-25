@@ -10,6 +10,7 @@ import {
   cashierRegisters,
   cashierShifts,
   customers,
+  orderPayments,
   paymentMethods,
   products,
   staffAssignments,
@@ -40,6 +41,7 @@ const payloadSchemas = {
   "products.update": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.delete": z.object({ productGlobalId: z.string().uuid() }),
   "shifts.open": z.object({ shiftGlobalId: z.string().uuid(), registerGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() }),
+  "shifts.close": z.object({ shiftGlobalId: z.string().uuid(), expectedCash: z.number().int(), closingCash: z.number().int().nonnegative(), closedAt: z.string().datetime() }),
   "shifts.drawer_adjust": z.object({ cashMovementGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid(), type: z.enum(["cash_in", "cash_out"]), amount: z.number().int().positive(), reason: z.string().trim().min(3).max(500), createdAt: z.string().datetime() }),
 };
 const commandSchema = z.object({
@@ -50,7 +52,7 @@ const commandSchema = z.object({
   registerGlobalId: z.string().uuid(),
   actorGlobalId: z.string().uuid(),
   domain: z.enum(["customers", "products", "shifts"]),
-  action: z.enum(["create", "update", "delete", "open", "drawer_adjust"]),
+  action: z.enum(["create", "update", "delete", "open", "drawer_adjust", "close"]),
   schemaVersion: z.literal(1),
   payload: z.record(z.string(), z.unknown()),
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -195,6 +197,47 @@ export async function POST(request: NextRequest) {
             const result = { cashMovementGlobalId: movementPayload.cashMovementGlobalId, revision: 1 };
             await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
             await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "shifts", entity_type: "cash_movement", entity_global_id: movementPayload.cashMovementGlobalId, action: command.action, server_revision: 1, source_operation_id: command.operationId });
+            await tx.update(syncDevices).set({ last_seen_at: new Date(), last_synchronized_at: new Date() }).where(eq(syncDevices.id, device.id));
+            return { operationId: command.operationId, status: "accepted", result };
+          }
+          if (command.action === "close") {
+            const closePayload = payload.data as z.infer<typeof payloadSchemas["shifts.close"]>;
+            const [shiftMapping] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "cashier_shift"), eq(syncGlobalEntities.global_id, closePayload.shiftGlobalId))).for("update").limit(1);
+            const [shift] = await tx.select().from(cashierShifts).where(and(eq(cashierShifts.id, Number(shiftMapping?.local_id)), eq(cashierShifts.branch_id, device.branch_id), eq(cashierShifts.status, "open"))).for("update").limit(1);
+            if (!shiftMapping || !shift) return { operationId: command.operationId, status: "rejected", error: "Open shift identity is invalid." };
+            if (shift.cashier_user_id !== actor.local_id && !hasPermission(assignment.role, "shift:review")) {
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.permission_denied", entity_type: "cashier_shift", entity_id: closePayload.shiftGlobalId, reason: "shift:review", details: JSON.stringify({ sourceOperationId: command.operationId }) });
+              return { operationId: command.operationId, status: "rejected", error: "Actor lacks shift review permission." };
+            }
+            const [methods, payments, movements] = await Promise.all([
+              tx.select().from(paymentMethods),
+              tx.select().from(orderPayments).where(eq(orderPayments.shift_id, shift.id)),
+              tx.select().from(shiftCashMovements).where(eq(shiftCashMovements.shift_id, shift.id)),
+            ]);
+            const cashMethodIds = new Set(methods.filter((method) => method.affects_drawer).map((method) => method.id));
+            const cashSales = payments.filter((payment) => payment.kind === "payment" && cashMethodIds.has(payment.payment_method_id)).reduce((sum, payment) => sum + payment.amount, 0);
+            const cashRefunds = payments.filter((payment) => payment.kind === "refund" && cashMethodIds.has(payment.payment_method_id)).reduce((sum, payment) => sum + payment.amount, 0);
+            const cashIn = movements.filter((movement) => movement.type === "cash_in").reduce((sum, movement) => sum + movement.amount, 0);
+            const cashOut = movements.filter((movement) => movement.type === "cash_out").reduce((sum, movement) => sum + movement.amount, 0);
+            const serverExpectedCash = shift.opening_float + cashSales - cashRefunds + cashIn - cashOut;
+            if (serverExpectedCash !== closePayload.expectedCash) {
+              const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+              await tx.update(syncCommandInbox).set({ result: { reason: "cash_snapshot_mismatch" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+              await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "cashier_shift", entity_global_id: closePayload.shiftGlobalId, local_payload: command.payload, server_snapshot: { expectedCash: serverExpectedCash }, reason: "The central shift cash total differs from the device snapshot." });
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: shift.id, actor_user_id: actor.local_id, action: "sync.shift.needs_review", entity_type: "cashier_shift", entity_id: closePayload.shiftGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, localExpectedCash: closePayload.expectedCash, serverExpectedCash }) });
+              return { operationId: command.operationId, status: "needs_review", result: { shiftGlobalId: closePayload.shiftGlobalId } };
+            }
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+            const variance = closePayload.closingCash - serverExpectedCash;
+            await tx.update(cashierShifts).set({ status: "closed", expected_cash: serverExpectedCash, closing_cash: closePayload.closingCash, variance, closed_by: actor.local_id, closed_at: new Date(closePayload.closedAt) }).where(eq(cashierShifts.id, shift.id));
+            const revision = (shiftMapping.server_revision ?? 0) + 1;
+            await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, shiftMapping.id));
+            const [deviceMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "cashier_shift"), eq(syncEntityMappings.global_id, closePayload.shiftGlobalId))).for("update").limit(1);
+            if (deviceMapping) await tx.update(syncEntityMappings).set({ server_revision: revision, local_revision: deviceMapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, deviceMapping.id));
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: shift.id, actor_user_id: actor.local_id, action: "sync.shift.closed", entity_type: "cashier_shift", entity_id: closePayload.shiftGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, expectedCash: serverExpectedCash, closingCash: closePayload.closingCash, variance }) });
+            const result = { shiftGlobalId: closePayload.shiftGlobalId, revision };
+            await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+            await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "shifts", entity_type: "cashier_shift", entity_global_id: closePayload.shiftGlobalId, action: "close", server_revision: revision, source_operation_id: command.operationId });
             await tx.update(syncDevices).set({ last_seen_at: new Date(), last_synchronized_at: new Date() }).where(eq(syncDevices.id, device.id));
             return { operationId: command.operationId, status: "accepted", result };
           }
@@ -363,9 +406,14 @@ export async function GET(request: NextRequest) {
     else if (isShift && mapping) {
       const shift = await db.query.cashierShifts.findFirst({ where: eq(cashierShifts.id, Number(mapping.local_id)) });
       if (shift) {
-        const [register] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "register"), eq(syncGlobalEntities.local_id, String(shift.register_id)))).limit(1);
-        const [actor] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, shift.cashier_user_id))).limit(1);
-        if (register && actor) snapshot = { registerGlobalId: register.global_id, actorGlobalId: actor.global_id, openingFloat: shift.opening_float, openedAt: shift.opened_at.toISOString() };
+        if (change.action === "close" && shift.status === "closed" && shift.closed_at && shift.expected_cash !== null && shift.closing_cash !== null && shift.variance !== null) {
+          const [closedBy] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, shift.closed_by ?? ""))).limit(1);
+          if (closedBy) snapshot = { closedByGlobalId: closedBy.global_id, expectedCash: shift.expected_cash, closingCash: shift.closing_cash, variance: shift.variance, closedAt: shift.closed_at.toISOString() };
+        } else {
+          const [register] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "register"), eq(syncGlobalEntities.local_id, String(shift.register_id)))).limit(1);
+          const [actor] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, shift.cashier_user_id))).limit(1);
+          if (register && actor) snapshot = { registerGlobalId: register.global_id, actorGlobalId: actor.global_id, openingFloat: shift.opening_float, openedAt: shift.opened_at.toISOString() };
+        }
       }
     }
     else if (isCashMovement && mapping) {

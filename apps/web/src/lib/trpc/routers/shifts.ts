@@ -262,7 +262,7 @@ export const shiftsRouter = router({
       const assignment = await requireStaff(ctx.user.id, shift.branch_id, "shift:own");
       if (shift.cashier_user_id !== ctx.user.id) assertPermission(assignment.role, "shift:review");
       const summary = await summarizeShift(db, shift);
-      const closed = await db.transaction(async (tx) => {
+      const closeShift = async (tx: any) => {
         const [updated] = await tx.update(cashierShifts).set({
           status: "closed",
           expected_cash: summary.expectedCash,
@@ -278,7 +278,18 @@ export const shiftsRouter = router({
           details: JSON.stringify({ expectedCash: summary.expectedCash, closingCash: input.closingCash, variance: input.closingCash - summary.expectedCash }),
         });
         return updated;
-      });
+      };
+      const closed = await db.transaction(async (tx) => process.env.FORNO_DESKTOP_MODE === "1"
+        ? executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "shifts",
+          action: "close",
+          entityType: "cashier_shift",
+          localId: (result) => String(result.id),
+          dependsOnGlobalIds: () => [],
+          payload: (shiftGlobalId, result) => ({ shiftGlobalId, expectedCash: summary.expectedCash, closingCash: input.closingCash, closedAt: result.closed_at!.toISOString() }),
+        }, closeShift)
+        : closeShift(tx));
       return { ...await hydrateShift(db, closed), summary };
     }),
 

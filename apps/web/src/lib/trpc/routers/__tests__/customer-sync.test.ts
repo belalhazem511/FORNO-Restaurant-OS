@@ -208,7 +208,7 @@ describe("desktop customer command boundary", () => {
       { organization_id: organizationBId, branch_id: branchB!.id, entity_type: "user", global_id: actorGlobalId, local_id: "local-owner-b" },
     ]);
     const movement = (await db.select().from(shiftCashMovements)).at(-1)!;
-    const previousDeviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+    const previousCloseDeviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
     process.env.FORNO_DESKTOP_DEVICE_ID = deviceBId;
     let importedStatus = 0;
     let importError: string | undefined;
@@ -224,8 +224,8 @@ describe("desktop customer command boundary", () => {
       importedStatus = imported.status;
       importError = (await imported.json()).error;
     } finally {
-      if (previousDeviceId === undefined) delete process.env.FORNO_DESKTOP_DEVICE_ID;
-      else process.env.FORNO_DESKTOP_DEVICE_ID = previousDeviceId;
+      if (previousCloseDeviceId === undefined) delete process.env.FORNO_DESKTOP_DEVICE_ID;
+      else process.env.FORNO_DESKTOP_DEVICE_ID = previousCloseDeviceId;
     }
     expect(importError).toBeUndefined();
     expect(importedStatus).toBe(200);
@@ -241,6 +241,29 @@ describe("desktop customer command boundary", () => {
     expect(applied.status).toBe(200);
     expect((await db.select().from(cashierShifts).where(and(eq(cashierShifts.branch_id, branch!.id), eq(cashierShifts.status, "open")))).length).toBe(1);
     expect((await db.select().from(syncConflicts).where(eq(syncConflicts.entity_global_id, remoteShiftGlobalId))).length).toBe(1);
+    const closed = await shiftCaller.close({ shiftId: shift.id, closingCash: 1750 });
+    const closeCommand = (await db.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, deviceId), eq(syncOutbox.domain, "shifts")))).find((item) => item.action === "close");
+    expect(closed.status).toBe("closed");
+    expect(closeCommand?.payload.expectedCash).toBe(1700);
+    expect(closeCommand?.payload.closingCash).toBe(1750);
+    expect(closeCommand?.dependencies).toContain(command!.operation_id);
+    expect((await db.select().from(cashierShifts).where(and(eq(cashierShifts.id, shift.id), eq(cashierShifts.status, "closed")))).length).toBe(1);
+    const previousDeviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+    process.env.FORNO_DESKTOP_DEVICE_ID = deviceBId;
+    let closeImportStatus = 0;
+    try {
+      const closeImport = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
+        body: JSON.stringify({ changes: [{ cursor: 46, domain: "shifts", entityType: "cashier_shift", entityGlobalId: mapping!.global_id, action: "close", revision: 2, snapshot: { closedByGlobalId: actorGlobalId, expectedCash: 1700, closingCash: 1750, variance: 50, closedAt: closed.closed_at!.toISOString() } }], nextCursor: 46 }),
+      }));
+      closeImportStatus = closeImport.status;
+    } finally {
+      if (previousDeviceId === undefined) delete process.env.FORNO_DESKTOP_DEVICE_ID;
+      else process.env.FORNO_DESKTOP_DEVICE_ID = previousDeviceId;
+    }
+    expect(closeImportStatus).toBe(200);
+    expect((await db.select().from(cashierShifts).where(and(eq(cashierShifts.branch_id, branchB!.id), eq(cashierShifts.status, "closed")))).length).toBe(1);
   });
 
   it("orders a cross-domain command after its pending global-identity dependency", async () => {
