@@ -5,6 +5,7 @@ import { db } from "@/lib/db";
 import { menuItems, products, staffAssignments } from "@/lib/db/schema";
 import { PRODUCT_IMAGE_MAX_BYTES, removeProductImage, writeProductImage } from "@/lib/media/product-images";
 import { hasPermission } from "@/lib/permissions";
+import { executeLocalCommand } from "@/lib/sync/local-command";
 
 async function authorizedProduct(request: Request, productId: number) {
   const session = await auth.api.getSession({ headers: request.headers });
@@ -22,7 +23,7 @@ async function authorizedProduct(request: Request, productId: number) {
   if (!canManage) {
     return { response: NextResponse.json({ error: "Product not found" }, { status: 404 }) };
   }
-  return { product };
+  return { product, actorId: session.user.id };
 }
 
 export async function POST(request: Request, context: { params: Promise<{ productId: string }> }) {
@@ -41,7 +42,19 @@ export async function POST(request: Request, context: { params: Promise<{ produc
     return NextResponse.json({ error: error instanceof Error ? error.message : "Invalid image" }, { status: 400 });
   }
   try {
-    await db.update(products).set({ image_key: newKey }).where(eq(products.id, productId));
+    if (process.env.FORNO_DESKTOP_MODE === "1") {
+      await db.transaction((tx) => executeLocalCommand<typeof products.$inferSelect>(tx, {
+        actorId: access.actorId,
+        domain: "products",
+        action: "update",
+        entityType: "product",
+        localId: (product) => String(product.id),
+        payload: (productGlobalId, product) => ({ productGlobalId, values: { name: product.name, description: product.description, price: product.price, in_stock: product.in_stock, category: product.category, imageKey: product.image_key } }),
+      }, async (tx) => {
+        const [updated] = await tx.update(products).set({ image_key: newKey }).where(eq(products.id, productId)).returning();
+        return updated!;
+      }));
+    } else await db.update(products).set({ image_key: newKey }).where(eq(products.id, productId));
   } catch (error) {
     await removeProductImage(newKey).catch(() => undefined);
     throw error;
@@ -55,7 +68,19 @@ export async function DELETE(request: Request, context: { params: Promise<{ prod
   if (!Number.isSafeInteger(productId) || productId < 1) return NextResponse.json({ error: "Invalid product" }, { status: 400 });
   const access = await authorizedProduct(request, productId);
   if ("response" in access) return access.response;
-  await db.update(products).set({ image_key: null }).where(eq(products.id, productId));
+  if (process.env.FORNO_DESKTOP_MODE === "1") {
+    await db.transaction((tx) => executeLocalCommand<typeof products.$inferSelect>(tx, {
+      actorId: access.actorId,
+      domain: "products",
+      action: "update",
+      entityType: "product",
+      localId: (product) => String(product.id),
+      payload: (productGlobalId, product) => ({ productGlobalId, values: { name: product.name, description: product.description, price: product.price, in_stock: product.in_stock, category: product.category, imageKey: product.image_key } }),
+    }, async (tx) => {
+      const [updated] = await tx.update(products).set({ image_key: null }).where(eq(products.id, productId)).returning();
+      return updated!;
+    }));
+  } else await db.update(products).set({ image_key: null }).where(eq(products.id, productId));
   if (access.product.image_key) await removeProductImage(access.product.image_key).catch(() => undefined);
   return NextResponse.json({ imageKey: null });
 }
