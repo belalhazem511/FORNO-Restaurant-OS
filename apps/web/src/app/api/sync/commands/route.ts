@@ -31,6 +31,7 @@ const payloadSchemas = {
   "customers.delete": z.object({ customerGlobalId: z.string().uuid() }),
   "products.create": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.update": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
+  "products.delete": z.object({ productGlobalId: z.string().uuid() }),
 };
 const commandSchema = z.object({
   operationId: z.string().uuid(),
@@ -180,7 +181,7 @@ export async function POST(request: NextRequest) {
           const [mapping] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "product"), eq(syncGlobalEntities.global_id, productGlobalId))).for("update").limit(1);
           const [deviceMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "product"), eq(syncEntityMappings.global_id, productGlobalId))).for("update").limit(1);
           if (command.action === "create" && mapping) return { operationId: command.operationId, status: "rejected", error: "Product global identity already exists." };
-          if (command.action === "update" && (!mapping || !deviceMapping || deviceMapping.server_revision !== command.baseRevision)) {
+          if (command.action !== "create" && (!mapping || !deviceMapping || deviceMapping.server_revision !== command.baseRevision)) {
             if (!mapping) return { operationId: command.operationId, status: "rejected", error: "Product mapping does not exist." };
             const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
             const [serverProduct] = await tx.select().from(products).where(eq(products.id, Number(mapping.local_id))).limit(1);
@@ -191,13 +192,20 @@ export async function POST(request: NextRequest) {
           }
           const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
           let revision = 1;
-          const { imageKey, ...productValues } = productPayload.values;
           if (command.action === "create") {
+            const { imageKey, ...productValues } = productPayload.values;
             const [product] = await tx.insert(products).values({ ...productValues, image_key: imageKey, user_uid: actor.local_id }).returning();
             await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "product", global_id: productGlobalId, local_id: String(product!.id) });
             await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "product", global_id: productGlobalId, local_id: String(product!.id), local_revision: 1, server_revision: 1 });
             await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.product.created", entity_type: "product", entity_id: productGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
+          } else if (command.action === "delete") {
+            await tx.delete(products).where(eq(products.id, Number(mapping!.local_id)));
+            revision = deviceMapping!.server_revision + 1;
+            await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, mapping!.id));
+            await tx.update(syncEntityMappings).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncEntityMappings.id, deviceMapping!.id));
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.product.deleted", entity_type: "product", entity_id: productGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
           } else {
+            const { imageKey, ...productValues } = productPayload.values;
             const [updated] = await tx.update(products).set({ ...productValues, image_key: imageKey, user_uid: actor.local_id }).where(eq(products.id, Number(mapping!.local_id))).returning();
             revision = deviceMapping!.server_revision + 1;
             await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, mapping!.id));

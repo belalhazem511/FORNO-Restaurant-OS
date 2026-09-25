@@ -44,8 +44,8 @@ function makeCommand(input: { operationId: string; idempotencyKey: string; custo
   };
 }
 
-function makeProductCommand(input: { operationId: string; idempotencyKey: string; productGlobalId: string; name: string }) {
-  const payload = { productGlobalId: input.productGlobalId, values: { name: input.name, description: null, price: 425, in_stock: 7, category: null, imageKey: "media/opaque.webp" } };
+function makeProductCommand(input: { operationId: string; idempotencyKey: string; productGlobalId: string; name?: string; action?: "create" | "update" | "delete"; baseRevision?: number; dependencies?: string[] }) {
+  const payload = input.action === "delete" ? { productGlobalId: input.productGlobalId } : { productGlobalId: input.productGlobalId, values: { name: input.name!, description: null, price: 425, in_stock: 7, category: null, imageKey: "media/opaque.webp" } };
   return {
     operationId: input.operationId,
     deviceId,
@@ -54,13 +54,13 @@ function makeProductCommand(input: { operationId: string; idempotencyKey: string
     registerGlobalId,
     actorGlobalId,
     domain: "products",
-    action: "create",
+    action: input.action ?? "create",
     schemaVersion: 1,
     payload,
     payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"),
     idempotencyKey: input.idempotencyKey,
-    baseRevision: 0,
-    dependencies: [],
+    baseRevision: input.baseRevision ?? 0,
+    dependencies: input.dependencies ?? [],
     deviceTimestamp: new Date().toISOString(),
   };
 }
@@ -181,6 +181,10 @@ describe("paired customer command processing", () => {
     expect(item.snapshot.imageKey).toBe("media/opaque.webp");
     expect(item.snapshot.id).toBeUndefined();
     expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
+    const deletion = makeProductCommand({ operationId: "b47d03e5-3265-40ca-91da-3e9dc662d04e", idempotencyKey: "611d7ab6-e8db-4c8c-b144-8dfbca4942f4", productGlobalId, action: "delete", baseRevision: 1, dependencies: [command.operationId] });
+    expect((await (await postCommands([deletion])).json()).results[0].status).toBe("accepted");
+    expect(await db.query.products.findFirst({ where: eq(products.name, "Synced Product") })).toBeUndefined();
+    expect((await (await postCommands([deletion])).json()).results[0].status).toBe("already_applied");
   });
 
   it("applies a customer deletion as an idempotent tombstone change", async () => {

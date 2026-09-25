@@ -24,7 +24,7 @@ The full operation-by-operation catalogue, server permission rule, dependency, c
 
 ## Current transport contract
 
-- Customer deletion is synchronized as a typed tombstone, with local deletion, mapping revision, audit, and outbox committed together. Peers retain the UUID mapping after deleting the local row; rejected payload hashes are audited without applying business data.
+- Customer and product deletion are synchronized as typed tombstones, with local deletion, mapping revision, audit, and outbox committed together. Peers retain the UUID mapping after deleting the local row; rejected payload hashes are audited without applying business data.
 
 - Customer deletion now uses a typed `customers.delete` tombstone. The local row is removed only in the same transaction that records its mapping revision, audit, and outbox operation; central pull preserves the global mapping while applying the tombstone.
 

@@ -142,6 +142,11 @@ describe("desktop customer command boundary", () => {
     expect(commands[1]?.action).toBe("update");
     expect(commands[1]?.dependencies).toEqual([commands[0]?.operation_id]);
     expect((await db.select().from(products).where(eq(products.id, created.id)))[0]?.name).toBe("Renamed Local Product");
+    await productCaller.delete({ id: created.id });
+    const deletion = (await db.select().from(syncOutbox).where(eq(syncOutbox.domain, "products"))).at(-1);
+    expect(deletion?.action).toBe("delete");
+    expect(deletion?.payload.productGlobalId).toBe(mapping?.global_id);
+    expect((await db.select().from(products).where(eq(products.id, created.id))).length).toBe(0);
   });
 
   it("imports product snapshots by global UUID while retaining a device-local integer key", async () => {
