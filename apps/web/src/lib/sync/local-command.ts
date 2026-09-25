@@ -73,7 +73,7 @@ export async function executeLocalCommand<Result>(
   const idempotencyKey = randomUUID();
   const pendingCommands = await tx.select({ operation_id: syncOutbox.operation_id, payload: syncOutbox.payload })
     .from(syncOutbox)
-    .where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.domain, input.domain), eq(syncOutbox.state, "pending")));
+    .where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.state, "pending")));
   const relatedGlobalIds = new Set([entityMapping.global_id, ...(input.dependsOnGlobalIds?.(result) ?? [])]);
   const dependencies = pendingCommands.filter((command) => Object.values(command.payload).some((value) => typeof value === "string" && relatedGlobalIds.has(value))).map((command) => command.operation_id);
   const entityDependencies = pendingCommands.filter((command) => command.payload[`${input.entityType}GlobalId`] === entityMapping!.global_id).length;

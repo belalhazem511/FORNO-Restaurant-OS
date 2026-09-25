@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 import { NextRequest } from "next/server";
+import { executeLocalCommand } from "@/lib/sync/local-command";
 import { auditLogs, branches, cashierRegisters, cashierShifts, customers, paymentMethods, products, shiftCashMovements, staffAssignments, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, transactions, user } from "@/lib/db/schema";
 
 const { pg, db } = createTestDb();
@@ -240,5 +241,24 @@ describe("desktop customer command boundary", () => {
     expect(applied.status).toBe(200);
     expect((await db.select().from(cashierShifts).where(and(eq(cashierShifts.branch_id, branch!.id), eq(cashierShifts.status, "open")))).length).toBe(1);
     expect((await db.select().from(syncConflicts).where(eq(syncConflicts.entity_global_id, remoteShiftGlobalId))).length).toBe(1);
+  });
+
+  it("orders a cross-domain command after its pending global-identity dependency", async () => {
+    const customer = await caller.create({ name: "Dependency Customer", email: "dependency@example.test" });
+    const customerMapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "customer"), eq(syncEntityMappings.local_id, String(customer.id))) });
+    const priorCommand = (await db.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, deviceId), eq(syncOutbox.domain, "customers"), eq(syncOutbox.state, "pending")))).find((item) => item.payload.customerGlobalId === customerMapping?.global_id);
+    await db.transaction((tx) => executeLocalCommand(tx, {
+      actorId: "local-owner",
+      domain: "products",
+      action: "create",
+      entityType: "product",
+      localId: (result: { id: number }) => String(result.id),
+      dependsOnGlobalIds: () => [customerMapping!.global_id],
+      payload: (productGlobalId) => ({ productGlobalId, customerGlobalId: customerMapping!.global_id }),
+    }, async () => ({ id: 987654 })));
+    const productMapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "product"), eq(syncEntityMappings.local_id, "987654")) });
+    const dependentCommand = (await db.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, deviceId), eq(syncOutbox.domain, "products")))).find((item) => item.payload.productGlobalId === productMapping?.global_id);
+    expect(priorCommand).toBeDefined();
+    expect(dependentCommand?.dependencies).toContain(priorCommand!.operation_id);
   });
 });
