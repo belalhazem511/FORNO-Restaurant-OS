@@ -7,7 +7,7 @@ import { auditLogs, branches, cashierRegisters, customers, staffAssignments, syn
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
-const { POST } = await import("./commands/route");
+const { GET, POST } = await import("./commands/route");
 const deviceId = "b2d90704-052a-4a37-a0fc-0464bf8c9e0a";
 const organizationId = "ce9b25aa-39de-41c8-8d07-6c4ad0b5b967";
 const branchGlobalId = "8fb88e82-24a4-483e-b931-e5d23e4f8d0c";
@@ -86,6 +86,12 @@ describe("paired customer command processing", () => {
     expect((await db.select().from(syncChangeLog)).length).toBe(1);
     expect((await db.select().from(syncCommandInbox)).length).toBe(1);
     expect((await db.select().from(auditLogs)).length).toBe(1);
+    const pulled = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const page = await pulled.json();
+    expect(page.changes[0].entityGlobalId).toBe(customerGlobalId);
+    expect(page.changes[0].snapshot.email).toBe("offline-customer@sync.test");
+    expect(page.changes[0].snapshot.user_uid).toBeUndefined();
+    expect(page.nextCursor).toBeGreaterThan(0);
   });
 
   it("rejects reused operation identity with different content and audits it", async () => {
@@ -110,5 +116,24 @@ describe("paired customer command processing", () => {
     expect((await db.select().from(syncConflicts).where(eq(syncConflicts.entity_global_id, globalId))).length).toBe(1);
     expect((await db.select().from(customers).where(eq(customers.id, serverCustomer!.id)))[0]?.name).toBe("Server Version");
     expect(global?.server_revision).toBe(2);
+  });
+
+  it("rejects revoked devices, wrong branch scope, and inactive actors without business writes", async () => {
+    const [device] = await db.select().from(syncDevices).where(eq(syncDevices.id, deviceId));
+    await db.update(syncDevices).set({ status: "revoked", revoked_at: new Date() }).where(eq(syncDevices.id, deviceId));
+    const revoked = await postCommands([makeCommand({ operationId: "d0336702-c798-4b59-84b9-500f238bb2c0", idempotencyKey: "e2cb3784-e6cc-49b7-a7ef-452068c92230", customerGlobalId: "2f8d03e1-5f13-4f42-89ac-0ab12a7dccaa", name: "Revoked" })]);
+    expect(revoked.status).toBe(401);
+    await db.update(syncDevices).set({ status: "paired", revoked_at: null }).where(eq(syncDevices.id, deviceId));
+
+    const before = (await db.select().from(customers)).length;
+    const wrongBranch = makeCommand({ operationId: "cb02a31e-d25e-4aeb-b238-d76e73f76c24", idempotencyKey: "21e3215b-6ce8-458c-8a0a-f674d878d8dd", customerGlobalId: "8bbd4ddb-f019-4053-86a1-f7564273db6f", name: "Wrong Branch" });
+    wrongBranch.branchGlobalId = "21a4a147-2ae8-4630-88d0-02eeb7d87917";
+    expect((await (await postCommands([wrongBranch])).json()).results[0].status).toBe("rejected");
+
+    await db.update(staffAssignments).set({ is_active: false }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
+    const inactiveActor = makeCommand({ operationId: "6e4f9a39-72bc-4d6d-b2df-0d41f9ebcc7a", idempotencyKey: "6cc00486-4756-442c-b398-0b0ed7922d42", customerGlobalId: "fe0b6f0e-edbe-49e0-b663-600a23cd72a4", name: "Inactive Actor" });
+    expect((await (await postCommands([inactiveActor])).json()).results[0].status).toBe("rejected");
+    expect((await db.select().from(customers)).length).toBe(before);
+    await db.update(staffAssignments).set({ is_active: true }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
   });
 });
