@@ -28,6 +28,7 @@ const productValuesSchema = z.object({ name: z.string().min(1).max(255), descrip
 const payloadSchemas = {
   "customers.create": z.object({ customerGlobalId: z.string().uuid(), values: valuesSchema }),
   "customers.update": z.object({ customerGlobalId: z.string().uuid(), values: valuesSchema }),
+  "customers.delete": z.object({ customerGlobalId: z.string().uuid() }),
   "products.create": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.update": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
 };
@@ -39,7 +40,7 @@ const commandSchema = z.object({
   registerGlobalId: z.string().uuid(),
   actorGlobalId: z.string().uuid(),
   domain: z.enum(["customers", "products"]),
-  action: z.enum(["create", "update"]),
+  action: z.enum(["create", "update", "delete"]),
   schemaVersion: z.literal(1),
   payload: z.record(z.string(), z.unknown()),
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -148,7 +149,9 @@ export async function POST(request: NextRequest) {
         const assignment = await tx.query.staffAssignments.findFirst({ where: and(eq(staffAssignments.user_id, actor.local_id), eq(staffAssignments.branch_id, device.branch_id), eq(staffAssignments.is_active, true)) });
         if (!assignment) return { operationId: command.operationId, status: "rejected", error: "Actor has no active assignment in this branch." };
 
-        const payload = payloadSchemas[`${command.domain}.${command.action}`].safeParse(command.payload);
+        const payloadSchema = payloadSchemas[`${command.domain}.${command.action}` as keyof typeof payloadSchemas];
+        if (!payloadSchema) return { operationId: command.operationId, status: "rejected", error: "Command type is not supported." };
+        const payload = payloadSchema.safeParse(command.payload);
         if (!payload.success) return { operationId: command.operationId, status: "rejected", error: "Customer command payload is invalid." };
         if (command.domain === "products") {
           const productPayload = payload.data as z.infer<typeof payloadSchemas["products.create"]>;
@@ -228,12 +231,16 @@ export async function POST(request: NextRequest) {
             payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted",
           }).returning();
           inboxId = inbox!.id;
-          const [updated] = await tx.update(customers).set(customerPayload.values).where(eq(customers.id, Number(mapping.local_id))).returning();
+          if (command.action === "delete") {
+            await tx.delete(customers).where(eq(customers.id, Number(mapping.local_id)));
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.customer.deleted", entity_type: "customer", entity_id: customerGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
+          } else {
+            await tx.update(customers).set(customerPayload.values).where(eq(customers.id, Number(mapping.local_id)));
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.customer.updated", entity_type: "customer", entity_id: customerGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
+          }
           revision = entityMapping.server_revision + 1;
           await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, mapping.id));
           await tx.update(syncEntityMappings).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncEntityMappings.id, entityMapping.id));
-          await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.customer.updated", entity_type: "customer", entity_id: customerGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
-          void updated;
         }
         const response = { customerGlobalId, revision };
         await tx.update(syncCommandInbox).set({ result: response, processed_at: new Date() }).where(eq(syncCommandInbox.id, inboxId));
@@ -271,7 +278,8 @@ export async function GET(request: NextRequest) {
       eq(syncGlobalEntities.global_id, change.entity_global_id),
     )).limit(1);
     let snapshot: Record<string, unknown> | null = null;
-    if (mapping && change.entity_type === "customer") {
+    if (change.action === "delete") snapshot = null;
+    else if (mapping && change.entity_type === "customer") {
       const customer = await db.query.customers.findFirst({ where: eq(customers.id, Number(mapping.local_id)) });
       if (customer) snapshot = { name: customer.name, email: customer.email, phone: customer.phone, status: customer.status };
     } else if (mapping) {

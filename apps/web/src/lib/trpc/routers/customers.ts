@@ -98,6 +98,21 @@ export const customersRouter = router({
     .input(z.object({ id: z.number() }))
     .output(z.object({ success: z.boolean() }))
     .mutation(async ({ ctx, input }) => {
+      if (process.env.FORNO_DESKTOP_MODE === "1") {
+        return db.transaction(async (tx) => executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "customers",
+          action: "delete",
+          entityType: "customer",
+          localId: (deleted) => deleted ? String(input.id) : null,
+          payload: (customerGlobalId) => ({ customerGlobalId }),
+        }, async (transaction) => {
+          const deleted = await transaction.delete(customers)
+            .where(and(eq(customers.id, input.id), eq(customers.user_uid, ctx.user.id)))
+            .returning({ id: customers.id });
+          return { success: true, deleted: deleted.length > 0 };
+        }));
+      }
       await db
         .delete(customers)
         .where(and(eq(customers.id, input.id), eq(customers.user_uid, ctx.user.id)));

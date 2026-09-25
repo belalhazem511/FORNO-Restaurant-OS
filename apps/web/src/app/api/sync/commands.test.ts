@@ -23,8 +23,8 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function makeCommand(input: { operationId: string; idempotencyKey: string; customerGlobalId: string; name: string; action?: "create" | "update"; baseRevision?: number }) {
-  const payload = { customerGlobalId: input.customerGlobalId, values: { name: input.name, email: `${input.name.toLowerCase().replaceAll(" ", "-")}@sync.test`, phone: null, status: "active" } };
+function makeCommand(input: { operationId: string; idempotencyKey: string; customerGlobalId: string; name?: string; action?: "create" | "update" | "delete"; baseRevision?: number; dependencies?: string[] }) {
+  const payload = input.action === "delete" ? { customerGlobalId: input.customerGlobalId } : { customerGlobalId: input.customerGlobalId, values: { name: input.name!, email: `${input.name!.toLowerCase().replaceAll(" ", "-")}@sync.test`, phone: null, status: "active" } };
   return {
     operationId: input.operationId,
     deviceId,
@@ -39,7 +39,7 @@ function makeCommand(input: { operationId: string; idempotencyKey: string; custo
     payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"),
     idempotencyKey: input.idempotencyKey,
     baseRevision: input.baseRevision ?? 0,
-    dependencies: [],
+    dependencies: input.dependencies ?? [],
     deviceTimestamp: new Date().toISOString(),
   };
 }
@@ -171,5 +171,17 @@ describe("paired customer command processing", () => {
     expect(item.snapshot.imageKey).toBe("media/opaque.webp");
     expect(item.snapshot.id).toBeUndefined();
     expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
+  });
+
+  it("applies a customer deletion as an idempotent tombstone change", async () => {
+    const id = "17e8b0ef-9d8b-44f8-9d97-b8ea984f64f2";
+    const create = makeCommand({ operationId: "643980d1-e0db-4fe4-b64a-1a750f09f19a", idempotencyKey: "790f490a-cf2b-4d0b-b7b7-6bdff0edb023", customerGlobalId: id, name: "Deleted Customer" });
+    expect((await (await postCommands([create])).json()).results[0].status).toBe("accepted");
+    const deletion = makeCommand({ operationId: "0a39d981-6373-48d7-b5fd-42d5d2d32c34", idempotencyKey: "4c089d8b-1a7f-4a79-88e9-6657c8f1b132", customerGlobalId: id, action: "delete", baseRevision: 1, dependencies: [create.operationId] });
+    expect((await (await postCommands([deletion])).json()).results[0].status).toBe("accepted");
+    expect(await db.query.customers.findFirst({ where: eq(customers.email, "deleted-customer@sync.test") })).toBeUndefined();
+    const change = await db.query.syncChangeLog.findFirst({ where: eq(syncChangeLog.entity_global_id, id), orderBy: (table, { desc }) => [desc(table.cursor)] });
+    expect(change?.action).toBe("delete");
+    expect((await (await postCommands([deletion])).json()).results[0].status).toBe("already_applied");
   });
 });

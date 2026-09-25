@@ -86,6 +86,25 @@ describe("desktop customer command boundary", () => {
     expect(update?.base_revision).toBe(1);
   });
 
+  it("queues customer deletion with the same global identity before removing its local row", async () => {
+    const created = await caller.create({ name: "Delete Offline", email: "delete-offline@example.test" });
+    const mapping = await db.query.syncEntityMappings.findFirst({
+      where: and(
+        eq(syncEntityMappings.device_id, deviceId),
+        eq(syncEntityMappings.entity_type, "customer"),
+        eq(syncEntityMappings.local_id, String(created.id)),
+      ),
+    });
+    const result = await caller.delete({ id: created.id });
+    const commands = await db.select().from(syncOutbox).where(eq(syncOutbox.domain, "customers"));
+    const deletion = commands.at(-1);
+    expect(result.success).toBe(true);
+    expect((await db.select().from(customers).where(eq(customers.id, created.id))).length).toBe(0);
+    expect(deletion?.action).toBe("delete");
+    expect(deletion?.payload.customerGlobalId).toBe(mapping?.global_id);
+    expect(deletion?.dependencies).toEqual([commands.at(-2)!.operation_id]);
+  });
+
   it("imports customer snapshots with a local integer ID and advances the cursor transactionally", async () => {
     const response = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
       method: "POST",
@@ -102,6 +121,14 @@ describe("desktop customer command boundary", () => {
     expect(imported?.user_uid).toBe("local-owner");
     expect(Number(mapping?.local_id)).toBe(Number(imported?.id));
     expect(device?.last_pulled_cursor).toBe(41);
+    const deleted = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
+      body: JSON.stringify({ changes: [{ cursor: 43, domain: "customers", entityType: "customer", entityGlobalId: pulledCustomerGlobalId, action: "delete", revision: 2, snapshot: null }], nextCursor: 43 }),
+    }));
+    expect(deleted.status).toBe(200);
+    expect((await db.select().from(customers).where(eq(customers.id, imported!.id))).length).toBe(0);
+    expect((await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "customer"), eq(syncEntityMappings.global_id, pulledCustomerGlobalId)) }))?.server_revision).toBe(2);
   });
 
   it("records product creation and edits as typed local commands", async () => {
@@ -122,8 +149,8 @@ describe("desktop customer command boundary", () => {
       method: "POST",
       headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
       body: JSON.stringify({
-        changes: [{ cursor: 42, domain: "products", entityType: "product", entityGlobalId: pulledProductGlobalId, action: "create", revision: 1, snapshot: { name: "Remote Product", description: null, price: 700, in_stock: 5, category: null, imageKey: "media/opaque.webp" } }],
-        nextCursor: 42,
+        changes: [{ cursor: 44, domain: "products", entityType: "product", entityGlobalId: pulledProductGlobalId, action: "create", revision: 1, snapshot: { name: "Remote Product", description: null, price: 700, in_stock: 5, category: null, imageKey: "media/opaque.webp" } }],
+        nextCursor: 44,
       }),
     }));
     expect(response.status).toBe(200);

@@ -36,10 +36,12 @@ export async function POST(request: NextRequest) {
         previousCursor = change.cursor;
         const isCustomer = change.domain === "customers" && change.entityType === "customer";
         const isProduct = change.domain === "products" && change.entityType === "product";
-        if ((!isCustomer && !isProduct) || !change.snapshot) continue;
-        const parsedSnapshot = isCustomer ? customerSnapshot.safeParse(change.snapshot) : productSnapshot.safeParse(change.snapshot);
-        if (!parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
-        const snapshot = parsedSnapshot.data;
+        if (!isCustomer && !isProduct) continue;
+        const isDelete = change.action === "delete" && change.snapshot === null;
+        if (!isDelete && !change.snapshot) continue;
+        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : productSnapshot.safeParse(change.snapshot);
+        if (parsedSnapshot && !parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
+        const snapshot = parsedSnapshot?.success ? parsedSnapshot.data : null;
         const entityType = change.entityType;
         const mapping = await tx.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, entityType), eq(syncEntityMappings.global_id, change.entityGlobalId)) });
         if (mapping) {
@@ -50,21 +52,24 @@ export async function POST(request: NextRequest) {
             const operationId = randomUUID();
             const idempotencyKey = randomUUID();
             const localPayload = queued.payload;
-            const remotePayload = { [globalKey]: change.entityGlobalId, values: snapshot };
+            const remotePayload = isDelete ? { [globalKey]: change.entityGlobalId, deleted: true } : { [globalKey]: change.entityGlobalId, values: snapshot };
             const payloadHash = createHash("sha256").update(JSON.stringify(remotePayload)).digest("hex");
-            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: operationId, branch_id: device.branch_id, actor_global_id: queued.actor_global_id, domain: "customers", action: "pull_conflict", schema_version: 1, payload: remotePayload, payload_hash: payloadHash, idempotency_key: idempotencyKey, state: "needs_review" }).returning();
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: operationId, branch_id: device.branch_id, actor_global_id: queued.actor_global_id, domain: change.domain, action: "pull_conflict", schema_version: 1, payload: remotePayload, payload_hash: payloadHash, idempotency_key: idempotencyKey, state: "needs_review" }).returning();
             await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: entityType, entity_global_id: change.entityGlobalId, local_payload: localPayload, server_snapshot: remotePayload, reason: `A local ${entityType} edit is pending while an authoritative server change arrived.` });
             const [actor] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"))).limit(1);
             if (actor) await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: `sync.${entityType}.needs_review`, entity_type: entityType, entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
             continue;
           }
-          if (entityType === "customer") await tx.update(customers).set(snapshot as z.infer<typeof customerSnapshot>).where(eq(customers.id, Number(mapping.local_id)));
+          if (isDelete && entityType === "customer") await tx.delete(customers).where(eq(customers.id, Number(mapping.local_id)));
+          else if (isDelete && entityType === "product") await tx.delete(products).where(eq(products.id, Number(mapping.local_id)));
+          else if (entityType === "customer") await tx.update(customers).set(snapshot as z.infer<typeof customerSnapshot>).where(eq(customers.id, Number(mapping.local_id)));
           else {
             const { imageKey, ...values } = snapshot as z.infer<typeof productSnapshot>;
             await tx.update(products).set({ ...values, image_key: imageKey }).where(eq(products.id, Number(mapping.local_id)));
           }
           await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
         } else {
+          if (isDelete) continue;
           const [owner] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"))).limit(1);
           if (!owner) throw new Error("No local user mapping is available to import customer ownership.");
           let localId: string;

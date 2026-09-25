@@ -18,11 +18,13 @@ This is an implementation-status matrix, not a claim that every web mutation is 
 
 ## Mutation coverage still required
 
-All tRPC mutations outside customer create/update and product create/update remain uninstrumented for paired-device synchronization. The current router surfaces include `checkout`, `customers.delete`, `inventory`, `offline`, `orders`, `payment-methods`, `printing`, `procurement`, `products` deletion/image operations, `receiving`, `shifts`, `stock-counts`, `stock-transfers`, `supplier-returns`, and `transactions`. Their existing APIs and local business behavior have not been intentionally changed, but their local writes do not yet atomically enqueue general sync commands.
+All tRPC mutations outside customer create/update/delete and product create/update remain uninstrumented for paired-device synchronization. The current router surfaces include `checkout`, `inventory`, `offline`, `orders`, `payment-methods`, `printing`, `procurement`, `products` deletion/image operations, `receiving`, `shifts`, `stock-counts`, `stock-transfers`, `supplier-returns`, and `transactions`. Their existing APIs and local business behavior have not been intentionally changed, but their local writes do not yet atomically enqueue general sync commands.
 
 The full operation-by-operation catalogue, server permission rule, dependency, conflict rule, and test evidence must be completed as each domain is instrumented. No raw table replication is used. A local record is not centrally synchronized merely because it exists in PGLite.
 
 ## Current transport contract
+
+- Customer deletion now uses a typed `customers.delete` tombstone. The local row is removed only in the same transaction that records its mapping revision, audit, and outbox operation; central pull preserves the global mapping while applying the tombstone.
 
 - Device authentication uses the paired device UUID and bearer secret; the central database stores only the SHA-256 credential hash.
 - Customer command payloads carry stable customer UUIDs and customer values, not cross-device integer IDs.
