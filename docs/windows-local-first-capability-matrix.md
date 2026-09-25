@@ -1,0 +1,30 @@
+# Windows local-first capability matrix
+
+This is an implementation-status matrix, not a claim that every web mutation is synchronized. The current slice proves local transactional command creation and paired-device processing for customer create/update only. Existing web/PWA behavior remains unchanged. A workflow marked pending must not be represented to staff as synchronized.
+
+| Page/workflow | Local read/write | Local transaction boundary | Existing permission | Typed sync command | Idempotency/dependency | Conflict behavior | Evidence |
+|---|---|---|---|---|---|---|---|
+| `/admin/customers` — `customers.list` | Local PGLite read | Query only | Authenticated user; rows scoped by `user_uid` | None required | Read-only | N/A | Existing `customers.test.ts` |
+| `/admin/customers` — `customers.create` | Local write in desktop mode; web path unchanged | Customer + global mapping + audit + outbox in one PGLite transaction | Existing authenticated procedure; central revalidation requires active branch assignment | `customers.create` v1 | UUID operation and idempotency keys; queued edits depend on prior pending commands | Rejected commands remain locally visible; central conflict retained | `customer-sync.test.ts`; `commands.test.ts` |
+| `/admin/customers` — `customers.update` | Local write in desktop mode; web path unchanged | Customer + mapping revision + audit + outbox in one PGLite transaction | Existing authenticated procedure; central revalidation requires active branch assignment | `customers.update` v1 | UUID operation/key; depends on pending customer commands; base revision | Stale central revision creates append-only Needs Review record and preserves both snapshots | `customer-sync.test.ts`; `commands.test.ts` |
+| `/admin/customers` — `customers.delete` | Local web/database behavior only | Existing direct delete | Existing authenticated procedure | **Pending** | No command | No cross-device deletion/recovery rule implemented | Existing `customers.test.ts` |
+| `/admin/pos`, `/admin/orders`, checkout, shifts, transactions, payment methods | Existing local PGLite operations; synchronization instrumentation pending | Existing workflow-specific transaction boundaries | Existing router permissions | **Pending** | Existing keys remain application-level only | **Pending per domain** | Existing POS/order/finance/offline tests; no desktop two-device evidence |
+| `/admin/products`, `/admin/inventory` including recipes, balances, movements, receiving, supplier returns, transfers, counts | Existing local PGLite operations; synchronization instrumentation pending | Existing append-only and workflow transactions | Existing product/inventory/procurement permissions | **Pending** | Existing keys remain application-level only | **Pending per domain** | Existing product/inventory/procurement tests; no desktop two-device evidence |
+| `/print/[jobId]`, `/offline-print/[documentId]`, printing settings/reprints | Existing local document/print behavior; synchronization instrumentation pending | Existing print-job/document boundaries | Existing print permissions | **Pending** | Existing print idempotency retained locally | **Pending** | Existing printing/offline tests; no desktop two-device evidence |
+| `/admin/storage`, `/admin/sync` — device setup, pairing, manual/periodic sync | Local identity, protected device credential, local queue and cursor | Pairing and command inbox/change-log transactions | Owner-authorized pairing; setup operations protected by local Electron token | Customer command transport only | Operation UUID, device ID, idempotency, payload hash, dependencies | Explicit accepted/already-applied/needs-review/rejected/retry-later results; customer pull conflicts preserved | Pairing tests from earlier milestone; new customer command tests |
+| Login, staff, roles, permissions, branch/register assignments | Existing local authentication/database functionality; sync pending | Existing auth/domain boundaries | Existing authorization model | **Pending protected auth channel** | **Pending** | Permission conflicts must not broaden access; not implemented yet | No desktop multi-device evidence |
+
+## Mutation coverage still required
+
+All tRPC mutations outside the two customer commands above remain uninstrumented for paired-device synchronization. The current router surfaces include `checkout`, `customers.delete`, `inventory`, `offline`, `orders`, `payment-methods`, `printing`, `procurement`, `products`, `receiving`, `shifts`, `stock-counts`, `stock-transfers`, `supplier-returns`, and `transactions`. Their existing APIs and local business behavior have not been intentionally changed, but their local writes do not yet atomically enqueue general sync commands.
+
+The full operation-by-operation catalogue, server permission rule, dependency, conflict rule, and test evidence must be completed as each domain is instrumented. No raw table replication is used. A local record is not centrally synchronized merely because it exists in PGLite.
+
+## Current transport contract
+
+- Device authentication uses the paired device UUID and bearer secret; the central database stores only the SHA-256 credential hash.
+- Customer command payloads carry stable customer UUIDs and customer values, not cross-device integer IDs.
+- Change pulls are ordered and limited to 200 events per page. Customer snapshots exclude credentials and financial data.
+- Local application and cursor advancement share a transaction. Pending local customer edits are preserved with a server snapshot in Needs Review.
+- The Electron process owns the protected credential and central URL. The renderer receives only narrow status/manual-sync IPC methods.
+- Cursor-incompatible full snapshots, resumable snapshot checksums, and non-customer domain exporters/importers are not implemented yet.

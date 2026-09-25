@@ -19,6 +19,10 @@ let localServer: ChildProcess | null = null;
 let mainWindow: BrowserWindow | null = null;
 let runtimeState: "setup_required" | "upgrade_required" | "starting" | "ready" | "failed" = "setup_required";
 let shutdownStarted = false;
+let syncTimer: NodeJS.Timeout | undefined;
+let syncRunning = false;
+let syncFailureCount = 0;
+let synchronizationState: "local_only" | "offline" | "pending" | "syncing" | "synced" | "failed" | "needs_review" = "local_only";
 const setupToken = randomBytes(32).toString("hex");
 const schemaVersionPath = join(localPaths.sync, "schema-version.json");
 
@@ -83,11 +87,82 @@ async function readOrCreateDeviceCredential() {
   return credential;
 }
 
-function childEnvironment(secret: string): NodeJS.ProcessEnv {
+async function synchronizeDevice() {
+  if (syncRunning || runtimeState !== "ready") return;
+  syncRunning = true;
+  synchronizationState = "syncing";
+  try {
+    const deviceId = await readOrCreateDeviceId();
+    const localHeaders = { "x-forno-desktop-setup": setupToken };
+    const queueResponse = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { headers: localHeaders, signal: AbortSignal.timeout(10_000) });
+    if (!queueResponse.ok) { synchronizationState = "offline"; return; }
+    const queue = await queueResponse.json() as { paired: boolean; cursor: number; commands: unknown[] };
+    if (!queue.paired) { synchronizationState = "local_only"; return; }
+    const centralUrl = (await readFile(join(localPaths.sync, "central-url"), "utf8")).trim().replace(/\/$/, "");
+    const credential = await readOrCreateDeviceCredential();
+    if (queue.commands.length) {
+      const upload = await fetch(`${centralUrl}/api/sync/commands`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId },
+        body: JSON.stringify({ commands: queue.commands }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (upload.ok) {
+        const response = await upload.json() as { results?: unknown[] };
+        await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { method: "POST", headers: { ...localHeaders, "content-type": "application/json" }, body: JSON.stringify({ results: response.results ?? [] }), signal: AbortSignal.timeout(10_000) });
+      } else throw new Error("Central command upload failed.");
+    }
+    const pull = await fetch(`${centralUrl}/api/sync/commands?cursor=${encodeURIComponent(queue.cursor)}`, {
+      headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (pull.ok) {
+      const page = await pull.json() as { changes: unknown[]; nextCursor: number };
+      const applied = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/apply`, { method: "POST", headers: { ...localHeaders, "content-type": "application/json" }, body: JSON.stringify(page), signal: AbortSignal.timeout(30_000) });
+      if (!applied.ok) throw new Error("Pulled changes could not be applied locally.");
+    } else throw new Error("Central change download failed.");
+    const latest = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { headers: localHeaders, signal: AbortSignal.timeout(10_000) });
+    if (!latest.ok) throw new Error("Local synchronization state could not be read.");
+    const finalQueue = await latest.json() as { paired: boolean; pendingCount: number; needsReviewCount: number; rejectedCount: number };
+    synchronizationState = finalQueue.needsReviewCount ? "needs_review" : finalQueue.rejectedCount ? "failed" : finalQueue.pendingCount ? "pending" : "synced";
+    syncFailureCount = 0;
+  } catch {
+    synchronizationState = "offline";
+    syncFailureCount = Math.min(syncFailureCount + 1, 5);
+  } finally {
+    syncRunning = false;
+  }
+}
+
+async function getSynchronizationStatus() {
+  if (syncRunning) return { state: "syncing" as const };
+  try {
+    const response = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { headers: { "x-forno-desktop-setup": setupToken }, signal: AbortSignal.timeout(5_000) });
+    if (!response.ok) return { state: synchronizationState };
+    const queue = await response.json() as { paired: boolean; pendingCount: number; needsReviewCount: number; rejectedCount: number };
+    const state = !queue.paired ? "local_only" : queue.needsReviewCount ? "needs_review" : queue.rejectedCount ? "failed" : queue.pendingCount ? "pending" : synchronizationState === "offline" ? "offline" : "synced";
+    synchronizationState = state;
+    return { state, pendingCount: queue.pendingCount, needsReviewCount: queue.needsReviewCount };
+  } catch {
+    return { state: synchronizationState === "local_only" ? "local_only" as const : "offline" as const };
+  }
+}
+
+function scheduleSynchronization(delayMs = 30_000) {
+  if (syncTimer) clearTimeout(syncTimer);
+  const backoff = Math.min(15 * 60_000, delayMs * (2 ** syncFailureCount));
+  const delayWithJitter = backoff + Math.floor(Math.random() * Math.max(1, Math.floor(backoff / 5)));
+  syncTimer = setTimeout(() => {
+    void synchronizeDevice().finally(() => scheduleSynchronization());
+  }, delayWithJitter);
+}
+
+async function childEnvironment(secret: string): Promise<NodeJS.ProcessEnv> {
   return {
     ...process.env,
     NODE_ENV: "production",
     FORNO_DESKTOP_MODE: "1",
+    FORNO_DESKTOP_DEVICE_ID: await readOrCreateDeviceId(),
     FORNO_DATABASE_ROLE: "runtime",
     FORNO_DATABASE_DIR: localPaths.database,
     FORNO_MEDIA_DIR: join(localPaths.root, "media"),
@@ -123,7 +198,7 @@ async function applyInitialSchema() {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const webRoot = packagedWebRoot();
-  const env = childEnvironment(await readOrCreateAuthSecret());
+  const env = await childEnvironment(await readOrCreateAuthSecret());
   await mkdir(localPaths.root, { recursive: true });
   await mkdir(dirname(localPaths.database), { recursive: true });
   await mkdir(localPaths.logs, { recursive: true });
@@ -136,7 +211,7 @@ async function startLocalServer() {
   if (localServer && localServer.exitCode === null) return;
   runtimeState = "starting";
   const webRoot = packagedWebRoot();
-  const env = childEnvironment(await readOrCreateAuthSecret());
+  const env = await childEnvironment(await readOrCreateAuthSecret());
   await Promise.all([
     mkdir(join(localPaths.root, "data"), { recursive: true }),
     mkdir(join(localPaths.root, "media"), { recursive: true }),
@@ -161,7 +236,7 @@ async function startLocalServer() {
     if (localServer.exitCode !== null) throw new Error("The local application server stopped during startup.");
     try {
       const response = await fetch(`${SERVER_ORIGIN}/login`, { signal: AbortSignal.timeout(1_000) });
-      if (response.ok) { runtimeState = "ready"; return; }
+      if (response.ok) { runtimeState = "ready"; scheduleSynchronization(1_000); return; }
     } catch { /* Local startup is still in progress. */ }
     await new Promise((resolveWait) => setTimeout(resolveWait, 250));
   }
@@ -258,6 +333,7 @@ function createWindow() {
     },
   });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.on("focus", () => scheduleSynchronization(1_000));
   mainWindow.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   mainWindow.webContents.session.webRequest.onHeadersReceived({ urls: [`${SERVER_ORIGIN}/*`] }, (details, callback) => {
     callback({
@@ -299,6 +375,17 @@ ipcMain.handle("desktop:device-status", async () => ({
   paired: await stat(join(localPaths.sync, "remote-organization-id")).then(() => true, () => false),
   remoteOrganizationId: await readFile(join(localPaths.sync, "remote-organization-id"), "utf8").catch(() => null),
 }));
+
+ipcMain.handle("desktop:sync-status", async (event) => {
+  assertStoragePage(event);
+  return getSynchronizationStatus();
+});
+
+ipcMain.handle("desktop:sync-now", async (event) => {
+  assertStoragePage(event);
+  await synchronizeDevice();
+  return getSynchronizationStatus();
+});
 ipcMain.handle("desktop:pair-device", async (event, input: { centralUrl: string; pairingCode: string; deviceName: string }) => {
   assertStoragePage(event);
   const central = new URL(input.centralUrl);
@@ -315,16 +402,18 @@ ipcMain.handle("desktop:pair-device", async (event, input: { centralUrl: string;
     body: JSON.stringify({ deviceId, credential, pairingCode: input.pairingCode.trim(), deviceName: input.deviceName.trim() }),
     signal: AbortSignal.timeout(20_000),
   });
-  const result = await response.json().catch(() => null) as { organizationId?: string; globalBranchId?: string; globalRegisterId?: string; error?: string } | null;
-  if (!response.ok || !result?.organizationId || !result.globalBranchId || !result.globalRegisterId) throw new Error(result?.error ?? "Device pairing failed; local operations remain available.");
+  const result = await response.json().catch(() => null) as { organizationId?: string; globalBranchId?: string; globalRegisterId?: string; globalActorId?: string; error?: string } | null;
+  if (!response.ok || !result?.organizationId || !result.globalBranchId || !result.globalRegisterId || !result.globalActorId) throw new Error(result?.error ?? "Device pairing failed; local operations remain available.");
   const localResult = await fetch(`${SERVER_ORIGIN}/api/desktop/pairing-complete`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-forno-desktop-setup": setupToken },
-    body: JSON.stringify({ deviceId, organizationId: result.organizationId, globalBranchId: result.globalBranchId, globalRegisterId: result.globalRegisterId }),
+    body: JSON.stringify({ deviceId, organizationId: result.organizationId, globalBranchId: result.globalBranchId, globalRegisterId: result.globalRegisterId, globalActorId: result.globalActorId }),
     signal: AbortSignal.timeout(10_000),
   });
   if (!localResult.ok) throw new Error((await localResult.json().catch(() => null))?.error ?? "Central pairing succeeded, but local identity reconciliation must be retried.");
   await writeFile(join(localPaths.sync, "remote-organization-id"), result.organizationId, { mode: 0o600 });
+  await writeFile(join(localPaths.sync, "central-url"), `${central.origin}${centralBasePath}`.replace(/\/$/, ""), { mode: 0o600 });
+  void synchronizeDevice();
   return { paired: true as const, deviceId, organizationId: result.organizationId };
 });
 ipcMain.handle("desktop:create-backup", async (event) => {
@@ -362,7 +451,7 @@ ipcMain.handle("desktop:upgrade-local-database", async (_event, confirmed: boole
   try {
     const backup = await createLocalBackup(localPaths.root);
     const webRoot = packagedWebRoot();
-    const env = childEnvironment(await readOrCreateAuthSecret());
+    const env = await childEnvironment(await readOrCreateAuthSecret());
     await runElectronNode(join(webRoot, "node_modules", "drizzle-kit", "bin.cjs"), ["push"], webRoot, env);
     await writeLocalSchemaVersion(schemaVersionPath);
     await startLocalServer();
@@ -386,6 +475,7 @@ app.on("second-instance", () => mainWindow?.focus());
 if (hasSingleInstance) app.whenReady().then(createWindow);
 app.on("window-all-closed", () => app.quit());
 app.on("before-quit", (event) => {
+  if (syncTimer) clearTimeout(syncTimer);
   if (!localServer || shutdownStarted) return;
   event.preventDefault();
   shutdownStarted = true;

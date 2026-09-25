@@ -3,6 +3,7 @@ import { protectedProcedure, router } from "../init";
 import { db } from "@/lib/db";
 import { customers } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
+import { recordLocalCustomerCommand } from "@/lib/sync/customer-command";
 
 const customerSchema = z.object({
   id: z.number(),
@@ -35,11 +36,15 @@ export const customersRouter = router({
     )
     .output(customerSchema)
     .mutation(async ({ ctx, input }) => {
-      const [data] = await db
-        .insert(customers)
-        .values({ ...input, user_uid: ctx.user.id })
-        .returning();
-      return data;
+      if (process.env.FORNO_DESKTOP_MODE !== "1") {
+        const [data] = await db.insert(customers).values({ ...input, user_uid: ctx.user.id }).returning();
+        return data;
+      }
+      return db.transaction(async (tx) => {
+        const [data] = await tx.insert(customers).values({ ...input, user_uid: ctx.user.id }).returning();
+        await recordLocalCustomerCommand(tx, { action: "create", customer: data!, actorId: ctx.user.id });
+        return data!;
+      });
     }),
 
   update: protectedProcedure
@@ -56,6 +61,16 @@ export const customersRouter = router({
     .output(customerSchema)
     .mutation(async ({ ctx, input }) => {
       const { id, ...data } = input;
+      if (process.env.FORNO_DESKTOP_MODE === "1") {
+        return db.transaction(async (tx) => {
+          const [updated] = await tx.update(customers)
+            .set({ ...data, user_uid: ctx.user.id })
+            .where(and(eq(customers.id, id), eq(customers.user_uid, ctx.user.id)))
+            .returning();
+          if (updated) await recordLocalCustomerCommand(tx, { action: "update", customer: updated, actorId: ctx.user.id });
+          return updated;
+        });
+      }
       const [updated] = await db
         .update(customers)
         .set({ ...data, user_uid: ctx.user.id })

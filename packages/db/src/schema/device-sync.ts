@@ -1,4 +1,4 @@
-import { check, index, integer, jsonb, pgTable, serial, text, timestamp, uniqueIndex, varchar, bigserial } from "drizzle-orm/pg-core";
+import { bigint, check, index, integer, jsonb, pgTable, serial, text, timestamp, uniqueIndex, varchar, bigserial } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { branches } from "./restaurant";
 import { cashierRegisters } from "./finance";
@@ -51,6 +51,7 @@ export const syncDevices = pgTable("sync_devices", {
   last_seen_at: timestamp("last_seen_at"),
   revoked_at: timestamp("revoked_at"),
   last_synchronized_at: timestamp("last_synchronized_at"),
+  last_pulled_cursor: bigint("last_pulled_cursor", { mode: "number" }).notNull().default(0),
 }, (table) => [
   uniqueIndex("sync_devices_credential_hash_uidx").on(table.credential_hash),
   index("sync_devices_org_status_idx").on(table.organization_id, table.status),

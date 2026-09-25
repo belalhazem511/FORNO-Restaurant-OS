@@ -72,6 +72,15 @@ const TABLES: PgTable[] = [
   schema.offlinePriceSnapshots,
   schema.offlineSyncRecords,
   schema.transactions,
+  schema.syncOrganizations,
+  schema.syncOrganizationBranches,
+  schema.syncDevices,
+  schema.syncEntityMappings,
+  schema.syncGlobalEntities,
+  schema.syncOutbox,
+  schema.syncCommandInbox,
+  schema.syncChangeLog,
+  schema.syncConflicts,
 ];
 
 function tableToDDL(table: PgTable): string {
@@ -171,7 +180,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_lines_return_receipt_line_uidx
 CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_status_history_idempotency_uidx ON supplier_return_status_history (idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_reversals_return_uidx ON supplier_return_reversals (supplier_return_id);
 CREATE UNIQUE INDEX IF NOT EXISTS supplier_return_reversals_idempotency_uidx ON supplier_return_reversals (idempotency_key);
-CREATE UNIQUE INDEX IF NOT EXISTS stock_movements_idempotency_uidx ON stock_movements (idempotency_key);`;
+CREATE UNIQUE INDEX IF NOT EXISTS stock_movements_idempotency_uidx ON stock_movements (idempotency_key);
+ALTER TABLE sync_devices ALTER COLUMN last_pulled_cursor SET DEFAULT 0;
+ALTER TABLE sync_global_entities ALTER COLUMN server_revision SET DEFAULT 1;
+ALTER TABLE sync_entity_mappings ALTER COLUMN local_revision SET DEFAULT 1;
+ALTER TABLE sync_entity_mappings ALTER COLUMN server_revision SET DEFAULT 0;
+ALTER TABLE sync_outbox ALTER COLUMN state SET DEFAULT 'pending';
+ALTER TABLE sync_outbox ALTER COLUMN attempts SET DEFAULT 0;
+ALTER TABLE sync_outbox ALTER COLUMN base_revision SET DEFAULT 0;
+ALTER TABLE sync_outbox ALTER COLUMN dependencies SET DEFAULT '[]'::jsonb;
+ALTER TABLE sync_conflicts ALTER COLUMN state SET DEFAULT 'needs_review';
+CREATE UNIQUE INDEX IF NOT EXISTS sync_global_entities_id_uidx ON sync_global_entities (organization_id, entity_type, global_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_global_entities_local_uidx ON sync_global_entities (organization_id, entity_type, local_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_entity_mappings_local_uidx ON sync_entity_mappings (device_id, entity_type, local_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_entity_mappings_device_global_uidx ON sync_entity_mappings (device_id, entity_type, global_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_outbox_operation_uidx ON sync_outbox (operation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_outbox_device_idempotency_uidx ON sync_outbox (device_id, idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_inbox_device_operation_uidx ON sync_command_inbox (device_id, operation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_inbox_device_idempotency_uidx ON sync_command_inbox (device_id, idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_change_log_source_operation_uidx ON sync_change_log (organization_id, source_operation_id, entity_global_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sync_conflicts_inbox_entity_uidx ON sync_conflicts (inbox_id, entity_type, entity_global_id);`;
 
 export function createTestDb() {
   const pg = new PGlite();

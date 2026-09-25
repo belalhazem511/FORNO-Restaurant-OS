@@ -25,7 +25,8 @@ export async function POST(request: NextRequest) {
         if (existing?.status === "paired" && existing.credential_hash && timingSafeEqual(Buffer.from(existing.credential_hash), Buffer.from(credentialHash))) {
           const [branchIdentity] = await tx.select().from(syncOrganizationBranches).where(eq(syncOrganizationBranches.branch_id, existing.branch_id)).limit(1);
           const [registerIdentity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, existing.organization_id), eq(syncGlobalEntities.entity_type, "register"), eq(syncGlobalEntities.local_id, String(existing.register_id)))).limit(1);
-          if (branchIdentity && registerIdentity) return { organizationId: existing.organization_id, branchId: existing.branch_id, globalBranchId: branchIdentity.global_branch_id, globalRegisterId: registerIdentity.global_id };
+          const [actorIdentity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, existing.organization_id), eq(syncGlobalEntities.entity_type, "user"))).limit(1);
+          if (branchIdentity && registerIdentity && actorIdentity) return { organizationId: existing.organization_id, branchId: existing.branch_id, globalBranchId: branchIdentity.global_branch_id, globalRegisterId: registerIdentity.global_id, globalActorId: actorIdentity.global_id };
         }
         throw new PairingError("The pairing code is invalid or expired.");
       }
@@ -45,8 +46,9 @@ export async function POST(request: NextRequest) {
       await tx.insert(auditLogs).values({ branch_id: pairing.branch_id, actor_user_id: pairing.created_by, action: "sync.device.paired", entity_type: "sync_device", entity_id: deviceId, details: JSON.stringify({ organizationId: pairing.organization_id, registerId: pairing.register_id, deviceName }) });
       const [branchIdentity] = await tx.select().from(syncOrganizationBranches).where(eq(syncOrganizationBranches.branch_id, pairing.branch_id)).limit(1);
       const [registerIdentity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, pairing.organization_id), eq(syncGlobalEntities.entity_type, "register"), eq(syncGlobalEntities.local_id, String(pairing.register_id)))).limit(1);
-      if (!branchIdentity || !registerIdentity) throw new PairingError("The assigned global branch/register identities are missing.");
-      return { organizationId: pairing.organization_id, branchId: pairing.branch_id, globalBranchId: branchIdentity.global_branch_id, globalRegisterId: registerIdentity.global_id };
+      const [actorIdentity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, pairing.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, pairing.created_by))).limit(1);
+      if (!branchIdentity || !registerIdentity || !actorIdentity) throw new PairingError("The assigned global branch/register/actor identities are missing.");
+      return { organizationId: pairing.organization_id, branchId: pairing.branch_id, globalBranchId: branchIdentity.global_branch_id, globalRegisterId: registerIdentity.global_id, globalActorId: actorIdentity.global_id };
     });
     return NextResponse.json({ paired: true, ...paired }, { headers: { "cache-control": "no-store" } });
   } catch (error) {

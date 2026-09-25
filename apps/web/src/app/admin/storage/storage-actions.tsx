@@ -12,6 +12,7 @@ export function StorageActions() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [device, setDevice] = useState<{ deviceId: string; paired: boolean; remoteOrganizationId: string | null } | null>(null);
+  const [syncStatus, setSyncStatus] = useState<{ state: string; pendingCount?: number; needsReviewCount?: number }>({ state: "local_only" });
   const [centralUrl, setCentralUrl] = useState("");
   const [pairingCode, setPairingCode] = useState("");
   const [deviceName, setDeviceName] = useState("");
@@ -20,8 +21,21 @@ export function StorageActions() {
   const [issuedCode, setIssuedCode] = useState("");
 
   useEffect(() => {
-    if (window.fornoDesktop) void window.fornoDesktop.getDeviceStatus().then(setDevice).catch(() => undefined);
+    if (window.fornoDesktop) {
+      void window.fornoDesktop.getDeviceStatus().then(setDevice).catch(() => undefined);
+      void window.fornoDesktop.getSyncStatus().then(setSyncStatus).catch(() => undefined);
+    }
   }, []);
+
+  const syncNow = async () => {
+    if (!window.fornoDesktop) return;
+    setSyncStatus({ state: "syncing" });
+    try {
+      setSyncStatus(await window.fornoDesktop.syncNow());
+    } catch {
+      setSyncStatus({ state: "offline" });
+    }
+  };
 
   const createBackup = async () => {
     if (!window.fornoDesktop) return setMessage(ar ? "النسخ الاحتياطي متاح في تطبيق Windows فقط." : "Backups are available in the Windows application.");
@@ -111,6 +125,10 @@ export function StorageActions() {
       <CardContent className="space-y-4">
         {window.fornoDesktop ? <>
           <p className="break-all text-sm">{ar ? "معرّف الجهاز" : "Device ID"}: {device?.deviceId ?? (ar ? "جارٍ التحميل" : "Loading")}</p>
+          <div className="flex flex-wrap items-center gap-3">
+            <p role="status" aria-live="polite" className="text-sm">{ar ? "المزامنة" : "Synchronization"}: {syncStatus.state.replaceAll("_", " ")}{syncStatus.pendingCount ? ` (${syncStatus.pendingCount})` : ""}{syncStatus.needsReviewCount ? ` · ${ar ? "بحاجة إلى مراجعة" : "Needs Review"}: ${syncStatus.needsReviewCount}` : ""}</p>
+            <Button variant="outline" disabled={busy || syncStatus.state === "syncing" || !device?.paired} onClick={() => void syncNow()}>{ar ? "مزامنة الآن" : "Sync now"}</Button>
+          </div>
           <p className="text-sm">{ar ? "الحالة" : "Status"}: {device?.paired ? (ar ? "مقترن" : "Paired") : (ar ? "محلي فقط" : "Local Only")}</p>
           {!device?.paired && <>
             <Input label={ar ? "عنوان الخادم المركزي" : "Central server URL"} value={centralUrl} onChange={(event) => setCentralUrl(event.target.value)} />

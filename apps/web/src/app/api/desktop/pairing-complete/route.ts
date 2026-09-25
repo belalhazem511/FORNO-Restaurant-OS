@@ -19,7 +19,8 @@ export async function POST(request: NextRequest) {
   const organizationId = typeof body?.organizationId === "string" ? body.organizationId : "";
   const globalBranchId = typeof body?.globalBranchId === "string" ? body.globalBranchId : "";
   const globalRegisterId = typeof body?.globalRegisterId === "string" ? body.globalRegisterId : "";
-  if (![deviceId, organizationId, globalBranchId, globalRegisterId].every((value) => /^[0-9a-f-]{36}$/i.test(value))) return NextResponse.json({ error: "Pairing identity is invalid." }, { status: 400 });
+  const globalActorId = typeof body?.globalActorId === "string" ? body.globalActorId : "";
+  if (![deviceId, organizationId, globalBranchId, globalRegisterId, globalActorId].every((value) => /^[0-9a-f-]{36}$/i.test(value))) return NextResponse.json({ error: "Pairing identity is invalid." }, { status: 400 });
   try {
     await db.transaction(async (tx) => {
       const [device] = await tx.select().from(syncDevices).where(eq(syncDevices.id, deviceId)).for("update").limit(1);
@@ -38,6 +39,8 @@ export async function POST(request: NextRequest) {
         await tx.update(syncGlobalEntities).set({ global_id: identity.globalId, updated_at: new Date() }).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, identity.type), eq(syncGlobalEntities.local_id, identity.localId)));
         await tx.update(syncEntityMappings).set({ global_id: identity.globalId, updated_at: new Date() }).where(and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, identity.type), eq(syncEntityMappings.local_id, identity.localId)));
       }
+      await tx.update(syncGlobalEntities).set({ global_id: globalActorId, updated_at: new Date() }).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, ownerIdentity.local_id)));
+      await tx.update(syncEntityMappings).set({ global_id: globalActorId, updated_at: new Date() }).where(and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.local_id, ownerIdentity.local_id)));
       await tx.update(syncOrganizationBranches).set({ global_branch_id: globalBranchId }).where(and(eq(syncOrganizationBranches.organization_id, device.organization_id), eq(syncOrganizationBranches.branch_id, device.branch_id)));
       await tx.update(syncOrganizations).set({ remote_organization_id: organizationId }).where(eq(syncOrganizations.id, device.organization_id));
       await tx.update(syncDevices).set({ status: "paired" }).where(eq(syncDevices.id, deviceId));

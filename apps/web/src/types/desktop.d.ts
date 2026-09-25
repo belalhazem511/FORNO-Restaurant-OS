@@ -7,6 +7,8 @@ declare global {
       completeOwnerSetup(input: { name: string; email: string; password: string; branchName: string; registerName: string; locale: "en" | "ar" }): Promise<void>;
       getRuntimeStatus(): Promise<{ state: "setup_required" | "upgrade_required" | "starting" | "ready" | "failed"; version: string }>;
       getDeviceStatus(): Promise<{ deviceId: string; paired: boolean; remoteOrganizationId: string | null }>;
+      getSyncStatus(): Promise<{ state: "local_only" | "offline" | "pending" | "syncing" | "synced" | "failed" | "needs_review"; pendingCount?: number; needsReviewCount?: number }>;
+      syncNow(): Promise<{ state: "local_only" | "offline" | "pending" | "syncing" | "synced" | "failed" | "needs_review"; pendingCount?: number; needsReviewCount?: number }>;
       pairDevice(input: { centralUrl: string; pairingCode: string; deviceName: string }): Promise<{ paired: true; deviceId: string; organizationId: string }>;
       getDeviceStatus(): Promise<{ deviceId: string; paired: boolean; remoteOrganizationId: string | null }>;
       pairDevice(input: { centralUrl: string; pairingCode: string; deviceName: string }): Promise<{ paired: true; deviceId: string; organizationId: string }>;
