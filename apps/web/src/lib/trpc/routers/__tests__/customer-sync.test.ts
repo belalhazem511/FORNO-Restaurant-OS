@@ -188,6 +188,49 @@ describe("desktop customer command boundary", () => {
     expect(movementCommand?.dependencies).toEqual([command!.operation_id]);
     expect((await db.select().from(shiftCashMovements)).length).toBe(1);
     expect((await db.select().from(transactions).where(eq(transactions.category, "cash_in"))).length).toBe(1);
+    const deviceBId = "c8d1dc2f-7cd4-4e66-bcb0-ccdb0b04ff59";
+    const organizationBId = "548b22d5-b7b5-4f18-bf6f-ea72630fe7b8";
+    const [branchB] = await db.insert(branches).values({ code: "LOCALB", name_en: "Local B", name_ar: "فرع ب", currency: "EGP", timezone: "Africa/Cairo", is_active: true }).returning();
+    const [registerB] = await db.insert(cashierRegisters).values({ branch_id: branchB!.id, code: "BREG", name_en: "Register B", name_ar: "كاشير ب", is_active: true }).returning();
+    await db.insert(user).values({ id: "local-owner-b", name: "Local Owner B", email: "owner-b@local.test", emailVerified: false });
+    await db.insert(staffAssignments).values({ user_id: "local-owner-b", branch_id: branchB!.id, role: "owner", is_active: true });
+    await db.insert(syncOrganizations).values({ id: organizationBId, name: "Device B" });
+    await db.insert(syncDevices).values({ id: deviceBId, organization_id: organizationBId, display_name: "Device B", branch_id: branchB!.id, register_id: registerB!.id, status: "local_only" });
+    await db.insert(syncEntityMappings).values([
+      { organization_id: organizationBId, device_id: deviceBId, branch_id: branchB!.id, entity_type: "branch", global_id: branchGlobalId, local_id: String(branchB!.id) },
+      { organization_id: organizationBId, device_id: deviceBId, branch_id: branchB!.id, entity_type: "register", global_id: registerGlobalId, local_id: String(registerB!.id) },
+      { organization_id: organizationBId, device_id: deviceBId, branch_id: branchB!.id, entity_type: "user", global_id: actorGlobalId, local_id: "local-owner-b" },
+    ]);
+    await db.insert(syncGlobalEntities).values([
+      { organization_id: organizationBId, branch_id: branchB!.id, entity_type: "branch", global_id: branchGlobalId, local_id: String(branchB!.id) },
+      { organization_id: organizationBId, branch_id: branchB!.id, entity_type: "register", global_id: registerGlobalId, local_id: String(registerB!.id) },
+      { organization_id: organizationBId, branch_id: branchB!.id, entity_type: "user", global_id: actorGlobalId, local_id: "local-owner-b" },
+    ]);
+    const movement = (await db.select().from(shiftCashMovements)).at(-1)!;
+    const previousDeviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+    process.env.FORNO_DESKTOP_DEVICE_ID = deviceBId;
+    let importedStatus = 0;
+    let importError: string | undefined;
+    try {
+      const imported = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
+        body: JSON.stringify({ changes: [
+          { cursor: 1, domain: "shifts", entityType: "cashier_shift", entityGlobalId: mapping!.global_id, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 1200, openedAt: shift.opened_at.toISOString() } },
+          { cursor: 2, domain: "shifts", entityType: "cash_movement", entityGlobalId: movementCommand!.payload.cashMovementGlobalId, action: "drawer_adjust", revision: 1, snapshot: { shiftGlobalId: mapping!.global_id, actorGlobalId, type: movement.type, amount: movement.amount, reason: movement.reason, createdAt: movement.created_at.toISOString() } },
+        ], nextCursor: 2 }),
+      }));
+      importedStatus = imported.status;
+      importError = (await imported.json()).error;
+    } finally {
+      if (previousDeviceId === undefined) delete process.env.FORNO_DESKTOP_DEVICE_ID;
+      else process.env.FORNO_DESKTOP_DEVICE_ID = previousDeviceId;
+    }
+    expect(importError).toBeUndefined();
+    expect(importedStatus).toBe(200);
+    expect((await db.select().from(cashierShifts)).length).toBe(2);
+    expect((await db.select().from(shiftCashMovements)).length).toBe(2);
+    expect((await db.select().from(transactions).where(eq(transactions.category, "cash_in"))).length).toBe(2);
     const remoteShiftGlobalId = "7501a95a-c582-4a3d-921f-c06d28053a77";
     const applied = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
       method: "POST",
@@ -195,7 +238,7 @@ describe("desktop customer command boundary", () => {
       body: JSON.stringify({ changes: [{ cursor: 45, domain: "shifts", entityType: "cashier_shift", entityGlobalId: remoteShiftGlobalId, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 900, openedAt: new Date().toISOString() } }], nextCursor: 45 }),
     }));
     expect(applied.status).toBe(200);
-    expect((await db.select().from(cashierShifts).where(eq(cashierShifts.status, "open"))).length).toBe(1);
+    expect((await db.select().from(cashierShifts).where(and(eq(cashierShifts.branch_id, branch!.id), eq(cashierShifts.status, "open")))).length).toBe(1);
     expect((await db.select().from(syncConflicts).where(eq(syncConflicts.entity_global_id, remoteShiftGlobalId))).length).toBe(1);
   });
 });

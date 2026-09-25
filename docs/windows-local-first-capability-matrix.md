@@ -26,6 +26,7 @@ The full operation-by-operation catalogue, server permission rule, dependency, c
 
 - `shifts.open` is now a typed command. Central processing revalidates the paired register and active cashier assignment, detects register/cashier overlap, creates mapping/audit/change event transactionally, and marks overlaps Needs Review; shift snapshots import locally with overlap protection.
 - `shifts.drawer_adjust` is now a typed command dependent on the shift-open operation. Central authorization rechecks `cash:adjust`; cash movement, completed financial transaction, mapping, audit, inbox result, and ordered change are written in one transaction. Denials are audited without financial effects.
+- The focused isolated PGLite characterization imports a shift and drawer movement onto a second device using different local branch, register, and user IDs while retaining global identities and exactly one local movement/transaction per device.
 
 - Customer and product deletion are synchronized as typed tombstones, with local deletion, mapping revision, audit, and outbox committed together. Peers retain the UUID mapping after deleting the local row; rejected payload hashes are audited without applying business data.
 
