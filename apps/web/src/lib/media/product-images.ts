@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 
 export const PRODUCT_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const MIME_EXTENSIONS = new Map([
@@ -45,6 +45,24 @@ export async function writeProductImage(productId: number, bytes: Buffer, mimeTy
   await mkdir(join(root, "products", String(productId)), { recursive: true });
   await writeFile(target, bytes, { flag: "wx" });
   return key;
+}
+
+export async function storeSynchronizedProductImage(key: string, bytes: Buffer, mimeType: string, contentHash: string) {
+  assertMediaWritesAllowed();
+  const extension = validateProductImage(bytes, mimeType, key.slice(key.lastIndexOf("/") + 1));
+  if (!key.endsWith(`.${extension}`)) throw new Error("Product image key does not match its content type.");
+  const actualHash = createHash("sha256").update(bytes).digest("hex");
+  if (!/^[0-9a-f]{64}$/.test(contentHash) || actualHash !== contentHash) throw new Error("Product image content hash does not match.");
+  const target = productImagePath(key);
+  await mkdir(dirname(target), { recursive: true });
+  try {
+    await writeFile(target, bytes, { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const existing = await readFile(target);
+    if (createHash("sha256").update(existing).digest("hex") !== actualHash) throw new Error("A different image already exists at this key.");
+  }
+  return actualHash;
 }
 
 export function productImagePath(key: string, env: Record<string, string | undefined> = process.env) {

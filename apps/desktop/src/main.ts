@@ -1,8 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { desktopPaths } from "./runtime-paths.js";
 import { createLocalBackup, restoreLocalBackup } from "./local-backups.js";
 import { CURRENT_LOCAL_SCHEMA_VERSION, readLocalSchemaVersion, writeLocalSchemaVersion } from "./local-schema-version.js";
@@ -108,7 +108,31 @@ async function synchronizeDevice() {
         signal: AbortSignal.timeout(30_000),
       });
       if (upload.ok) {
-        const response = await upload.json() as { results?: unknown[] };
+        const response = await upload.json() as { results?: Array<{ operationId: string; status: string }> };
+        const resultsByOperation = new Map((response.results ?? []).map((result) => [result.operationId, result]));
+        for (const raw of queue.commands as Array<{ operationId: string; domain: string; action: string; payload: Record<string, unknown> }>) {
+          const result = resultsByOperation.get(raw.operationId);
+          const values = raw.payload.values as { imageKey?: unknown } | undefined;
+          const productGlobalId = raw.payload.productGlobalId;
+          if (!result || (result.status !== "accepted" && result.status !== "already_applied") || raw.domain !== "products" || typeof values?.imageKey !== "string" || typeof productGlobalId !== "string") continue;
+          const key = values.imageKey;
+          const localImageUrl = `${SERVER_ORIGIN}/media/${key.split("/").map(encodeURIComponent).join("/")}`;
+          const image = await fetch(localImageUrl, { signal: AbortSignal.timeout(15_000) });
+          if (!image.ok) throw new Error("A locally referenced product image could not be read for synchronization.");
+          const bytes = Buffer.from(await image.arrayBuffer());
+          const contentHash = createHash("sha256").update(bytes).digest("hex");
+          const form = new FormData();
+          form.set("productGlobalId", productGlobalId);
+          form.set("key", key);
+          form.set("file", new Blob([bytes], { type: image.headers.get("content-type") ?? "application/octet-stream" }), basename(key));
+          const mediaUpload = await fetch(`${centralUrl}/api/sync/media`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId, "x-forno-content-sha256": contentHash },
+            body: form,
+            signal: AbortSignal.timeout(30_000),
+          });
+          if (!mediaUpload.ok) throw new Error("Central product media upload failed.");
+        }
         await fetch(`${SERVER_ORIGIN}/api/desktop/sync/queue`, { method: "POST", headers: { ...localHeaders, "content-type": "application/json" }, body: JSON.stringify({ results: response.results ?? [] }), signal: AbortSignal.timeout(10_000) });
       } else throw new Error("Central command upload failed.");
     }
@@ -118,6 +142,26 @@ async function synchronizeDevice() {
     });
     if (pull.ok) {
       const page = await pull.json() as { changes: unknown[]; nextCursor: number };
+      for (const raw of page.changes as Array<{ domain?: string; entityType?: string; snapshot?: { imageKey?: unknown } | null }>) {
+        const key = raw.domain === "products" && raw.entityType === "product" && typeof raw.snapshot?.imageKey === "string" ? raw.snapshot.imageKey : null;
+        if (!key) continue;
+        const mediaUrl = `${centralUrl}/media/${key.split("/").map(encodeURIComponent).join("/")}`;
+        const image = await fetch(mediaUrl, { signal: AbortSignal.timeout(15_000) });
+        if (image.status === 404) continue;
+        if (!image.ok) throw new Error("Product media download failed; the change cursor was not advanced.");
+        const bytes = Buffer.from(await image.arrayBuffer());
+        const contentHash = createHash("sha256").update(bytes).digest("hex");
+        const form = new FormData();
+        form.set("key", key);
+        form.set("file", new Blob([bytes], { type: image.headers.get("content-type") ?? "application/octet-stream" }), basename(key));
+        const cached = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/media`, {
+          method: "POST",
+          headers: { ...localHeaders, "x-forno-content-sha256": contentHash },
+          body: form,
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!cached.ok) throw new Error("Product media could not be cached locally; the change cursor was not advanced.");
+      }
       const applied = await fetch(`${SERVER_ORIGIN}/api/desktop/sync/apply`, { method: "POST", headers: { ...localHeaders, "content-type": "application/json" }, body: JSON.stringify(page), signal: AbortSignal.timeout(30_000) });
       if (!applied.ok) throw new Error("Pulled changes could not be applied locally.");
     } else throw new Error("Central change download failed.");

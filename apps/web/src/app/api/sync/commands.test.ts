@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { NextRequest } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, SCHEMA_DDL } from "@/lib/trpc/routers/__tests__/helpers";
 import { auditLogs, branches, cashierRegisters, customers, products, staffAssignments, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, user } from "@/lib/db/schema";
+import { productImagePath } from "@/lib/media/product-images";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
 const { GET, POST } = await import("./commands/route");
+const { POST: uploadProductMedia } = await import("./media/route");
 const deviceId = "b2d90704-052a-4a37-a0fc-0464bf8c9e0a";
 const organizationId = "ce9b25aa-39de-41c8-8d07-6c4ad0b5b967";
 const branchGlobalId = "8fb88e82-24a4-483e-b931-e5d23e4f8d0c";
@@ -197,5 +202,43 @@ describe("paired customer command processing", () => {
     const change = await db.query.syncChangeLog.findFirst({ where: eq(syncChangeLog.entity_global_id, id), orderBy: (table, { desc }) => [desc(table.cursor)] });
     expect(change?.action).toBe("delete");
     expect((await (await postCommands([deletion])).json()).results[0].status).toBe("already_applied");
+  });
+
+  it("accepts only paired, hash-verified media for the authoritative product reference", async () => {
+    const mediaDirectory = await mkdtemp(join(tmpdir(), "forno-central-media-test-"));
+    const oldMediaDirectory = process.env.FORNO_MEDIA_DIR;
+    const oldDatabaseRole = process.env.FORNO_DATABASE_ROLE;
+    process.env.FORNO_MEDIA_DIR = mediaDirectory;
+    process.env.FORNO_DATABASE_ROLE = "test";
+    const globalId = "6c5a66bd-5596-47f9-92bf-ab99c64e263a";
+    const key = "products/314/12345678-1234-1234-1234-123456789012.png";
+    const [product] = await db.insert(products).values({ name: "Media Sync", description: null, price: 100, in_stock: 1, category: null, image_key: key, user_uid: "central-owner" }).returning();
+    await db.insert(syncGlobalEntities).values({ organization_id: organizationId, branch_id: centralBranchId, entity_type: "product", global_id: globalId, local_id: String(product!.id) });
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p7sAAAAASUVORK5CYII=", "base64");
+    const contentHash = createHash("sha256").update(png).digest("hex");
+    const requestFor = (hash = contentHash) => {
+      const form = new FormData();
+      form.set("productGlobalId", globalId);
+      form.set("key", key);
+      form.set("file", new File([png], "image.png", { type: "image/png" }));
+      return new NextRequest("http://localhost/api/sync/media", { method: "POST", headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId, "x-forno-content-sha256": hash }, body: form });
+    };
+    try {
+      expect((await uploadProductMedia(requestFor())).status).toBe(200);
+      expect(await readFile(productImagePath(key))).toEqual(png);
+      expect((await uploadProductMedia(requestFor())).status).toBe(200);
+      expect((await uploadProductMedia(requestFor("0".repeat(64)))).status).toBe(400);
+      const unauthorizedForm = new FormData();
+      unauthorizedForm.set("productGlobalId", globalId);
+      unauthorizedForm.set("key", key);
+      unauthorizedForm.set("file", new File([png], "image.png", { type: "image/png" }));
+      expect((await uploadProductMedia(new NextRequest("http://localhost/api/sync/media", { method: "POST", body: unauthorizedForm }))).status).toBe(401);
+    } finally {
+      if (oldMediaDirectory === undefined) delete process.env.FORNO_MEDIA_DIR;
+      else process.env.FORNO_MEDIA_DIR = oldMediaDirectory;
+      if (oldDatabaseRole === undefined) delete process.env.FORNO_DATABASE_ROLE;
+      else process.env.FORNO_DATABASE_ROLE = oldDatabaseRole;
+      await rm(mediaDirectory, { recursive: true, force: true });
+    }
   });
 });

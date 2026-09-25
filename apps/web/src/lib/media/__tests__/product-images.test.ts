@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PRODUCT_IMAGE_MAX_BYTES, productImagePath, removeProductImage, validateProductImage, writeProductImage } from "../product-images";
+import { PRODUCT_IMAGE_MAX_BYTES, productImagePath, removeProductImage, storeSynchronizedProductImage, validateProductImage, writeProductImage } from "../product-images";
 
 const directories: string[] = [];
 const previousMediaDir = process.env.FORNO_MEDIA_DIR;
@@ -46,6 +47,20 @@ describe("product image storage", () => {
     expect(() => validateProductImage(Buffer.alloc(PRODUCT_IMAGE_MAX_BYTES + 1), "image/png", "x.png")).toThrow();
     expect(() => validateProductImage(valid, "image/png", "../x.png")).toThrow();
     expect(() => productImagePath("products/42/../../secret.png", { FORNO_MEDIA_DIR: tmpdir() })).toThrow();
+  });
+
+  it("imports synchronized media by opaque key and verifies idempotent content hashes", async () => {
+    await isolatedMedia();
+    const target = await mkdtemp(join(tmpdir(), "forno-product-media-peer-"));
+    directories.push(target);
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p7sAAAAASUVORK5CYII=", "base64");
+    const key = "products/42/12345678-1234-1234-1234-123456789012.png";
+    const hash = createHash("sha256").update(png).digest("hex");
+    process.env.FORNO_MEDIA_DIR = target;
+    expect(await storeSynchronizedProductImage(key, png, "image/png", hash)).toBe(hash);
+    expect(await storeSynchronizedProductImage(key, png, "image/png", hash)).toBe(hash);
+    expect(await readFile(productImagePath(key))).toEqual(png);
+    await expect(storeSynchronizedProductImage(key, png, "image/png", "0".repeat(64))).rejects.toThrow("content hash");
   });
 
   it("requires isolated media directories for test and build roles", () => {

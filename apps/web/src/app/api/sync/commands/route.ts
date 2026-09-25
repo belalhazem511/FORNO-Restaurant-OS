@@ -1,8 +1,9 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { and, asc, eq, gt } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
+import { authenticatePairedDevice } from "@/lib/sync/paired-device";
 import {
   auditLogs,
   customers,
@@ -62,18 +63,6 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-async function authenticateDevice(request: NextRequest) {
-  const deviceId = request.headers.get("x-forno-device-id") ?? "";
-  const credential = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
-  if (!/^[0-9a-f-]{36}$/i.test(deviceId) || credential.length < 32 || credential.length > 100) return null;
-  const [device] = await db.select().from(syncDevices).where(eq(syncDevices.id, deviceId)).limit(1);
-  if (!device || device.status !== "paired" || !device.credential_hash || device.revoked_at) return null;
-  const actual = createHash("sha256").update(credential).digest();
-  const expected = Buffer.from(device.credential_hash, "hex");
-  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
-  return device;
-}
-
 async function auditRejectedCommand(device: { id: string; organization_id: string; branch_id: number }, actorGlobalId: string, operationId: string, reason: string) {
   await db.transaction(async (tx) => {
     const [actor] = await tx.select().from(syncGlobalEntities).where(and(
@@ -94,7 +83,7 @@ async function auditRejectedCommand(device: { id: string; organization_id: strin
 }
 
 export async function POST(request: NextRequest) {
-  const device = await authenticateDevice(request);
+  const device = await authenticatePairedDevice(request);
   if (!device) return NextResponse.json({ error: "Paired device authentication failed." }, { status: 401, headers: { "cache-control": "no-store" } });
   const body = await request.json().catch(() => null) as { commands?: unknown } | null;
   if (!body || !Array.isArray(body.commands) || body.commands.length < 1 || body.commands.length > 100) {
@@ -286,7 +275,7 @@ export async function POST(request: NextRequest) {
 }
 
 export async function GET(request: NextRequest) {
-  const device = await authenticateDevice(request);
+  const device = await authenticatePairedDevice(request);
   if (!device) return NextResponse.json({ error: "Paired device authentication failed." }, { status: 401, headers: { "cache-control": "no-store" } });
   const rawCursor = Number(request.nextUrl.searchParams.get("cursor") ?? "0");
   if (!Number.isSafeInteger(rawCursor) || rawCursor < 0) return NextResponse.json({ error: "Change cursor is invalid." }, { status: 400, headers: { "cache-control": "no-store" } });
