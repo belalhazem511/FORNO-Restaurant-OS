@@ -5,6 +5,7 @@ import { products } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
 import { staffAssignments } from "@/lib/db/schema";
 import { hasPermission } from "@/lib/permissions";
+import { executeLocalCommand } from "@/lib/sync/local-command";
 
 const productSchema = z.object({
   id: z.number(),
@@ -44,6 +45,17 @@ export const productsRouter = router({
     )
     .output(productSchema)
     .mutation(async ({ ctx, input }) => {
+      if (process.env.FORNO_DESKTOP_MODE === "1") return db.transaction(async (tx) => executeLocalCommand(tx, {
+        actorId: ctx.user.id,
+        domain: "products",
+        action: "create",
+        entityType: "product",
+        localId: (product) => String(product.id),
+        payload: (productGlobalId, product) => ({ productGlobalId, values: { name: product.name, description: product.description, price: product.price, in_stock: product.in_stock, category: product.category, imageKey: product.image_key } }),
+      }, async (transaction) => {
+        const [created] = await transaction.insert(products).values({ ...input, user_uid: ctx.user.id }).returning();
+        return created!;
+      }));
       const [data] = await db
         .insert(products)
         .values({ ...input, user_uid: ctx.user.id })
@@ -66,6 +78,18 @@ export const productsRouter = router({
     .output(productSchema)
     .mutation(async ({ ctx, input }) => {
       const { id, ...data } = input;
+      if (process.env.FORNO_DESKTOP_MODE === "1") return db.transaction(async (tx) => executeLocalCommand(tx, {
+        actorId: ctx.user.id,
+        domain: "products",
+        action: "update",
+        entityType: "product",
+        localId: (product) => product ? String(product.id) : null,
+        payload: (productGlobalId, product) => ({ productGlobalId, values: { name: product.name, description: product.description, price: product.price, in_stock: product.in_stock, category: product.category, imageKey: product.image_key } }),
+      }, async (transaction) => {
+        const [updated] = await transaction.update(products).set({ ...data, user_uid: ctx.user.id })
+          .where(and(eq(products.id, id), eq(products.user_uid, ctx.user.id))).returning();
+        return updated;
+      }));
       const [updated] = await db
         .update(products)
         .set({ ...data, user_uid: ctx.user.id })

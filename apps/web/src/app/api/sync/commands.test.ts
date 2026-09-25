@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { NextRequest } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, SCHEMA_DDL } from "@/lib/trpc/routers/__tests__/helpers";
-import { auditLogs, branches, cashierRegisters, customers, staffAssignments, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, customers, products, staffAssignments, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, user } from "@/lib/db/schema";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
@@ -39,6 +39,27 @@ function makeCommand(input: { operationId: string; idempotencyKey: string; custo
     payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"),
     idempotencyKey: input.idempotencyKey,
     baseRevision: input.baseRevision ?? 0,
+    dependencies: [],
+    deviceTimestamp: new Date().toISOString(),
+  };
+}
+
+function makeProductCommand(input: { operationId: string; idempotencyKey: string; productGlobalId: string; name: string }) {
+  const payload = { productGlobalId: input.productGlobalId, values: { name: input.name, description: null, price: 425, in_stock: 7, category: null, imageKey: "media/opaque.webp" } };
+  return {
+    operationId: input.operationId,
+    deviceId,
+    organizationId,
+    branchGlobalId,
+    registerGlobalId,
+    actorGlobalId,
+    domain: "products",
+    action: "create",
+    schemaVersion: 1,
+    payload,
+    payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"),
+    idempotencyKey: input.idempotencyKey,
+    baseRevision: 0,
     dependencies: [],
     deviceTimestamp: new Date().toISOString(),
   };
@@ -135,5 +156,20 @@ describe("paired customer command processing", () => {
     expect((await (await postCommands([inactiveActor])).json()).results[0].status).toBe("rejected");
     expect((await db.select().from(customers)).length).toBe(before);
     await db.update(staffAssignments).set({ is_active: true }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
+  });
+
+  it("applies product commands and publishes an opaque media reference without local integer IDs", async () => {
+    const productGlobalId = "247d2eca-7c10-4dc2-867f-af94dd7b5c8c";
+    const command = makeProductCommand({ operationId: "76fa5c16-9a0a-4c69-b806-9b439c45cb8d", idempotencyKey: "f818e481-a04c-40ab-98ab-5f4fd0d1b447", productGlobalId, name: "Synced Product" });
+    const response = await postCommands([command]);
+    expect((await response.json()).results[0].status).toBe("accepted");
+    const product = await db.query.products.findFirst({ where: eq(products.name, "Synced Product") });
+    expect(product?.image_key).toBe("media/opaque.webp");
+    const pulled = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const page = await pulled.json();
+    const item = page.changes.find((change: { entityGlobalId: string }) => change.entityGlobalId === productGlobalId);
+    expect(item.snapshot.imageKey).toBe("media/opaque.webp");
+    expect(item.snapshot.id).toBeUndefined();
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
   });
 });

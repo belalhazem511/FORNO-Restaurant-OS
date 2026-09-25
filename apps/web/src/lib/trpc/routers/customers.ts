@@ -3,7 +3,7 @@ import { protectedProcedure, router } from "../init";
 import { db } from "@/lib/db";
 import { customers } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
-import { recordLocalCustomerCommand } from "@/lib/sync/customer-command";
+import { executeLocalCommand } from "@/lib/sync/local-command";
 
 const customerSchema = z.object({
   id: z.number(),
@@ -41,9 +41,17 @@ export const customersRouter = router({
         return data;
       }
       return db.transaction(async (tx) => {
-        const [data] = await tx.insert(customers).values({ ...input, user_uid: ctx.user.id }).returning();
-        await recordLocalCustomerCommand(tx, { action: "create", customer: data!, actorId: ctx.user.id });
-        return data!;
+        return executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "customers",
+          action: "create",
+          entityType: "customer",
+          localId: (customer) => String(customer.id),
+          payload: (customerGlobalId, customer) => ({ customerGlobalId, values: { name: customer.name, email: customer.email, phone: customer.phone, status: customer.status } }),
+        }, async (transaction) => {
+          const [created] = await transaction.insert(customers).values({ ...input, user_uid: ctx.user.id }).returning();
+          return created!;
+        });
       });
     }),
 
@@ -62,14 +70,20 @@ export const customersRouter = router({
     .mutation(async ({ ctx, input }) => {
       const { id, ...data } = input;
       if (process.env.FORNO_DESKTOP_MODE === "1") {
-        return db.transaction(async (tx) => {
-          const [updated] = await tx.update(customers)
+        return db.transaction(async (tx) => executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "customers",
+          action: "update",
+          entityType: "customer",
+          localId: (customer) => customer ? String(customer.id) : null,
+          payload: (customerGlobalId, customer) => ({ customerGlobalId, values: { name: customer.name, email: customer.email, phone: customer.phone, status: customer.status } }),
+        }, async (transaction) => {
+          const [updated] = await transaction.update(customers)
             .set({ ...data, user_uid: ctx.user.id })
             .where(and(eq(customers.id, id), eq(customers.user_uid, ctx.user.id)))
             .returning();
-          if (updated) await recordLocalCustomerCommand(tx, { action: "update", customer: updated, actorId: ctx.user.id });
           return updated;
-        });
+        }));
       }
       const [updated] = await db
         .update(customers)
