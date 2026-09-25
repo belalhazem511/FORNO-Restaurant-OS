@@ -53,12 +53,14 @@ afterAll(async () => {
 
 describe("desktop customer command boundary", () => {
   it("commits customer, global mapping, audit, and typed outbox together", async () => {
+    await db.delete(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.local_id, "local-owner")));
     const created = await caller.create({ name: "Offline Customer", email: "offline-customer@example.test" });
     const [outbox] = await db.select().from(syncOutbox).where(eq(syncOutbox.domain, "customers"));
     const mapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "customer"), eq(syncEntityMappings.local_id, String(created.id))) });
     expect(outbox?.action).toBe("create");
     expect(outbox?.payload.customerGlobalId).toBe(mapping?.global_id);
     expect(mapping?.local_id).toBe(String(created.id));
+    expect(await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.local_id, "local-owner")) })).toBeDefined();
     const rows = await db.select().from(customers).where(eq(customers.id, created.id));
     expect(rows.length).toBe(1);
   });

@@ -44,7 +44,12 @@ export async function executeLocalCommand<Result>(
   if (!actorIdentity) {
     const globalId = randomUUID();
     [actorIdentity] = await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "user", global_id: globalId, local_id: input.actorId }).returning();
-    await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "user", global_id: globalId, local_id: input.actorId });
+  }
+  const actorMapping = await tx.query.syncEntityMappings.findFirst({
+    where: and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.local_id, input.actorId)),
+  });
+  if (!actorMapping) {
+    await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "user", global_id: actorIdentity!.global_id, local_id: input.actorId });
   }
 
   const result = await apply(tx);
