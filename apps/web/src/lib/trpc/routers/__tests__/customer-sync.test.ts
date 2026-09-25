@@ -2,16 +2,18 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 import { NextRequest } from "next/server";
-import { auditLogs, branches, cashierRegisters, customers, products, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, products, staffAssignments, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, user } from "@/lib/db/schema";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
 const { customersRouter } = await import("../customers");
 const { productsRouter } = await import("../products");
+const { shiftsRouter } = await import("../shifts");
 const { createCallerFactory } = await import("../../init");
 const { POST: applyChanges } = await import("@/app/api/desktop/sync/apply/route");
 const caller = createCallerFactory(customersRouter)({ user: makeUser("local-owner") });
 const productCaller = createCallerFactory(productsRouter)({ user: makeUser("local-owner") });
+const shiftCaller = createCallerFactory(shiftsRouter)({ user: makeUser("local-owner") });
 const deviceId = "b2d90704-052a-4a37-a0fc-0464bf8c9e0a";
 const organizationId = "ce9b25aa-39de-41c8-8d07-6c4ad0b5b967";
 const branchGlobalId = "8fb88e82-24a4-483e-b931-e5d23e4f8d0c";
@@ -165,5 +167,28 @@ describe("desktop customer command boundary", () => {
     const mapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "product"), eq(syncEntityMappings.global_id, pulledProductGlobalId)) });
     expect(imported?.image_key).toBe("media/opaque.webp");
     expect(Number(mapping?.local_id)).toBe(Number(imported?.id));
+  });
+
+  it("commits local shift creation and its register reference to the outbox atomically", async () => {
+    const branch = await db.query.branches.findFirst({ where: eq(branches.code, "LOCAL") });
+    const register = await db.query.cashierRegisters.findFirst({ where: eq(cashierRegisters.code, "MAIN") });
+    await db.insert(staffAssignments).values({ user_id: "local-owner", branch_id: branch!.id, role: "owner", is_active: true });
+    const shift = await shiftCaller.open({ branchId: branch!.id, registerId: register!.id, openingFloat: 1200 });
+    const command = await db.query.syncOutbox.findFirst({ where: eq(syncOutbox.domain, "shifts") });
+    const mapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "cashier_shift"), eq(syncEntityMappings.local_id, String(shift.id))) });
+    expect((await db.select().from(cashierShifts).where(eq(cashierShifts.id, shift.id))).length).toBe(1);
+    expect(command?.action).toBe("open");
+    expect(command?.payload.shiftGlobalId).toBe(mapping?.global_id);
+    expect(command?.payload.registerGlobalId).toBe(registerGlobalId);
+    expect(command?.payload.openingFloat).toBe(1200);
+    const remoteShiftGlobalId = "7501a95a-c582-4a3d-921f-c06d28053a77";
+    const applied = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
+      body: JSON.stringify({ changes: [{ cursor: 45, domain: "shifts", entityType: "cashier_shift", entityGlobalId: remoteShiftGlobalId, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 900, openedAt: new Date().toISOString() } }], nextCursor: 45 }),
+    }));
+    expect(applied.status).toBe(200);
+    expect((await db.select().from(cashierShifts).where(eq(cashierShifts.status, "open"))).length).toBe(1);
+    expect((await db.select().from(syncConflicts).where(eq(syncConflicts.entity_global_id, remoteShiftGlobalId))).length).toBe(1);
   });
 });

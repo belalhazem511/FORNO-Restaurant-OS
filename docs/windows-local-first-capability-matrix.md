@@ -24,6 +24,8 @@ The full operation-by-operation catalogue, server permission rule, dependency, c
 
 ## Current transport contract
 
+- `shifts.open` is now a typed command. Central processing revalidates the paired register and active cashier assignment, detects register/cashier overlap, creates mapping/audit/change event transactionally, and marks overlaps Needs Review; shift snapshots import locally with overlap protection.
+
 - Customer and product deletion are synchronized as typed tombstones, with local deletion, mapping revision, audit, and outbox committed together. Peers retain the UUID mapping after deleting the local row; rejected payload hashes are audited without applying business data.
 
 - Customer deletion now uses a typed `customers.delete` tombstone. The local row is removed only in the same transaction that records its mapping revision, audit, and outbox operation; central pull preserves the global mapping while applying the tombstone.

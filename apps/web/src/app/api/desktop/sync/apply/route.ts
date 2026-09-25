@@ -1,13 +1,14 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, or } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
-import { auditLogs, customers, products, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox } from "@/lib/db/schema";
+import { auditLogs, cashierShifts, customers, products, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox } from "@/lib/db/schema";
 
 export const runtime = "nodejs";
 const customerSnapshot = z.object({ name: z.string(), email: z.string().email(), phone: z.string().nullable(), status: z.string().nullable() });
 const productSnapshot = z.object({ name: z.string(), description: z.string().nullable(), price: z.number().int().nonnegative(), in_stock: z.number().int().nonnegative(), category: z.string().nullable(), imageKey: z.string().max(200).nullable() });
+const shiftSnapshot = z.object({ registerGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() });
 const changeSchema = z.object({ cursor: z.number().int().positive(), domain: z.string(), entityType: z.string(), entityGlobalId: z.string().uuid(), action: z.string(), revision: z.number().int().positive(), snapshot: z.unknown().nullable() });
 
 function authorized(request: NextRequest) {
@@ -36,17 +37,18 @@ export async function POST(request: NextRequest) {
         previousCursor = change.cursor;
         const isCustomer = change.domain === "customers" && change.entityType === "customer";
         const isProduct = change.domain === "products" && change.entityType === "product";
-        if (!isCustomer && !isProduct) continue;
+        const isShift = change.domain === "shifts" && change.entityType === "cashier_shift";
+        if (!isCustomer && !isProduct && !isShift) continue;
         const isDelete = change.action === "delete" && change.snapshot === null;
         if (!isDelete && !change.snapshot) continue;
-        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : productSnapshot.safeParse(change.snapshot);
+        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : shiftSnapshot.safeParse(change.snapshot);
         if (parsedSnapshot && !parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
         const snapshot = parsedSnapshot?.success ? parsedSnapshot.data : null;
         const entityType = change.entityType;
         const mapping = await tx.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, entityType), eq(syncEntityMappings.global_id, change.entityGlobalId)) });
         if (mapping) {
           const queuedCommands = await tx.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.state, "pending")));
-          const globalKey = `${entityType}GlobalId`;
+          const globalKey = isShift ? "shiftGlobalId" : `${entityType}GlobalId`;
           const queued = queuedCommands.find((item) => item.domain === change.domain && item.payload[globalKey] === change.entityGlobalId);
           if (queued) {
             const operationId = randomUUID();
@@ -60,6 +62,10 @@ export async function POST(request: NextRequest) {
             if (actor) await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: `sync.${entityType}.needs_review`, entity_type: entityType, entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
             continue;
           }
+          if (isShift) {
+            await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
+            continue;
+          }
           if (isDelete && entityType === "customer") await tx.delete(customers).where(eq(customers.id, Number(mapping.local_id)));
           else if (isDelete && entityType === "product") await tx.delete(products).where(eq(products.id, Number(mapping.local_id)));
           else if (entityType === "customer") await tx.update(customers).set(snapshot as z.infer<typeof customerSnapshot>).where(eq(customers.id, Number(mapping.local_id)));
@@ -70,6 +76,27 @@ export async function POST(request: NextRequest) {
           await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
         } else {
           if (isDelete) continue;
+          if (isShift) {
+            const shift = snapshot as z.infer<typeof shiftSnapshot>;
+            const [register] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "register"), eq(syncEntityMappings.global_id, shift.registerGlobalId))).limit(1);
+            const [actor] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, shift.actorGlobalId))).limit(1);
+            if (!register || !actor) throw new Error("Pulled shift references an unmapped register or actor.");
+            const conflict = await tx.query.cashierShifts.findFirst({ where: and(eq(cashierShifts.branch_id, device.branch_id), eq(cashierShifts.status, "open"), or(eq(cashierShifts.register_id, Number(register.local_id)), eq(cashierShifts.cashier_user_id, actor.local_id))) });
+            if (conflict) {
+              const operationId = randomUUID();
+              const idempotencyKey = randomUUID();
+              const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: operationId, branch_id: device.branch_id, actor_global_id: shift.actorGlobalId, domain: change.domain, action: "pull_conflict", schema_version: 1, payload: { cashierShiftGlobalId: change.entityGlobalId }, payload_hash: createHash("sha256").update(change.entityGlobalId).digest("hex"), idempotency_key: idempotencyKey, state: "needs_review" }).returning();
+              await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "cashier_shift", entity_global_id: change.entityGlobalId, local_payload: { activeShiftId: conflict.id }, server_snapshot: shift, reason: "A conflicting local cashier shift is already open." });
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.cashier_shift.needs_review", entity_type: "cashier_shift", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor, activeShiftId: conflict.id }) });
+              continue;
+            }
+            const [created] = await tx.insert(cashierShifts).values({ branch_id: device.branch_id, register_id: Number(register.local_id), cashier_user_id: actor.local_id, opened_by: actor.local_id, opening_float: shift.openingFloat, status: "open", opened_at: new Date(shift.openedAt) }).returning();
+            const localId = String(created!.id);
+            await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "cashier_shift", global_id: change.entityGlobalId, local_id: localId, local_revision: 1, server_revision: change.revision });
+            await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "cashier_shift", global_id: change.entityGlobalId, local_id: localId, server_revision: change.revision });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: created!.id, actor_user_id: actor.local_id, action: "sync.cashier_shift.imported", entity_type: "cashier_shift", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
+            continue;
+          }
           const [owner] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"))).limit(1);
           if (!owner) throw new Error("No local user mapping is available to import customer ownership.");
           let localId: string;

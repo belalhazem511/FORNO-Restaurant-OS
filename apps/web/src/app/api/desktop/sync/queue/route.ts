@@ -71,8 +71,8 @@ export async function POST(request: NextRequest) {
       const state = raw.status === "already_applied" ? "accepted" : raw.status;
       await tx.update(syncOutbox).set({ state, server_result: raw.result && typeof raw.result === "object" ? raw.result as Record<string, unknown> : null, last_error: typeof raw.error === "string" ? raw.error.slice(0, 1000) : null, acknowledged_at: new Date() }).where(eq(syncOutbox.id, item.id));
       if ((state === "accepted") && raw.result && typeof raw.result === "object" && typeof (raw.result as Record<string, unknown>).revision === "number") {
-        const entityType = item.domain === "customers" ? "customer" : item.domain === "products" ? "product" : "";
-        const globalId = item.payload[`${entityType}GlobalId`];
+        const entityType = item.domain === "customers" ? "customer" : item.domain === "products" ? "product" : item.domain === "shifts" ? "cashier_shift" : "";
+        const globalId = item.payload[entityType === "cashier_shift" ? "shiftGlobalId" : `${entityType}GlobalId`];
         if (entityType && typeof globalId === "string") await tx.update(syncEntityMappings).set({ server_revision: (raw.result as Record<string, unknown>).revision as number, updated_at: new Date() }).where(and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, entityType), eq(syncEntityMappings.global_id, globalId)));
       }
     }

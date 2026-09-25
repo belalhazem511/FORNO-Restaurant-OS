@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt, or } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
 import { authenticatePairedDevice } from "@/lib/sync/paired-device";
 import {
   auditLogs,
+  cashierRegisters,
+  cashierShifts,
   customers,
   products,
   staffAssignments,
@@ -33,6 +35,7 @@ const payloadSchemas = {
   "products.create": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.update": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.delete": z.object({ productGlobalId: z.string().uuid() }),
+  "shifts.open": z.object({ shiftGlobalId: z.string().uuid(), registerGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() }),
 };
 const commandSchema = z.object({
   operationId: z.string().uuid(),
@@ -41,8 +44,8 @@ const commandSchema = z.object({
   branchGlobalId: z.string().uuid(),
   registerGlobalId: z.string().uuid(),
   actorGlobalId: z.string().uuid(),
-  domain: z.enum(["customers", "products"]),
-  action: z.enum(["create", "update", "delete"]),
+  domain: z.enum(["customers", "products", "shifts"]),
+  action: z.enum(["create", "update", "delete", "open"]),
   schemaVersion: z.literal(1),
   payload: z.record(z.string(), z.unknown()),
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -164,6 +167,34 @@ export async function POST(request: NextRequest) {
         if (!payloadSchema) return { operationId: command.operationId, status: "rejected", error: "Command type is not supported." };
         const payload = payloadSchema.safeParse(command.payload);
         if (!payload.success) return { operationId: command.operationId, status: "rejected", error: "Customer command payload is invalid." };
+        if (command.domain === "shifts") {
+          const shiftPayload = payload.data as z.infer<typeof payloadSchemas["shifts.open"]>;
+          if (command.action !== "open" || shiftPayload.registerGlobalId !== command.registerGlobalId) return { operationId: command.operationId, status: "rejected", error: "Shift command scope is invalid." };
+          const [registerMapping] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "register"), eq(syncGlobalEntities.global_id, shiftPayload.registerGlobalId))).limit(1);
+          const registerId = Number(registerMapping?.local_id);
+          const [register] = await tx.select().from(cashierRegisters).where(and(eq(cashierRegisters.id, registerId), eq(cashierRegisters.branch_id, device.branch_id), eq(cashierRegisters.is_active, true))).limit(1);
+          if (!registerMapping || registerMapping.local_id !== String(device.register_id) || !register) return { operationId: command.operationId, status: "rejected", error: "Shift register is not assigned to the paired device." };
+          const [existingMapping] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "cashier_shift"), eq(syncGlobalEntities.global_id, shiftPayload.shiftGlobalId))).for("update").limit(1);
+          if (existingMapping) return { operationId: command.operationId, status: "rejected", error: "Shift global identity already exists." };
+          const activeShift = await tx.query.cashierShifts.findFirst({ where: and(eq(cashierShifts.status, "open"), eq(cashierShifts.branch_id, device.branch_id), or(eq(cashierShifts.register_id, register.id), eq(cashierShifts.cashier_user_id, actor.local_id))) });
+          if (activeShift) {
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+            await tx.update(syncCommandInbox).set({ result: { reason: "overlapping_shift" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+            await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "cashier_shift", entity_global_id: shiftPayload.shiftGlobalId, local_payload: command.payload, server_snapshot: { activeShiftId: activeShift.id }, reason: "A conflicting open shift already exists for this register or cashier." });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.shift.needs_review", entity_type: "cashier_shift", entity_id: shiftPayload.shiftGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, activeShiftId: activeShift.id }) });
+            return { operationId: command.operationId, status: "needs_review", result: { shiftGlobalId: shiftPayload.shiftGlobalId } };
+          }
+          const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+          const [shift] = await tx.insert(cashierShifts).values({ branch_id: device.branch_id, register_id: register.id, cashier_user_id: actor.local_id, opened_by: actor.local_id, opening_float: shiftPayload.openingFloat, status: "open", opened_at: new Date(shiftPayload.openedAt) }).returning();
+          await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "cashier_shift", global_id: shiftPayload.shiftGlobalId, local_id: String(shift!.id), server_revision: 1 });
+          await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "cashier_shift", global_id: shiftPayload.shiftGlobalId, local_id: String(shift!.id), local_revision: 1, server_revision: 1 });
+          await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: shift!.id, actor_user_id: actor.local_id, action: "sync.shift.opened", entity_type: "cashier_shift", entity_id: shiftPayload.shiftGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, openingFloat: shiftPayload.openingFloat }) });
+          const result = { shiftGlobalId: shiftPayload.shiftGlobalId, revision: 1 };
+          await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+          await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "shifts", entity_type: "cashier_shift", entity_global_id: shiftPayload.shiftGlobalId, action: "open", server_revision: 1, source_operation_id: command.operationId });
+          await tx.update(syncDevices).set({ last_seen_at: new Date(), last_synchronized_at: new Date() }).where(eq(syncDevices.id, device.id));
+          return { operationId: command.operationId, status: "accepted", result };
+        }
         if (command.domain === "products") {
           const productPayload = payload.data as z.infer<typeof payloadSchemas["products.create"]>;
           const productGlobalId = productPayload.productGlobalId;
@@ -286,7 +317,8 @@ export async function GET(request: NextRequest) {
   )).orderBy(asc(syncChangeLog.cursor)).limit(200);
   const exported = [];
   for (const change of changes) {
-    if ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product")) {
+    const isShift = change.domain === "shifts" && change.entity_type === "cashier_shift";
+    if (!isShift && ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product"))) {
       exported.push({ cursor: change.cursor, domain: change.domain, entityType: change.entity_type, entityGlobalId: change.entity_global_id, action: change.action, revision: change.server_revision, snapshot: null });
       continue;
     }
@@ -297,6 +329,14 @@ export async function GET(request: NextRequest) {
     )).limit(1);
     let snapshot: Record<string, unknown> | null = null;
     if (change.action === "delete") snapshot = null;
+    else if (isShift && mapping) {
+      const shift = await db.query.cashierShifts.findFirst({ where: eq(cashierShifts.id, Number(mapping.local_id)) });
+      if (shift) {
+        const [register] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "register"), eq(syncGlobalEntities.local_id, String(shift.register_id)))).limit(1);
+        const [actor] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, shift.cashier_user_id))).limit(1);
+        if (register && actor) snapshot = { registerGlobalId: register.global_id, actorGlobalId: actor.global_id, openingFloat: shift.opening_float, openedAt: shift.opened_at.toISOString() };
+      }
+    }
     else if (mapping && change.entity_type === "customer") {
       const customer = await db.query.customers.findFirst({ where: eq(customers.id, Number(mapping.local_id)) });
       if (customer) snapshot = { name: customer.name, email: customer.email, phone: customer.phone, status: customer.status };

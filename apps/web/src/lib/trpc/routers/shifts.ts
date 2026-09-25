@@ -9,11 +9,13 @@ import {
   orderPayments,
   paymentMethods,
   shiftCashMovements,
+  syncEntityMappings,
   transactions,
 } from "@/lib/db/schema";
 import { calculateExpectedCash } from "@/lib/finance";
 import { assertPermission, requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
+import { executeLocalCommand } from "@/lib/sync/local-command";
 
 const methodTotalSchema = z.object({
   paymentMethodId: z.number(),
@@ -158,7 +160,7 @@ export const shiftsRouter = router({
         throw new TRPCError({ code: "CONFLICT", message: "This cashier or register already has an open shift" });
       }
       try {
-        const created = await db.transaction(async (tx) => {
+        const createShift = async (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => {
           const [shift] = await tx.insert(cashierShifts).values({
             branch_id: input.branchId,
             register_id: input.registerId,
@@ -173,7 +175,21 @@ export const shiftsRouter = router({
             details: JSON.stringify({ openingFloat: input.openingFloat, registerId: input.registerId }),
           });
           return shift;
-        });
+        };
+        const registerIdentity = process.env.FORNO_DESKTOP_MODE === "1"
+          ? await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, process.env.FORNO_DESKTOP_DEVICE_ID ?? ""), eq(syncEntityMappings.entity_type, "register"), eq(syncEntityMappings.local_id, String(input.registerId))) })
+          : null;
+        if (process.env.FORNO_DESKTOP_MODE === "1" && !registerIdentity) throw new Error("The local register synchronization identity is unavailable.");
+        const created = await db.transaction(async (tx) => process.env.FORNO_DESKTOP_MODE === "1"
+          ? executeLocalCommand(tx, {
+            actorId: ctx.user.id,
+            domain: "shifts",
+            action: "open",
+            entityType: "cashier_shift",
+            localId: (shift) => String(shift.id),
+            payload: (shiftGlobalId, shift) => ({ shiftGlobalId, registerGlobalId: registerIdentity!.global_id, openingFloat: shift.opening_float, openedAt: shift.opened_at.toISOString() }),
+          }, createShift)
+          : createShift(tx));
         return hydrateShift(db, created);
       } catch (error) {
         if (error instanceof Error && /unique|duplicate/i.test(error.message)) {
