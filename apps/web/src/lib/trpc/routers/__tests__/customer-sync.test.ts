@@ -3,18 +3,20 @@ import { and, eq } from "drizzle-orm";
 import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 import { NextRequest } from "next/server";
 import { executeLocalCommand } from "@/lib/sync/local-command";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, paymentMethods, products, shiftCashMovements, staffAssignments, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, transactions, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, paymentMethods, products, registerPrintPreferences, shiftCashMovements, staffAssignments, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, transactions, user } from "@/lib/db/schema";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
 const { customersRouter } = await import("../customers");
 const { productsRouter } = await import("../products");
 const { shiftsRouter } = await import("../shifts");
+const { printingRouter } = await import("../printing");
 const { createCallerFactory } = await import("../../init");
 const { POST: applyChanges } = await import("@/app/api/desktop/sync/apply/route");
 const caller = createCallerFactory(customersRouter)({ user: makeUser("local-owner") });
 const productCaller = createCallerFactory(productsRouter)({ user: makeUser("local-owner") });
 const shiftCaller = createCallerFactory(shiftsRouter)({ user: makeUser("local-owner") });
+const printingCaller = createCallerFactory(printingRouter)({ user: makeUser("local-owner") });
 const deviceId = "b2d90704-052a-4a37-a0fc-0464bf8c9e0a";
 const organizationId = "ce9b25aa-39de-41c8-8d07-6c4ad0b5b967";
 const branchGlobalId = "8fb88e82-24a4-483e-b931-e5d23e4f8d0c";
@@ -25,12 +27,14 @@ const pulledProductGlobalId = "37d00221-42e4-4bb5-8ca8-101cbd99a352";
 const originalDesktopMode = process.env.FORNO_DESKTOP_MODE;
 const originalDeviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
 const originalSetupToken = process.env.FORNO_DESKTOP_SETUP_TOKEN;
+let localRegisterId: number;
 
 beforeAll(async () => {
   await pg.exec(SCHEMA_DDL);
   await db.insert(user).values({ id: "local-owner", name: "Local Owner", email: "owner@local.test", emailVerified: false });
   const [branch] = await db.insert(branches).values({ code: "LOCAL", name_en: "Local", name_ar: "محلي", currency: "EGP", timezone: "Africa/Cairo", is_active: true }).returning();
   const [register] = await db.insert(cashierRegisters).values({ branch_id: branch!.id, code: "MAIN", name_en: "Main", name_ar: "الرئيسي", is_active: true }).returning();
+  localRegisterId = register!.id;
   await db.insert(syncOrganizations).values({ id: organizationId, name: "Local Org" });
   await db.insert(syncDevices).values({ id: deviceId, organization_id: organizationId, display_name: "Test device", branch_id: branch!.id, register_id: register!.id, status: "local_only" });
   await db.insert(syncEntityMappings).values([
@@ -55,6 +59,17 @@ afterAll(async () => {
 });
 
 describe("desktop customer command boundary", () => {
+  it("commits print preferences and their typed synchronization command together", async () => {
+    const branch = await db.query.branches.findFirst({ where: eq(branches.code, "LOCAL") });
+    if (!await db.query.staffAssignments.findFirst({ where: and(eq(staffAssignments.user_id, "local-owner"), eq(staffAssignments.branch_id, branch!.id)) })) await db.insert(staffAssignments).values({ user_id: "local-owner", branch_id: branch!.id, role: "owner", is_active: true });
+    const preference = await printingCaller.updatePreferences({ registerId: localRegisterId, paperWidth: 58, language: "ar", receiptCopies: 2, kotCopies: 3 });
+    const command = (await db.select().from(syncOutbox).where(eq(syncOutbox.domain, "printing"))).at(-1);
+    expect(preference.paper_width).toBe(58);
+    expect((await db.select().from(registerPrintPreferences).where(eq(registerPrintPreferences.register_id, localRegisterId))).length).toBe(1);
+    expect(command?.action).toBe("settings_update");
+    expect(command?.payload).toMatchObject({ registerGlobalId, paperWidth: 58, language: "ar", receiptCopies: 2, kotCopies: 3 });
+  });
+
   it("commits customer, global mapping, audit, and typed outbox together", async () => {
     await db.delete(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.local_id, "local-owner")));
     const created = await caller.create({ name: "Offline Customer", email: "offline-customer@example.test" });
@@ -173,7 +188,7 @@ describe("desktop customer command boundary", () => {
   it("commits local shift creation and its register reference to the outbox atomically", async () => {
     const branch = await db.query.branches.findFirst({ where: eq(branches.code, "LOCAL") });
     const register = await db.query.cashierRegisters.findFirst({ where: eq(cashierRegisters.code, "MAIN") });
-    await db.insert(staffAssignments).values({ user_id: "local-owner", branch_id: branch!.id, role: "owner", is_active: true });
+    if (!await db.query.staffAssignments.findFirst({ where: and(eq(staffAssignments.user_id, "local-owner"), eq(staffAssignments.branch_id, branch!.id)) })) await db.insert(staffAssignments).values({ user_id: "local-owner", branch_id: branch!.id, role: "owner", is_active: true });
     const shift = await shiftCaller.open({ branchId: branch!.id, registerId: register!.id, openingFloat: 1200 });
     const command = await db.query.syncOutbox.findFirst({ where: eq(syncOutbox.domain, "shifts") });
     const mapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "cashier_shift"), eq(syncEntityMappings.local_id, String(shift.id))) });
@@ -219,7 +234,8 @@ describe("desktop customer command boundary", () => {
         body: JSON.stringify({ changes: [
           { cursor: 1, domain: "shifts", entityType: "cashier_shift", entityGlobalId: mapping!.global_id, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 1200, openedAt: shift.opened_at.toISOString() } },
           { cursor: 2, domain: "shifts", entityType: "cash_movement", entityGlobalId: movementCommand!.payload.cashMovementGlobalId, action: "drawer_adjust", revision: 1, snapshot: { shiftGlobalId: mapping!.global_id, actorGlobalId, type: movement.type, amount: movement.amount, reason: movement.reason, createdAt: movement.created_at.toISOString() } },
-        ], nextCursor: 2 }),
+          { cursor: 3, domain: "printing", entityType: "register_print_preferences", entityGlobalId: "2b2cfdce-82c6-468b-a1b0-cbaaf83e2659", action: "settings_update", revision: 1, snapshot: { registerGlobalId, updatedByGlobalId: actorGlobalId, paperWidth: 58, language: "ar", receiptCopies: 2, kotCopies: 3, updatedAt: new Date().toISOString() } },
+        ], nextCursor: 3 }),
       }));
       importedStatus = imported.status;
       importError = (await imported.json()).error;
@@ -232,6 +248,9 @@ describe("desktop customer command boundary", () => {
     expect((await db.select().from(cashierShifts)).length).toBe(2);
     expect((await db.select().from(shiftCashMovements)).length).toBe(2);
     expect((await db.select().from(transactions).where(eq(transactions.category, "cash_in"))).length).toBe(2);
+    const importedPrintSettings = await db.query.registerPrintPreferences.findFirst({ where: eq(registerPrintPreferences.register_id, registerB!.id) });
+    expect(importedPrintSettings).toMatchObject({ paper_width: 58, language: "ar", receipt_copies: 2, kot_copies: 3 });
+    expect(await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceBId), eq(syncEntityMappings.entity_type, "register_print_preferences"), eq(syncEntityMappings.global_id, "2b2cfdce-82c6-468b-a1b0-cbaaf83e2659")) })).toBeDefined();
     const remoteShiftGlobalId = "7501a95a-c582-4a3d-921f-c06d28053a77";
     const applied = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
       method: "POST",
@@ -283,5 +302,28 @@ describe("desktop customer command boundary", () => {
     const dependentCommand = (await db.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, deviceId), eq(syncOutbox.domain, "products")))).find((item) => item.payload.productGlobalId === productMapping?.global_id);
     expect(priorCommand).toBeDefined();
     expect(dependentCommand?.dependencies).toContain(priorCommand!.operation_id);
+  });
+
+  it("creates one durable outbox command for a stable idempotency key", async () => {
+    let applied = 0;
+    const execute = (description: string) => db.transaction((tx) => executeLocalCommand(tx, {
+      actorId: "local-owner",
+      domain: "orders",
+      action: "create",
+      entityType: "order",
+      idempotencyKey: "stable-order-request-001",
+      localId: (result: { id: number }) => String(result.id),
+      payload: (orderGlobalId) => ({ orderGlobalId, requestId: "stable-order-request-001", description }),
+    }, async () => {
+      applied += 1;
+      return { id: 987655 };
+    }));
+    await execute("Takeaway order");
+    await execute("Takeaway order");
+    const operations = await db.select().from(syncOutbox).where(eq(syncOutbox.idempotency_key, "stable-order-request-001"));
+    expect(applied).toBe(2);
+    expect(operations.length).toBe(1);
+    await expect(execute("Different order payload")).rejects.toThrow("Local synchronization idempotency key was reused with different content.");
+    expect((await db.select().from(syncOutbox).where(eq(syncOutbox.idempotency_key, "stable-order-request-001"))).length).toBe(1);
   });
 });

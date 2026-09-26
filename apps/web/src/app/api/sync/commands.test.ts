@@ -6,12 +6,12 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { NextRequest } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, SCHEMA_DDL } from "@/lib/trpc/routers/__tests__/helpers";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, paymentMethods, products, shiftCashMovements, staffAssignments, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, kitchenStations, menuCategories, menuItems, orderCancellations, orderCheckouts, orderPayments, orders, paymentMethods, printJobs, products, recipeComponents, recipeVersions, shiftCashMovements, staffAssignments, stockBalances, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
 import { productImagePath } from "@/lib/media/product-images";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
-const { GET, POST } = await import("./commands/route");
+const { GET, POST, SYNC_COMMAND_REGISTRY } = await import("./commands/route");
 const { POST: uploadProductMedia } = await import("./media/route");
 const deviceId = "b2d90704-052a-4a37-a0fc-0464bf8c9e0a";
 const organizationId = "ce9b25aa-39de-41c8-8d07-6c4ad0b5b967";
@@ -21,6 +21,8 @@ const actorGlobalId = "b22d0546-3cff-4333-b27e-1a87d65c1945";
 const credential = "device-secret-for-central-sync-tests-123";
 const customerGlobalId = "fa9ccdae-1358-46f9-9f89-4a675607c7a0";
 let centralBranchId = 0;
+const menuItemGlobalId = "5575a74a-9bbc-4b99-9847-0bce2095e6ef";
+const stationGlobalId = "c40f7ab8-d0db-4f6b-811e-837dc0ba8ce7";
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -85,6 +87,36 @@ function makeShiftCloseCommand(input: { operationId: string; idempotencyKey: str
   return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "shifts", action: "close", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: [input.dependency], deviceTimestamp: new Date().toISOString() };
 }
 
+function makeOrderCommand(input: { operationId: string; idempotencyKey: string; orderGlobalId: string; clientRequestId: string }) {
+  const payload = { orderGlobalId: input.orderGlobalId, branchGlobalId, customerGlobalId: null, diningTableGlobalId: null, orderType: "takeaway", deliveryAddress: null, clientRequestId: input.clientRequestId, shiftGlobalId: null, items: [{ menuItemGlobalId: menuItemGlobalId, variantGlobalId: null, modifierOptionGlobalIds: [], quantity: 1, notes: "No onions" }] };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "orders", action: "create", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+}
+
+function makeOrderTransitionCommand(input: { operationId: string; idempotencyKey: string; orderGlobalId: string; status: "confirmed" | "preparing" | "ready"; dependencies: string[]; baseRevision?: number; overrideReason?: string }) {
+  const payload = { orderGlobalId: input.orderGlobalId, status: input.status, note: "Device kitchen update", inventoryOverrideReason: input.overrideReason ?? null };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "orders", action: "transition", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: input.baseRevision ?? 1, dependencies: input.dependencies, deviceTimestamp: new Date().toISOString() };
+}
+
+function makeCheckoutCommand(input: { operationId: string; idempotencyKey: string; checkoutGlobalId: string; orderGlobalId: string; shiftGlobalId: string; paymentGlobalIds: string[]; transactionGlobalIds: string[]; dependencies: string[] }) {
+  const payload = { checkoutGlobalId: input.checkoutGlobalId, orderGlobalId: input.orderGlobalId, shiftGlobalId: input.shiftGlobalId, discount: null, payments: [{ code: "CASH", amount: 125, tenderedAmount: 150 }, { code: "CARD", amount: 125, tenderedAmount: null }], paymentGlobalIds: input.paymentGlobalIds, transactionGlobalIds: input.transactionGlobalIds };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "checkout", action: "pay", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: input.dependencies, deviceTimestamp: new Date().toISOString() };
+}
+
+function makePrintCommand(input: { operationId: string; idempotencyKey: string; jobGlobalId: string; orderGlobalId: string; shiftGlobalId: string; dependencies: string[]; documentType?: "receipt" | "kot"; stationId?: string | null; isReprint?: boolean; reprintReason?: string | null }) {
+  const payload = { jobGlobalId: input.jobGlobalId, orderGlobalId: input.orderGlobalId, shiftGlobalId: input.shiftGlobalId, stationGlobalId: input.stationId ?? null, documentType: input.documentType ?? "receipt", isReprint: input.isReprint ?? false, reprintReason: input.reprintReason ?? null, copyCount: 1, paperWidth: 80, language: "bilingual" };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "printing", action: "request", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: input.dependencies, deviceTimestamp: new Date().toISOString() };
+}
+
+function makePrintTransition(input: { operationId: string; idempotencyKey: string; jobGlobalId: string; orderGlobalId: string; status: "previewed" | "acknowledged"; dependency: string }) {
+  const payload = { jobGlobalId: input.jobGlobalId, orderGlobalId: input.orderGlobalId, status: input.status, errorMessage: null };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "printing", action: "transition", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: [input.dependency], deviceTimestamp: new Date().toISOString() };
+}
+
+function makeCancellationCommand(input: { operationId: string; idempotencyKey: string; cancellationGlobalId: string; orderGlobalId: string; shiftGlobalId: string; checkoutGlobalId: string; originalPaymentGlobalIds: string[]; refundGlobalIds: string[]; transactionGlobalIds: string[]; dependencies: string[] }) {
+  const payload = { cancellationGlobalId: input.cancellationGlobalId, orderGlobalId: input.orderGlobalId, shiftGlobalId: input.shiftGlobalId, checkoutGlobalId: input.checkoutGlobalId, originalPaymentGlobalIds: input.originalPaymentGlobalIds, reason: "Customer requested cancellation", inventoryDisposition: "returned_unused", refundGlobalIds: input.refundGlobalIds, transactionGlobalIds: input.transactionGlobalIds };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "checkout", action: "cancel", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: input.dependencies, deviceTimestamp: new Date().toISOString() };
+}
+
 async function postCommands(commands: unknown[]) {
   return POST(new NextRequest("http://localhost/api/sync/commands", {
     method: "POST",
@@ -111,11 +143,50 @@ beforeAll(async () => {
     { organization_id: organizationId, device_id: deviceId, branch_id: branch!.id, entity_type: "branch", global_id: branchGlobalId, local_id: String(branch!.id) },
     { organization_id: organizationId, device_id: deviceId, branch_id: branch!.id, entity_type: "register", global_id: registerGlobalId, local_id: String(register!.id) },
   ]);
+  const [station] = await db.insert(kitchenStations).values({ branch_id: branch!.id, code: "MAIN", name_en: "Main", name_ar: "الرئيسي", is_active: true }).returning();
+  await db.insert(syncGlobalEntities).values({ organization_id: organizationId, branch_id: branch!.id, entity_type: "kitchen_station", global_id: stationGlobalId, local_id: String(station!.id) });
+  await db.insert(syncEntityMappings).values({ organization_id: organizationId, device_id: deviceId, branch_id: branch!.id, entity_type: "kitchen_station", global_id: stationGlobalId, local_id: String(station!.id) });
+  const [category] = await db.insert(menuCategories).values({ branch_id: branch!.id, code: "MAIN", name_en: "Main", name_ar: "الرئيسي", sort_order: 1, is_active: true }).returning();
+  const [menuItem] = await db.insert(menuItems).values({ category_id: category!.id, kitchen_station_id: station!.id, code: "SYNC-ITEM", name_en: "Sync item", name_ar: "صنف", base_price: 250, is_available: true, sort_order: 1 }).returning();
+  const [location] = await db.insert(inventoryLocations).values({ branch_id: branch!.id, code: "MAIN", name_en: "Main", name_ar: "الرئيسي", is_active: true }).returning();
+  const [ingredientCategory] = await db.insert(ingredientCategories).values({ branch_id: branch!.id, code: "BASE", name_en: "Base", name_ar: "أساسي", is_active: true }).returning();
+  const [unit] = await db.insert(unitsOfMeasure).values({ code: "SYNC-G", name_en: "Gram", name_ar: "جرام", dimension: "mass", base_numerator: 1_000, base_denominator: 1 }).returning();
+  const [ingredient] = await db.insert(ingredients).values({ branch_id: branch!.id, category_id: ingredientCategory!.id, sku: "SYNC-BASE", name_en: "Base", name_ar: "أساسي", base_unit_id: unit!.id, dimension: "mass", default_location_id: location!.id, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, allow_negative: false, average_unit_cost_micros: 100, created_by: "central-owner", updated_by: "central-owner" }).returning();
+  await db.insert(stockBalances).values({ branch_id: branch!.id, location_id: location!.id, ingredient_id: ingredient!.id, quantity_base: 100_000_000, average_unit_cost_micros: 100 });
+  const [recipe] = await db.insert(recipeVersions).values({ branch_id: branch!.id, menu_item_id: menuItem!.id, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "central-owner", approved_by: "central-owner", approved_at: new Date() }).returning();
+  await db.insert(recipeComponents).values({ recipe_version_id: recipe!.id, ingredient_id: ingredient!.id, source_location_id: location!.id, unit_id: unit!.id, quantity_input_scaled: 100_000, quantity_base: 100_000_000 });
+  await db.insert(syncGlobalEntities).values({ organization_id: organizationId, branch_id: branch!.id, entity_type: "menu_item", global_id: menuItemGlobalId, local_id: String(menuItem!.id) });
+  await db.insert(syncEntityMappings).values({ organization_id: organizationId, device_id: deviceId, branch_id: branch!.id, entity_type: "menu_item", global_id: menuItemGlobalId, local_id: String(menuItem!.id) });
 });
 
 afterAll(async () => { await pg.close(); });
 
 describe("paired customer command processing", () => {
+  it("registers a validated handler and reconciliation importer for each supported command", () => {
+    const commandNames = Object.keys(SYNC_COMMAND_REGISTRY).sort();
+    expect(commandNames).toEqual([
+      "checkout.cancel", "checkout.pay", "customers.create", "customers.delete", "customers.update",
+      "orders.create", "orders.transition", "orders.update", "printing.request", "printing.settings_update", "printing.transition",
+      "products.create", "products.delete", "products.update", "shifts.close", "shifts.drawer_adjust", "shifts.open",
+    ]);
+    for (const command of Object.values(SYNC_COMMAND_REGISTRY)) {
+      expect(typeof command.schema.safeParse).toBe("function");
+      expect(command.handler.length).toBeGreaterThan(0);
+      expect(command.importer.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("applies print-setting commands once and exports a typed register snapshot", async () => {
+    const preferenceGlobalId = "5e707a0a-4c28-45ed-a37a-706b31a3bad6";
+    const payload = { preferenceGlobalId, registerGlobalId, paperWidth: 58, language: "ar", receiptCopies: 2, kotCopies: 3, updatedAt: new Date().toISOString() };
+    const command = { operationId: "0f4f1e9d-5cc5-4d4d-8cdb-dc741c40dfba", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "printing", action: "settings_update", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "print-settings-test-01", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
+    const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const change = (await response.json()).changes.find((item: { entityGlobalId: string }) => item.entityGlobalId === preferenceGlobalId);
+    expect(change.snapshot).toMatchObject({ registerGlobalId, paperWidth: 58, language: "ar", receiptCopies: 2, kotCopies: 3 });
+  });
+
   it("authenticates the paired device and applies a customer create exactly once", async () => {
     const command = makeCommand({ operationId: "8ce283aa-13f4-44fa-a27c-e45f5d7cc23e", idempotencyKey: "256006e3-46a8-42de-9a3f-49c739da8975", customerGlobalId, name: "Offline Customer" });
     const first = await postCommands([command]);
@@ -124,14 +195,15 @@ describe("paired customer command processing", () => {
     const retry = await postCommands([command]);
     expect((await retry.json()).results[0].status).toBe("already_applied");
     expect((await db.select().from(customers)).length).toBe(1);
-    expect((await db.select().from(syncChangeLog)).length).toBe(1);
-    expect((await db.select().from(syncCommandInbox)).length).toBe(1);
-    expect((await db.select().from(auditLogs)).length).toBe(1);
+    expect((await db.select().from(syncChangeLog).where(eq(syncChangeLog.domain, "customers"))).length).toBe(1);
+    expect((await db.select().from(syncCommandInbox).where(eq(syncCommandInbox.domain, "customers"))).length).toBe(1);
+    expect((await db.select().from(auditLogs).where(eq(auditLogs.action, "sync.customer.created"))).length).toBe(1);
     const pulled = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
     const page = await pulled.json();
-    expect(page.changes[0].entityGlobalId).toBe(customerGlobalId);
-    expect(page.changes[0].snapshot.email).toBe("offline-customer@sync.test");
-    expect(page.changes[0].snapshot.user_uid).toBeUndefined();
+    const customerChange = page.changes.find((change: { entityGlobalId: string }) => change.entityGlobalId === customerGlobalId);
+    expect(customerChange.entityGlobalId).toBe(customerGlobalId);
+    expect(customerChange.snapshot.email).toBe("offline-customer@sync.test");
+    expect(customerChange.snapshot.user_uid).toBeUndefined();
     expect(page.nextCursor).toBeGreaterThan(0);
   });
 
@@ -296,5 +368,73 @@ describe("paired customer command processing", () => {
     const closeChanges = await (await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }))).json();
     const closeChange = closeChanges.changes.find((change: { action: string; entityGlobalId: string }) => change.action === "close" && change.entityGlobalId === shiftGlobalId);
     expect(closeChange.snapshot.expectedCash).toBe(4000);
+  });
+});
+
+describe("paired order command processing", () => {
+  it("applies an order command exactly once and exports a global-ID-only snapshot", async () => {
+    const command = makeOrderCommand({ operationId: "c84ec790-967e-481f-a011-331ee73083de", idempotencyKey: "dc34b60f-a2d0-435c-8ad9-89dfd6e3e5f8", orderGlobalId: "31de3057-7f4d-4f7f-90c3-2d0ee1fb2654", clientRequestId: "central-order-sync-001" });
+    const before = (await db.select().from(orders)).length;
+    const first = await postCommands([command]);
+    expect((await first.json()).results[0].status).toBe("accepted");
+    const retry = await postCommands([command]);
+    expect((await retry.json()).results[0].status).toBe("already_applied");
+    expect((await db.select().from(orders))).toHaveLength(before + 1);
+    const pull = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const changes = (await pull.json()).changes as Array<{ domain: string; entityType: string; snapshot: Record<string, unknown> | null }>;
+    const orderChange = changes.find((change) => change.domain === "orders" && change.entityType === "order");
+    expect(orderChange?.snapshot?.clientRequestId).toBe("central-order-sync-001");
+    expect(orderChange?.snapshot?.branchGlobalId).toBe(branchGlobalId);
+    expect(JSON.stringify(Object.keys(orderChange?.snapshot ?? {}))).not.toContain("branch_id");
+    const updatePayload = { orderGlobalId: command.payload.orderGlobalId, status: "pending", note: "Keep pending", inventoryOverrideReason: null };
+    const updateCommand = { ...command, operationId: "2c873e10-51e9-4c51-b359-a008b5e20122", domain: "orders", action: "update", payload: updatePayload, payloadHash: createHash("sha256").update(stableJson(updatePayload)).digest("hex"), idempotencyKey: "order-update-idempotency-01", baseRevision: 1, dependencies: [command.operationId] };
+    expect((await (await postCommands([updateCommand])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([updateCommand])).json()).results[0].status).toBe("already_applied");
+  });
+
+  it("processes shift, split-safe checkout, and print acknowledgement in dependency order exactly once", async () => {
+    const orderGlobalId = "31de3057-7f4d-4f7f-90c3-2d0ee1fb2654";
+    const orderOperationId = "c84ec790-967e-481f-a011-331ee73083de";
+    const shiftOpen = makeShiftCommand({ operationId: "ed13a43d-879e-4b13-b8b8-2d6d4debc2f2", idempotencyKey: "5dbba043-4707-4d0c-a2b8-3a8be57d431a", shiftGlobalId: "03d80d42-559b-44ac-b55a-e5bb09821ff0" });
+    expect((await (await postCommands([shiftOpen])).json()).results[0].status).toBe("accepted");
+    const orderUpdateOperationId = "2c873e10-51e9-4c51-b359-a008b5e20122";
+    const confirmation = makeOrderTransitionCommand({ operationId: "f4e0f249-f36c-455f-b457-fec412b25bb9", idempotencyKey: "bea2a4a7-300c-4dd3-8dd8-b812ea8e62cb", orderGlobalId, status: "confirmed", baseRevision: 2, dependencies: [orderOperationId, orderUpdateOperationId, shiftOpen.operationId] });
+    const confirmationResult = (await (await postCommands([confirmation])).json()).results[0];
+    expect(confirmationResult).toMatchObject({ status: "accepted" });
+    expect((await (await postCommands([confirmation])).json()).results[0].status).toBe("already_applied");
+    if (!await db.query.paymentMethods.findFirst({ where: eq(paymentMethods.code, "CASH") })) await db.insert(paymentMethods).values({ code: "CASH", name: "Cash", affects_drawer: true, is_active: true });
+    if (!await db.query.paymentMethods.findFirst({ where: eq(paymentMethods.code, "CARD") })) await db.insert(paymentMethods).values({ code: "CARD", name: "Card", affects_drawer: false, is_active: true });
+    const checkout = makeCheckoutCommand({ operationId: "4b318d33-ec4a-4d75-97be-39b6697f4a1f", idempotencyKey: "7ac3e3e6-5721-4936-b665-e83abc4bc823", checkoutGlobalId: "f1d4dc63-e1ef-4685-97ee-016886145071", orderGlobalId, shiftGlobalId: shiftOpen.payload.shiftGlobalId, paymentGlobalIds: ["b5bc7814-5c84-4ee2-ae62-58a0081bbed0", "a57a91a1-63e6-47d9-beb8-ea110b7165de"], transactionGlobalIds: ["e2a8f73a-ed82-4d00-8d98-50ba97388091", "9d6f8125-3ccf-4ecb-b652-24eb30fd6382"], dependencies: [orderOperationId, orderUpdateOperationId, confirmation.operationId, shiftOpen.operationId] });
+    expect((await (await postCommands([checkout])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([checkout])).json()).results[0].status).toBe("already_applied");
+    expect((await db.select().from(orderCheckouts))).toHaveLength(1);
+    expect((await db.select().from(orderPayments))).toHaveLength(2);
+    expect((await db.select().from(transactions).where(eq(transactions.category, "selling")))).toHaveLength(2);
+    const checkoutChanges = await (await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }))).json();
+    const checkoutSnapshot = checkoutChanges.changes.find((change: { entityGlobalId: string }) => change.entityGlobalId === checkout.payload.checkoutGlobalId).snapshot;
+    expect(checkoutSnapshot.payments.map((payment: { methodCode: string }) => payment.methodCode)).toEqual(["CASH", "CARD"]);
+    expect(JSON.stringify(checkoutSnapshot)).not.toMatch(/cardNumber|pin|cvv|password|token/i);
+    const print = makePrintCommand({ operationId: "3708c095-5c5c-4f2a-adb8-2dcb307b3567", idempotencyKey: "ae4d1658-1992-4956-bbe3-4249c54f43b5", jobGlobalId: "6e3ae919-6081-46dd-a59f-82c07198c038", orderGlobalId, shiftGlobalId: shiftOpen.payload.shiftGlobalId, dependencies: [orderOperationId, checkout.operationId] });
+    expect((await (await postCommands([print])).json()).results[0].status).toBe("accepted");
+    const preview = makePrintTransition({ operationId: "b76a8e1f-f91e-473c-92b6-216735639f44", idempotencyKey: "1b28d0fb-430f-41bb-bf83-8eb20900be6c", jobGlobalId: print.payload.jobGlobalId, orderGlobalId, status: "previewed", dependency: print.operationId });
+    expect((await (await postCommands([preview])).json()).results[0].status).toBe("accepted");
+    const acknowledgement = makePrintTransition({ operationId: "a2b5ac38-83b0-4a68-a32b-2bb3acfe93ee", idempotencyKey: "a0a1ce4e-4143-4e42-a013-6e886393a40c", jobGlobalId: print.payload.jobGlobalId, orderGlobalId, status: "acknowledged", dependency: preview.operationId });
+    expect((await (await postCommands([acknowledgement])).json()).results[0].status).toBe("accepted");
+    const kot = makePrintCommand({ operationId: "86d0c442-9d0a-4870-820b-769e5e9760f7", idempotencyKey: "b35e1a31-5aa0-4aaf-8676-0f450740709a", jobGlobalId: "3387c2ab-bcf5-4695-9a5b-6848ec74f6a7", orderGlobalId, shiftGlobalId: shiftOpen.payload.shiftGlobalId, dependencies: [orderOperationId], documentType: "kot", stationId: stationGlobalId });
+    expect((await (await postCommands([kot])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([kot])).json()).results[0].status).toBe("already_applied");
+    const reprint = makePrintCommand({ operationId: "bb7d5e83-7a62-4639-9057-b3f71b7467d8", idempotencyKey: "73f62f20-801b-4e64-bc37-a55f406a1c27", jobGlobalId: "524eb97d-cf03-43b4-995f-29217be28e51", orderGlobalId, shiftGlobalId: shiftOpen.payload.shiftGlobalId, dependencies: [print.operationId], isReprint: true, reprintReason: "Customer copy requested" });
+    expect((await (await postCommands([reprint])).json()).results[0].status).toBe("accepted");
+    const printRows = await db.select().from(printJobs);
+    expect(printRows).toHaveLength(3);
+    expect(printRows.some((job) => job.document_type === "receipt" && job.status === "acknowledged" && !job.is_reprint)).toBe(true);
+    expect(printRows.filter((job) => job.is_reprint)).toHaveLength(1);
+    const cancellation = makeCancellationCommand({ operationId: "c3468a0a-bbd2-48ab-9b1b-a4ac9291fc9a", idempotencyKey: "d97a1c4d-85f3-4a91-84a1-f09ded50f215", cancellationGlobalId: "71c566e5-70aa-405a-98cf-eb657e218efb", orderGlobalId, shiftGlobalId: shiftOpen.payload.shiftGlobalId, checkoutGlobalId: checkout.payload.checkoutGlobalId, originalPaymentGlobalIds: checkout.payload.paymentGlobalIds, refundGlobalIds: ["49c33f7c-6337-458d-a4e0-f6ef86b96a68", "8511c9d3-3884-4cee-9a8e-9184d06347fb"], transactionGlobalIds: ["9e76fe2b-6098-4791-9e1b-931b51526ca5", "9a64483a-a77a-4f32-ae3c-2d069aedb817"], dependencies: [checkout.operationId, shiftOpen.operationId] });
+    expect((await (await postCommands([cancellation])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([cancellation])).json()).results[0].status).toBe("already_applied");
+    expect((await db.select().from(orders).where(eq(orders.client_request_id, "central-order-sync-001")))[0]?.payment_status).toBe("refunded");
+    expect((await db.select().from(orderPayments))).toHaveLength(4);
+    expect((await db.select().from(transactions).where(eq(transactions.order_id, (await db.query.orders.findFirst({ where: eq(orders.client_request_id, "central-order-sync-001") }))!.id)))).toHaveLength(4);
+    expect((await db.select().from(orderCancellations))).toHaveLength(1);
   });
 });

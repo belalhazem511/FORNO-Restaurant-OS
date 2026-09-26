@@ -3,8 +3,10 @@ import { db } from "@/lib/db";
 import { applyCancellationDisposition } from "@/lib/inventory/service";
 import { auditLogs, cashierShifts, orderCancellations, orderPayments, orders, orderStatusHistory, restaurantTables, transactions } from "@/lib/db/schema";
 
-export async function cancelOrder(input: { idempotencyKey: string; reason: string; inventoryDisposition?: "returned_unused" | "prepared_discarded" }, order: typeof orders.$inferSelect, wasPaid: boolean, shift: typeof cashierShifts.$inferSelect | null, actorId: string) {
-  return db.transaction(async (tx) => {
+type CancellationTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+export async function cancelOrder(input: { idempotencyKey: string; reason: string; inventoryDisposition?: "returned_unused" | "prepared_discarded" }, order: typeof orders.$inferSelect, wasPaid: boolean, shift: typeof cashierShifts.$inferSelect | null, actorId: string, transaction?: CancellationTransaction) {
+  const persist = async (tx: CancellationTransaction) => {
     const current = await tx.query.orders.findFirst({ where: eq(orders.id, order.id) });
     if (!current || current.status === "cancelled") throw new Error("Order is already cancelled");
     const [cancellation] = await tx.insert(orderCancellations).values({
@@ -79,6 +81,7 @@ export async function cancelOrder(input: { idempotencyKey: string; reason: strin
       entity_type: "order_cancellation", entity_id: String(cancellation.id),
       reason: input.reason, details: JSON.stringify({ wasPaid, refundedAmount }),
     });
-    return { orderId: order.id, paymentStatus: wasPaid ? "refunded" as const : "unpaid" as const, refundedAmount };
-  });
+    return { cancellationId: cancellation.id, orderId: order.id, paymentStatus: wasPaid ? "refunded" as const : "unpaid" as const, refundedAmount };
+  };
+  return transaction ? persist(transaction) : db.transaction(persist);
 }

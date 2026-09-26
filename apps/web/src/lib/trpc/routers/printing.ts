@@ -9,6 +9,7 @@ import {
   orders,
   printJobs,
   registerPrintPreferences,
+  syncDevices,
   type PrintDocumentType,
   type PrintLanguage,
   type PrintPaperWidth,
@@ -16,6 +17,7 @@ import {
 import { assertKotContainsNoFinancialData, classifyReceiptState, type PrintableItem, type TrustedPrintDocument } from "@/lib/printing/documents";
 import { hasPermission, requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
+import { executeLocalCommand, ensureLocalGlobalMapping } from "@/lib/sync/local-command";
 
 const paperWidthSchema = z.union([z.literal(58), z.literal(80)]);
 const languageSchema = z.enum(["ar", "en", "bilingual"]);
@@ -151,7 +153,11 @@ export const printingRouter = router({
       if (!register) throw new TRPCError({ code: "NOT_FOUND", message: "Register not found" });
       await requireStaff(ctx.user.id, register.branch_id, "print:settings");
       return db.transaction(async (tx) => {
-        const [preference] = await tx.insert(registerPrintPreferences).values({
+        const device = process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, process.env.FORNO_DESKTOP_DEVICE_ID ?? "") }) : null;
+        if (process.env.FORNO_DESKTOP_MODE === "1" && !device) throw new Error("The local synchronization identity is unavailable.");
+        const registerIdentity = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "register", localId: register.id }) : null;
+        const updatePreferences = async (transaction: typeof tx) => {
+        const [preference] = await transaction.insert(registerPrintPreferences).values({
           register_id: register.id,
           paper_width: input.paperWidth,
           language: input.language,
@@ -162,8 +168,20 @@ export const printingRouter = router({
           target: registerPrintPreferences.register_id,
           set: { paper_width: input.paperWidth, language: input.language, receipt_copies: input.receiptCopies, kot_copies: input.kotCopies, updated_by: ctx.user.id, updated_at: new Date() },
         }).returning();
-        await tx.insert(auditLogs).values({ branch_id: register.branch_id, actor_user_id: ctx.user.id, action: "print.settings.update", entity_type: "cashier_register", entity_id: String(register.id), details: JSON.stringify(input) });
+        await transaction.insert(auditLogs).values({ branch_id: register.branch_id, actor_user_id: ctx.user.id, action: "print.settings.update", entity_type: "cashier_register", entity_id: String(register.id), details: JSON.stringify(input) });
         return preference;
+        };
+        if (!device) return updatePreferences(tx);
+        if (!registerIdentity) throw new Error("The local register synchronization identity is unavailable.");
+        return executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "printing",
+          action: "settings_update",
+          entityType: "register_print_preferences",
+          localId: (preference) => String(preference.id),
+          dependsOnGlobalIds: () => [registerIdentity.global_id],
+          payload: (preferenceGlobalId, preference) => ({ preferenceGlobalId, registerGlobalId: registerIdentity.global_id, paperWidth: preference.paper_width, language: preference.language, receiptCopies: preference.receipt_copies, kotCopies: preference.kot_copies, updatedAt: preference.updated_at.toISOString() }),
+        }, updatePreferences);
       });
     }),
 
@@ -196,7 +214,14 @@ export const printingRouter = router({
         if (!initial) throw new TRPCError({ code: "BAD_REQUEST", message: "An initial document must exist before it can be reprinted" });
       }
       return db.transaction(async (tx) => {
-        const [job] = await tx.insert(printJobs).values({
+        const desktopMode = process.env.FORNO_DESKTOP_MODE === "1";
+        const device = desktopMode ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, process.env.FORNO_DESKTOP_DEVICE_ID ?? "") }) : null;
+        if (desktopMode && !device) throw new Error("The local synchronization identity is unavailable.");
+        const orderIdentity = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order", localId: order.id }) : null;
+        const shiftIdentity = device && printContext.shift ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "cashier_shift", localId: printContext.shift.id }) : null;
+        const stationIdentity = device && stationId ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "kitchen_station", localId: stationId }) : null;
+        const persist = async (transaction: typeof tx) => {
+        const [job] = await transaction.insert(printJobs).values({
           order_id: order.id,
           station_id: stationId,
           register_id: printContext.register?.id ?? null,
@@ -212,7 +237,7 @@ export const printingRouter = router({
           language: input.language ?? defaults.language,
           reprint_reason: input.reprint ? input.reprintReason : null,
         }).returning();
-        await tx.insert(auditLogs).values({
+        await transaction.insert(auditLogs).values({
           branch_id: order.branch_id,
           shift_id: printContext.shift?.id ?? null,
           order_id: order.id,
@@ -225,6 +250,22 @@ export const printingRouter = router({
           details: JSON.stringify({ documentType: input.documentType, stationId, paperWidth: job.paper_width, language: job.language, copies: job.copy_count }),
         });
         return { jobId: job.id, existing: false, copyCount: job.copy_count };
+        };
+        if (!device) {
+          const result = await persist(tx);
+          return { jobId: result.jobId, existing: result.existing, copyCount: result.copyCount };
+        }
+        if (!orderIdentity || printContext.shift && !shiftIdentity || stationId && !stationIdentity) throw new Error("A print dependency identity is unavailable.");
+        return executeLocalCommand<{ jobId: number; existing: boolean; copyCount: number }>(tx, {
+          actorId: ctx.user.id,
+          domain: "printing",
+          action: "request",
+          entityType: "print_job",
+          idempotencyKey: input.idempotencyKey,
+          localId: (result) => String(result.jobId),
+          dependsOnGlobalIds: () => [orderIdentity.global_id, ...(shiftIdentity ? [shiftIdentity.global_id] : []), ...(stationIdentity ? [stationIdentity.global_id] : [])],
+          payload: (jobGlobalId) => ({ jobGlobalId, orderGlobalId: orderIdentity.global_id, shiftGlobalId: shiftIdentity?.global_id ?? null, stationGlobalId: stationIdentity?.global_id ?? null, documentType: input.documentType, isReprint: input.reprint, reprintReason: input.reprint ? input.reprintReason : null, copyCount: input.copyCount ?? defaults.copyCount, paperWidth: input.paperWidth ?? defaults.paperWidth, language: input.language ?? defaults.language }),
+        }, persist);
       });
     }),
 
@@ -309,10 +350,28 @@ export const printingRouter = router({
       if (!allowed[job.status].includes(input.status)) throw new TRPCError({ code: "CONFLICT", message: `Cannot change print status from ${job.status} to ${input.status}` });
       if (input.status === "failed" && !input.errorMessage) throw new TRPCError({ code: "BAD_REQUEST", message: "A printer error message is required" });
       return db.transaction(async (tx) => {
-        const [updated] = await tx.update(printJobs).set({ status: input.status, error_message: input.status === "failed" ? input.errorMessage : null, previewed_at: input.status === "previewed" ? new Date() : job.previewed_at, acknowledged_at: input.status === "acknowledged" ? new Date() : null, updated_at: new Date() }).where(and(eq(printJobs.id, job.id), eq(printJobs.status, job.status))).returning();
+        const device = process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, process.env.FORNO_DESKTOP_DEVICE_ID ?? "") }) : null;
+        if (process.env.FORNO_DESKTOP_MODE === "1" && !device) throw new Error("The local synchronization identity is unavailable.");
+        const jobIdentity = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "print_job", localId: job.id }) : null;
+        const orderIdentity = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order", localId: job.order_id }) : null;
+        const persist = async (transaction: typeof tx) => {
+        const [updated] = await transaction.update(printJobs).set({ status: input.status, error_message: input.status === "failed" ? input.errorMessage : null, previewed_at: input.status === "previewed" ? new Date() : job.previewed_at, acknowledged_at: input.status === "acknowledged" ? new Date() : null, updated_at: new Date() }).where(and(eq(printJobs.id, job.id), eq(printJobs.status, job.status))).returning();
         if (!updated) throw new TRPCError({ code: "CONFLICT", message: "Print request was updated concurrently" });
-        await tx.insert(auditLogs).values({ branch_id: job.order.branch_id, shift_id: job.shift_id, order_id: job.order_id, actor_user_id: ctx.user.id, action: `print.${input.status}`, entity_type: "print_job", entity_id: String(job.id), details: input.errorMessage ?? null });
-        return { id: updated.id, status: updated.status };
+        await transaction.insert(auditLogs).values({ branch_id: job.order.branch_id, shift_id: job.shift_id, order_id: job.order_id, actor_user_id: ctx.user.id, action: `print.${input.status}`, entity_type: "print_job", entity_id: String(job.id), details: input.errorMessage ?? null });
+        return { id: updated.id, status: updated.status as typeof input.status };
+        };
+        if (!device) return persist(tx);
+        if (!jobIdentity || !orderIdentity) throw new Error("A print synchronization identity is unavailable.");
+        return executeLocalCommand<{ id: number; status: typeof input.status }>(tx, {
+          actorId: ctx.user.id,
+          domain: "printing",
+          action: "transition",
+          entityType: "print_job",
+          idempotencyKey: `print-transition:${job.id}:${input.status}`,
+          localId: (result) => String(result.id),
+          dependsOnGlobalIds: () => [jobIdentity.global_id, orderIdentity.global_id],
+          payload: (jobGlobalId) => ({ jobGlobalId, orderGlobalId: orderIdentity.global_id, status: input.status, errorMessage: input.errorMessage ?? null }),
+        }, persist);
       });
     }),
 

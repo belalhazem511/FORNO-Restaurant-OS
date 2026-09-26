@@ -5,6 +5,26 @@ import { auditLogs, syncDevices, syncEntityMappings, syncGlobalEntities, syncOut
 
 type LocalTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
+export async function ensureLocalGlobalMapping(
+  tx: LocalTransaction,
+  input: { organizationId: string; deviceId: string; branchId: number; entityType: string; localId: string | number },
+) {
+  const localId = String(input.localId);
+  let globalEntity = await tx.query.syncGlobalEntities.findFirst({
+    where: and(eq(syncGlobalEntities.organization_id, input.organizationId), eq(syncGlobalEntities.entity_type, input.entityType), eq(syncGlobalEntities.local_id, localId)),
+  });
+  if (!globalEntity) {
+    [globalEntity] = await tx.insert(syncGlobalEntities).values({ organization_id: input.organizationId, branch_id: input.branchId, entity_type: input.entityType, global_id: randomUUID(), local_id: localId }).returning();
+  }
+  let mapping = await tx.query.syncEntityMappings.findFirst({
+    where: and(eq(syncEntityMappings.device_id, input.deviceId), eq(syncEntityMappings.entity_type, input.entityType), eq(syncEntityMappings.local_id, localId)),
+  });
+  if (!mapping) {
+    [mapping] = await tx.insert(syncEntityMappings).values({ organization_id: input.organizationId, device_id: input.deviceId, branch_id: input.branchId, entity_type: input.entityType, global_id: globalEntity!.global_id, local_id: localId }).returning();
+  }
+  return mapping!;
+}
+
 type LocalCommandInput<Result> = {
   actorId: string;
   domain: string;
@@ -13,6 +33,7 @@ type LocalCommandInput<Result> = {
   localId(result: Result): string | null;
   payload(globalId: string, result: Result): Record<string, unknown>;
   dependsOnGlobalIds?(result: Result): string[];
+  idempotencyKey?: string;
 };
 
 function stableJson(value: unknown): string {
@@ -59,18 +80,25 @@ export async function executeLocalCommand<Result>(
   let entityMapping = await tx.query.syncEntityMappings.findFirst({
     where: and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, input.entityType), eq(syncEntityMappings.local_id, localId)),
   });
+  const isNewEntityMapping = !entityMapping;
   if (!entityMapping) {
     const globalId = randomUUID();
     [entityMapping] = await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: input.entityType, global_id: globalId, local_id: localId }).returning();
     await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: input.entityType, global_id: globalId, local_id: localId });
-  } else {
-    await tx.update(syncEntityMappings).set({ local_revision: entityMapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, entityMapping.id));
   }
 
   const payload = input.payload(entityMapping.global_id, result);
   const payloadHash = createHash("sha256").update(stableJson(payload)).digest("hex");
+  const idempotencyKey = input.idempotencyKey ?? randomUUID();
+  const priorOperation = await tx.query.syncOutbox.findFirst({ where: and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.idempotency_key, idempotencyKey)) });
+  if (priorOperation) {
+    if (priorOperation.payload_hash !== payloadHash) throw new Error("Local synchronization idempotency key was reused with different content.");
+    return result;
+  }
+  if (!isNewEntityMapping) {
+    await tx.update(syncEntityMappings).set({ local_revision: entityMapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, entityMapping.id));
+  }
   const operationId = randomUUID();
-  const idempotencyKey = randomUUID();
   const pendingCommands = await tx.select({ operation_id: syncOutbox.operation_id, payload: syncOutbox.payload })
     .from(syncOutbox)
     .where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.state, "pending")));

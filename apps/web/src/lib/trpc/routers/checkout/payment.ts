@@ -5,9 +5,10 @@ import { calculateDiscount } from "@/lib/finance";
 
 type Discount = { type: "percentage" | "fixed"; value: number; reason: string } | null | undefined;
 type Allocation = { paymentMethodId: number; amount: number; tenderedAmount?: number | null };
+type PaymentTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-export async function payOrder(input: { idempotencyKey: string; discount?: Discount; payments: Allocation[] }, order: typeof orders.$inferSelect, shift: typeof cashierShifts.$inferSelect, methodById: Map<number, typeof paymentMethods.$inferSelect>, actorId: string) {
-  return db.transaction(async (tx) => {
+export async function payOrder(input: { idempotencyKey: string; discount?: Discount; payments: Allocation[] }, order: typeof orders.$inferSelect, shift: typeof cashierShifts.$inferSelect, methodById: Map<number, typeof paymentMethods.$inferSelect>, actorId: string, transaction?: PaymentTransaction) {
+  const persist = async (tx: PaymentTransaction) => {
     const lockedOrder = await tx.query.orders.findFirst({
       where: eq(orders.id, order.id),
       with: { orderItems: { with: { modifiers: true } } },
@@ -117,5 +118,6 @@ export async function payOrder(input: { idempotencyKey: string; discount?: Disco
       changeAmount,
       paymentStatus: "paid" as const,
     };
-  });
+  };
+  return transaction ? persist(transaction) : db.transaction(persist);
 }

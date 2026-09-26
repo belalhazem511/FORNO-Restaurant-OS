@@ -9,6 +9,7 @@ const { ordersRouter } = await import("../orders");
 const { createCallerFactory } = await import("../../init");
 const {
   branches,
+  cashierRegisters,
   ingredientCategories,
   ingredients,
   inventoryLocations,
@@ -31,6 +32,10 @@ const {
   restaurantTables,
   stockBalances,
   staffAssignments,
+  syncDevices,
+  syncEntityMappings,
+  syncOrganizations,
+  syncOutbox,
   transactions,
   user,
   unitsOfMeasure,
@@ -264,5 +269,47 @@ describe("order lifecycle", () => {
     const order = await cashierCaller.create({ branchId, orderType: "takeaway", clientRequestId: requestId("cashier-override"), items: [pizzaLine()] });
     await expect(cashierCaller.transition({ id: order.id, status: "confirmed", inventoryOverrideReason: "Cashier cannot self authorize" })).rejects.toThrow("Cashiers cannot override");
     expect((await db.query.orders.findFirst({ where: eq(orders.id, order.id) }))?.status).toBe("pending");
+  });
+
+  it("commits desktop order creation with stable global references and one idempotent outbox command", async () => {
+    const organizationId = "773b1c55-20fb-4b3d-b55d-bec837959eed";
+    const deviceId = "2818db39-57bd-4b8c-94d1-458cdf751364";
+    const branch = await db.query.branches.findFirst({ where: eq(branches.id, branchId) });
+    const register = await db.insert(cashierRegisters).values({ branch_id: branchId, code: "SYNC-ORDERS", name_en: "Sync", name_ar: "مزامنة", is_active: true }).returning();
+    await db.insert(syncOrganizations).values({ id: organizationId, name: "Order sync test" });
+    await db.insert(syncDevices).values({ id: deviceId, organization_id: organizationId, display_name: "Order device", branch_id: branch!.id, register_id: register[0]!.id, status: "local_only" });
+    await db.insert(syncEntityMappings).values([
+      { organization_id: organizationId, device_id: deviceId, branch_id: branchId, entity_type: "branch", global_id: "a68e7f29-7b8a-4362-9944-5b7f8506ff01", local_id: String(branchId), local_revision: 1, server_revision: 0 },
+      { organization_id: organizationId, device_id: deviceId, branch_id: branchId, entity_type: "register", global_id: "8fe0be0c-41b7-408e-bc1b-9198d0f6f7af", local_id: String(register[0]!.id), local_revision: 1, server_revision: 0 },
+    ]);
+    const previousMode = process.env.FORNO_DESKTOP_MODE;
+    const previousDevice = process.env.FORNO_DESKTOP_DEVICE_ID;
+    process.env.FORNO_DESKTOP_MODE = "1";
+    process.env.FORNO_DESKTOP_DEVICE_ID = deviceId;
+    try {
+      const clientRequestId = "desktop-order-once-0001";
+      const input = { branchId, orderType: "takeaway" as const, clientRequestId, items: [pizzaLine({ notes: "Kitchen note" })] };
+      const first = await caller.create(input);
+      const retry = await caller.create(input);
+      await caller.update({ id: first.id, status: "confirmed" });
+      await caller.transition({ id: first.id, status: "preparing" });
+      const commands = await db.select().from(syncOutbox).where(eq(syncOutbox.domain, "orders"));
+      expect(retry.id).toBe(first.id);
+      expect(commands).toHaveLength(3);
+      expect(commands[0]?.action).toBe("create");
+      expect(commands[1]?.action).toBe("update");
+      expect(commands[2]?.action).toBe("transition");
+      expect(commands[1]?.dependencies).toContain(commands[0]?.operation_id);
+      expect(commands[2]?.dependencies).toContain(commands[1]?.operation_id);
+      expect(commands[0]?.payload.orderGlobalId).toEqual(expect.any(String));
+      expect(commands[0]?.payload.items).toMatchObject([{ quantity: 1, notes: "Kitchen note" }]);
+      expect(commands[0]?.payload).not.toHaveProperty("orderId");
+      expect((commands[0]?.payload.items as Array<Record<string, unknown>>)[0]).not.toHaveProperty("menuItemId");
+    } finally {
+      if (previousMode === undefined) delete process.env.FORNO_DESKTOP_MODE;
+      else process.env.FORNO_DESKTOP_MODE = previousMode;
+      if (previousDevice === undefined) delete process.env.FORNO_DESKTOP_DEVICE_ID;
+      else process.env.FORNO_DESKTOP_DEVICE_ID = previousDevice;
+    }
   });
 });

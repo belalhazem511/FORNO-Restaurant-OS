@@ -5,6 +5,8 @@ import { validateOrderFulfilment } from "@/lib/orders/lifecycle";
 import { TRPCError } from "@trpc/server";
 import { menuAvailability } from "@/lib/inventory/service";
 
+type OrderTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 type CreateOrderInput = {
   branchId: number;
   customerId?: number | null;
@@ -21,8 +23,9 @@ type CreateOrderInput = {
   }>;
 };
 
-export async function createOrder(input: CreateOrderInput, userId: string) {
-  const existing = await db.query.orders.findFirst({
+export async function createOrder(input: CreateOrderInput, userId: string, transaction?: OrderTransaction) {
+  const executor = transaction ?? db;
+  const existing = await executor.query.orders.findFirst({
     where: eq(orders.client_request_id, input.clientRequestId),
     with: { customer: { columns: { name: true } } },
   });
@@ -37,20 +40,20 @@ export async function createOrder(input: CreateOrderInput, userId: string) {
     deliveryAddress: input.deliveryAddress,
     customerId: input.customerId,
   });
-  const branch = await db.query.branches.findFirst({
+  const branch = await executor.query.branches.findFirst({
     where: and(eq(branches.id, input.branchId), eq(branches.is_active, true)),
   });
   if (!branch) throw new Error("Active restaurant branch not found");
 
   if (input.customerId) {
-    const customer = await db.query.customers.findFirst({
+    const customer = await executor.query.customers.findFirst({
       where: and(eq(customers.id, input.customerId), eq(customers.user_uid, userId)),
     });
     if (!customer) throw new Error("Customer not found");
   }
 
   if (input.diningTableId) {
-    const table = await db.query.restaurantTables.findFirst({
+    const table = await executor.query.restaurantTables.findFirst({
       where: eq(restaurantTables.id, input.diningTableId),
       with: { diningArea: { columns: { branch_id: true } } },
     });
@@ -69,7 +72,7 @@ export async function createOrder(input: CreateOrderInput, userId: string) {
     modifierTotal: number;
   }> = [];
   for (const requestedItem of input.items) {
-    const menuItem = await db.query.menuItems.findFirst({
+    const menuItem = await executor.query.menuItems.findFirst({
       where: eq(menuItems.id, requestedItem.menuItemId),
       with: {
         category: true,
@@ -130,7 +133,7 @@ export async function createOrder(input: CreateOrderInput, userId: string) {
     0,
   );
 
-  return db.transaction(async (tx) => {
+  const persist = async (tx: OrderTransaction) => {
     const stockConfigurations = new Map<string, { menuItemId: number; variantId: number | null; modifierOptionIds: number[]; quantity: number }>();
     for (const item of preparedItems) {
       const modifierOptionIds = item.selectedModifiers.map((modifier) => modifier.id).sort((a, b) => a - b);
@@ -219,5 +222,6 @@ export async function createOrder(input: CreateOrderInput, userId: string) {
       where: eq(customers.id, input.customerId), columns: { name: true },
     }) : null;
     return { ...orderData, customer: customer ?? null };
-  });
+  };
+  return transaction ? persist(transaction) : db.transaction(persist);
 }

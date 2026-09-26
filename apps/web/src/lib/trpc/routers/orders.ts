@@ -7,7 +7,9 @@ import {
   orders,
   orderStatusHistory,
   restaurantTables,
+  cashierShifts,
   staffAssignments,
+  syncDevices,
   type OrderStatus,
   type OrderType,
 } from "@/lib/db/schema";
@@ -17,6 +19,26 @@ import { protectedProcedure, router } from "../init";
 import { assertPermission, hasPermission } from "@/lib/permissions";
 import { issueOrderInventory } from "@/lib/inventory/service";
 import { createOrder } from "./orders/create";
+import { executeLocalCommand, ensureLocalGlobalMapping } from "@/lib/sync/local-command";
+
+type SyncedOrderResult = Awaited<ReturnType<typeof createOrder>> & {
+  syncReferences: {
+    branchGlobalId: string;
+    customerGlobalId: string | null;
+    diningTableGlobalId: string | null;
+    orderType: "dine_in" | "takeaway" | "delivery";
+    deliveryAddress: string | null;
+    clientRequestId: string;
+    items: Array<{
+      menuItemGlobalId: string;
+      variantGlobalId: string | null;
+      modifierOptionGlobalIds: string[];
+      quantity: number;
+      notes: string | null;
+    }>;
+    shiftGlobalId: string | null;
+  };
+};
 
 const orderTypeSchema = z.enum(ORDER_TYPES);
 const orderStatusSchema = z.enum(ORDER_STATUSES);
@@ -128,7 +150,39 @@ export const ordersRouter = router({
       })).min(1),
     }))
     .output(orderWithCustomerSchema)
-    .mutation(async ({ ctx, input }) => createOrder(input, ctx.user.id)),
+    .mutation(async ({ ctx, input }) => {
+      if (process.env.FORNO_DESKTOP_MODE !== "1") return createOrder(input, ctx.user.id);
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      if (!deviceId) throw new Error("The desktop device identity is unavailable.");
+      return db.transaction(async (tx) => {
+        const device = await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) });
+        if (!device) throw new Error("The local synchronization identity is unavailable.");
+        return executeLocalCommand<SyncedOrderResult>(tx, {
+          actorId: ctx.user.id,
+          domain: "orders",
+          action: "create",
+          entityType: "order",
+          idempotencyKey: input.clientRequestId,
+          localId: (result) => String(result.id),
+          dependsOnGlobalIds: (result) => [result.syncReferences.branchGlobalId, result.syncReferences.customerGlobalId, result.syncReferences.diningTableGlobalId, result.syncReferences.shiftGlobalId, ...result.syncReferences.items.flatMap((item) => [item.menuItemGlobalId, item.variantGlobalId, ...item.modifierOptionGlobalIds])].filter((globalId): globalId is string => Boolean(globalId)),
+          payload: (orderGlobalId, result) => ({ orderGlobalId, ...result.syncReferences }),
+        }, async (transaction) => {
+          const order = await createOrder(input, ctx.user.id, transaction);
+          const branch = await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "branch", localId: input.branchId });
+          const customer = input.customerId ? await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "customer", localId: input.customerId }) : null;
+          const table = input.diningTableId ? await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "restaurant_table", localId: input.diningTableId }) : null;
+          const items = await Promise.all(input.items.map(async (item) => {
+            const menuItem = await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "menu_item", localId: item.menuItemId });
+            const variant = item.variantId ? await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "menu_item_variant", localId: item.variantId }) : null;
+            const modifiers = await Promise.all(item.modifierOptionIds.map((id) => ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "modifier_option", localId: id })));
+            return { menuItemGlobalId: menuItem.global_id, variantGlobalId: variant?.global_id ?? null, modifierOptionGlobalIds: modifiers.map((mapping) => mapping.global_id), quantity: item.quantity, notes: item.notes ?? null };
+          }));
+          const shift = await transaction.query.cashierShifts.findFirst({ where: and(eq(cashierShifts.branch_id, input.branchId), eq(cashierShifts.cashier_user_id, ctx.user.id), eq(cashierShifts.status, "open")) });
+          const shiftMapping = shift ? await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "cashier_shift", localId: shift.id }) : null;
+          return { ...order, syncReferences: { branchGlobalId: branch.global_id, customerGlobalId: customer?.global_id ?? null, diningTableGlobalId: table?.global_id ?? null, orderType: input.orderType, deliveryAddress: input.deliveryAddress ?? null, clientRequestId: input.clientRequestId, items, shiftGlobalId: shiftMapping?.global_id ?? null } };
+        });
+      });
+    }),
 
   update: protectedProcedure
     .meta({ openapi: { method: "PATCH", path: "/orders/{id}", tags: ["Orders"], summary: "Update an order" } })
@@ -140,7 +194,8 @@ export const ordersRouter = router({
       inventoryOverrideReason: z.string().trim().min(3).max(500).optional(),
     }))
     .output(orderWithCustomerSchema)
-    .mutation(async ({ ctx, input }) => db.transaction(async (tx) => {
+    .mutation(async ({ ctx, input }) => {
+      const updateOrder = async (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => {
       const current = await tx.query.orders.findFirst({
         where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)),
       });
@@ -181,12 +236,32 @@ export const ordersRouter = router({
         ? await tx.query.customers.findFirst({ where: eq(customers.id, updated.customer_id), columns: { name: true } })
         : null;
       return { ...updated, customer: customer ?? null };
-    })),
+      };
+      if (process.env.FORNO_DESKTOP_MODE !== "1") return db.transaction(updateOrder);
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      if (!deviceId) throw new Error("The desktop device identity is unavailable.");
+      return db.transaction(async (tx) => {
+        const device = await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) });
+        if (!device) throw new Error("The local synchronization identity is unavailable.");
+        const orderIdentity = await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order", localId: input.id });
+        return executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "orders",
+          action: "update",
+          entityType: "order",
+          idempotencyKey: `order-update:${input.id}:${input.status ?? "unchanged"}:${input.note ?? ""}:${input.inventoryOverrideReason ?? ""}`,
+          localId: (order) => String(order.id),
+          dependsOnGlobalIds: () => [orderIdentity.global_id],
+          payload: (orderGlobalId, order) => ({ orderGlobalId, status: order.status, note: input.note ?? null, inventoryOverrideReason: input.inventoryOverrideReason ?? null }),
+        }, updateOrder);
+      });
+    }),
 
   transition: protectedProcedure
     .input(z.object({ id: z.number(), status: orderStatusSchema, note: z.string().max(500).optional(), inventoryOverrideReason: z.string().trim().min(3).max(500).optional() }))
     .output(orderWithCustomerSchema)
-    .mutation(async ({ ctx, input }) => db.transaction(async (tx) => {
+    .mutation(async ({ ctx, input }) => {
+      const performTransition = async (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => {
       const current = await tx.query.orders.findFirst({
         where: and(eq(orders.id, input.id), eq(orders.user_uid, ctx.user.id)),
       });
@@ -218,7 +293,25 @@ export const ordersRouter = router({
         ? await tx.query.customers.findFirst({ where: eq(customers.id, updated.customer_id), columns: { name: true } })
         : null;
       return { ...updated, customer: customer ?? null };
-    })),
+      };
+      if (process.env.FORNO_DESKTOP_MODE !== "1") return db.transaction(performTransition);
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      if (!deviceId) throw new Error("The desktop device identity is unavailable.");
+      return db.transaction(async (tx) => {
+        const device = await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) });
+        if (!device) throw new Error("The local synchronization identity is unavailable.");
+        await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order", localId: input.id });
+        return executeLocalCommand(tx, {
+          actorId: ctx.user.id,
+          domain: "orders",
+          action: "transition",
+          entityType: "order",
+          idempotencyKey: `order-transition:${input.id}:${input.status}:${input.note ?? ""}:${input.inventoryOverrideReason ?? ""}`,
+          localId: (result) => String(result.id),
+          payload: (orderGlobalId) => ({ orderGlobalId, status: input.status, note: input.note ?? null, inventoryOverrideReason: input.inventoryOverrideReason ?? null }),
+        }, performTransition);
+      });
+    }),
 
   delete: protectedProcedure
     .meta({ openapi: { method: "DELETE", path: "/orders/{id}", tags: ["Orders"], summary: "Delete an order and its items" } })

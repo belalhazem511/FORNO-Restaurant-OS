@@ -10,11 +10,14 @@ import {
   orderPayments,
   orders,
   paymentMethods,
+  syncDevices,
+  transactions,
 } from "@/lib/db/schema";
 import { requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
 import { cancelOrder } from "./checkout/cancellation";
 import { payOrder } from "./checkout/payment";
+import { executeLocalCommand, ensureLocalGlobalMapping } from "@/lib/sync/local-command";
 
 const discountInputSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("percentage"), value: z.number().int().positive(), reason: z.string().trim().min(3).max(500) }),
@@ -93,7 +96,45 @@ export const checkoutRouter = router({
       if (methods.length !== uniqueMethodIds.length) throw new Error("An allocated payment method is unavailable");
       const methodById = new Map(methods.map((method) => [method.id, method]));
 
-      return payOrder(input, order, shift, methodById, ctx.user.id);
+      if (process.env.FORNO_DESKTOP_MODE !== "1") return payOrder(input, order, shift, methodById, ctx.user.id);
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      if (!deviceId) throw new Error("The desktop device identity is unavailable.");
+      return db.transaction(async (tx) => {
+        const device = await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) });
+        if (!device) throw new Error("The local synchronization identity is unavailable.");
+        const orderMapping = await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order", localId: order.id });
+        const shiftMapping = await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "cashier_shift", localId: shift.id });
+        const paymentCodes = input.payments.map((payment) => ({
+          code: methodById.get(payment.paymentMethodId)!.code,
+          amount: payment.amount,
+          tenderedAmount: payment.tenderedAmount ?? null,
+        }));
+        return executeLocalCommand<Awaited<ReturnType<typeof payOrder>> & { syncReferences: { paymentGlobalIds: string[]; transactionGlobalIds: string[] } }>(tx, {
+          actorId: ctx.user.id,
+          domain: "checkout",
+          action: "pay",
+          entityType: "order_checkout",
+          idempotencyKey: input.idempotencyKey,
+          localId: (result) => String(result.checkoutId),
+          dependsOnGlobalIds: () => [orderMapping.global_id, shiftMapping.global_id],
+          payload: (checkoutGlobalId, result) => ({
+            checkoutGlobalId,
+            orderGlobalId: orderMapping.global_id,
+            shiftGlobalId: shiftMapping.global_id,
+            discount: input.discount ?? null,
+            payments: paymentCodes,
+            paymentGlobalIds: result.syncReferences.paymentGlobalIds,
+            transactionGlobalIds: result.syncReferences.transactionGlobalIds,
+          }),
+        }, async (transaction) => {
+          const result = await payOrder(input, order, shift, methodById, ctx.user.id, transaction);
+          const paymentRows = await transaction.select().from(orderPayments).where(and(eq(orderPayments.checkout_id, result.checkoutId), eq(orderPayments.kind, "payment")));
+          const paymentGlobalIds = await Promise.all(paymentRows.map(async (payment) => (await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order_payment", localId: payment.id })).global_id));
+          const transactionRows = await transaction.select().from(transactions).where(eq(transactions.order_id, order.id));
+          const transactionGlobalIds = await Promise.all(transactionRows.filter((row) => paymentRows.some((payment) => payment.id === row.order_payment_id)).map(async (row) => (await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "transaction", localId: row.id })).global_id));
+          return { ...result, syncReferences: { paymentGlobalIds, transactionGlobalIds } };
+        });
+      });
     }),
 
   cancel: protectedProcedure
@@ -134,7 +175,36 @@ export const checkoutRouter = router({
         if (!shift) throw new Error("An active cashier shift is required for a financial reversal");
       }
 
-      return cancelOrder(input, order, wasPaid, shift, ctx.user.id);
+      if (process.env.FORNO_DESKTOP_MODE !== "1") return cancelOrder(input, order, wasPaid, shift, ctx.user.id);
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      if (!deviceId) throw new Error("The desktop device identity is unavailable.");
+      return db.transaction(async (tx) => {
+        const device = await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) });
+        if (!device) throw new Error("The local synchronization identity is unavailable.");
+        const orderMapping = await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order", localId: order.id });
+        const shiftMapping = shift ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "cashier_shift", localId: shift.id }) : null;
+        const originalPayments = await tx.select().from(orderPayments).where(and(eq(orderPayments.order_id, order.id), eq(orderPayments.kind, "payment")));
+        const originalPaymentMappings = await Promise.all(originalPayments.map((payment) => ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order_payment", localId: payment.id })));
+        const originalCheckout = await tx.query.orderCheckouts.findFirst({ where: eq(orderCheckouts.order_id, order.id) });
+        const checkoutMapping = originalCheckout ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order_checkout", localId: originalCheckout.id }) : null;
+        return executeLocalCommand<{ cancellationId: number; orderId: number; paymentStatus: "unpaid" | "refunded"; refundedAmount: number; syncReferences: { refundGlobalIds: string[]; transactionGlobalIds: string[] } }>(tx, {
+          actorId: ctx.user.id,
+          domain: "checkout",
+          action: "cancel",
+          entityType: "order_cancellation",
+          idempotencyKey: input.idempotencyKey,
+          localId: (result) => String(result.cancellationId),
+          dependsOnGlobalIds: () => [orderMapping.global_id, ...(shiftMapping ? [shiftMapping.global_id] : []), ...(checkoutMapping ? [checkoutMapping.global_id] : []), ...originalPaymentMappings.map((mapping) => mapping.global_id)],
+          payload: (cancellationGlobalId, result) => ({ cancellationGlobalId, orderGlobalId: orderMapping.global_id, shiftGlobalId: shiftMapping?.global_id ?? null, checkoutGlobalId: checkoutMapping?.global_id ?? null, originalPaymentGlobalIds: originalPaymentMappings.map((mapping) => mapping.global_id), reason: input.reason, inventoryDisposition: input.inventoryDisposition ?? null, refundGlobalIds: result.syncReferences.refundGlobalIds, transactionGlobalIds: result.syncReferences.transactionGlobalIds }),
+        }, async (transaction) => {
+          const result = await cancelOrder(input, order, wasPaid, shift, ctx.user.id, transaction);
+          const refunds = await transaction.select().from(orderPayments).where(and(eq(orderPayments.order_id, order.id), eq(orderPayments.kind, "refund")));
+          const refundGlobalIds = await Promise.all(refunds.map(async (payment) => (await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "order_payment", localId: payment.id })).global_id));
+          const financialRows = await transaction.select().from(transactions).where(and(eq(transactions.order_id, order.id), eq(transactions.category, "refund")));
+          const transactionGlobalIds = await Promise.all(financialRows.map(async (row) => (await ensureLocalGlobalMapping(transaction, { organizationId: device.organization_id, deviceId: device.id, branchId: device.branch_id, entityType: "transaction", localId: row.id })).global_id));
+          return { ...result, syncReferences: { refundGlobalIds, transactionGlobalIds } };
+        });
+      });
     }),
 
   financials: protectedProcedure
