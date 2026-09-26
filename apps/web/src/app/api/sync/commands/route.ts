@@ -38,6 +38,7 @@ import {
   inventoryLocations,
   stockBalances,
   stockMovements,
+  suppliers,
 } from "@/lib/db/schema";
 import { createOrder } from "@/lib/trpc/routers/orders/create";
 import { payOrder } from "@/lib/trpc/routers/checkout/payment";
@@ -56,6 +57,7 @@ const valuesSchema = z.object({
   status: z.enum(["active", "inactive"]).nullable(),
 });
 const productValuesSchema = z.object({ name: z.string().min(1).max(255), description: z.string().nullable(), price: z.number().int().nonnegative(), in_stock: z.number().int().nonnegative(), category: z.string().max(50).nullable(), imageKey: z.string().max(200).nullable() });
+const supplierValuesSchema = z.object({ code: z.string().min(2).max(40), nameEn: z.string().min(2).max(160), nameAr: z.string().min(2).max(160), contactName: z.string().nullable(), phone: z.string().nullable(), email: z.string().nullable(), address: z.string().nullable(), notes: z.string().nullable() });
 const payloadSchemas = {
   "customers.create": z.object({ customerGlobalId: z.string().uuid(), values: valuesSchema }),
   "customers.update": z.object({ customerGlobalId: z.string().uuid(), values: valuesSchema }),
@@ -64,6 +66,9 @@ const payloadSchemas = {
   "products.update": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.delete": z.object({ productGlobalId: z.string().uuid() }),
   "inventory.adjust": z.object({ movementGlobalId: z.string().uuid(), ingredientGlobalId: z.string().uuid(), locationGlobalId: z.string().uuid(), direction: z.enum(["positive", "negative"]), opening: z.boolean(), quantityBase: z.number().int().positive(), unitCostMicros: z.number().int().nonnegative(), reason: z.string().trim().min(3).max(500), override: z.boolean(), idempotencyKey: z.string().trim().min(8).max(140) }),
+  "suppliers.create": z.object({ supplierGlobalId: z.string().uuid(), values: supplierValuesSchema }),
+  "suppliers.update": z.object({ supplierGlobalId: z.string().uuid(), values: supplierValuesSchema, baseRevision: z.number().int().nonnegative() }),
+  "suppliers.archive": z.object({ supplierGlobalId: z.string().uuid(), reason: z.string().trim().min(3).max(500), baseRevision: z.number().int().nonnegative(), values: supplierValuesSchema.extend({ isActive: z.boolean() }) }),
   "shifts.open": z.object({ shiftGlobalId: z.string().uuid(), registerGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() }),
   "shifts.close": z.object({ shiftGlobalId: z.string().uuid(), expectedCash: z.number().int(), closingCash: z.number().int().nonnegative(), closedAt: z.string().datetime() }),
   "shifts.drawer_adjust": z.object({ cashMovementGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid(), type: z.enum(["cash_in", "cash_out"]), amount: z.number().int().positive(), reason: z.string().trim().min(3).max(500), createdAt: z.string().datetime() }),
@@ -96,6 +101,9 @@ export const SYNC_COMMAND_REGISTRY = {
   "products.update": { schema: payloadSchemas["products.update"], permission: "product:manage", handler: "mutateProduct", importer: "product" },
   "products.delete": { schema: payloadSchemas["products.delete"], permission: "product:manage", handler: "mutateProduct", importer: "product" },
   "inventory.adjust": { schema: payloadSchemas["inventory.adjust"], permission: "inventory:adjust", handler: "adjustStock", importer: "stock_movement" },
+  "suppliers.create": { schema: payloadSchemas["suppliers.create"], permission: "supplier:manage", handler: "mutateSupplier", importer: "supplier" },
+  "suppliers.update": { schema: payloadSchemas["suppliers.update"], permission: "supplier:manage", handler: "mutateSupplier", importer: "supplier" },
+  "suppliers.archive": { schema: payloadSchemas["suppliers.archive"], permission: "supplier:manage", handler: "mutateSupplier", importer: "supplier" },
 } as const satisfies Record<keyof typeof payloadSchemas, { schema: z.ZodType; permission: string | null; handler: string; importer: string }>;
 const commandSchema = z.object({
   operationId: z.string().uuid(),
@@ -104,8 +112,8 @@ const commandSchema = z.object({
   branchGlobalId: z.string().uuid(),
   registerGlobalId: z.string().uuid(),
   actorGlobalId: z.string().uuid(),
-  domain: z.enum(["customers", "products", "shifts", "orders", "checkout", "printing", "inventory"]),
-  action: z.enum(["create", "update", "delete", "open", "drawer_adjust", "close", "pay", "cancel", "request", "transition", "settings_update", "adjust"]),
+  domain: z.enum(["customers", "products", "shifts", "orders", "checkout", "printing", "inventory", "suppliers"]),
+  action: z.enum(["create", "update", "delete", "open", "drawer_adjust", "close", "pay", "cancel", "request", "transition", "settings_update", "adjust", "archive"]),
   schemaVersion: z.literal(1),
   payload: z.record(z.string(), z.unknown()),
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -623,6 +631,66 @@ export async function POST(request: NextRequest) {
           await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "stock_movement", entity_global_id: adjustment.movementGlobalId, action: "adjust", server_revision: 1, source_operation_id: command.operationId });
           return { operationId: command.operationId, status: "accepted", result };
         }
+        if (command.domain === "suppliers") {
+          const supplierPayload = payload.data as z.infer<typeof payloadSchemas["suppliers.create"]> | z.infer<typeof payloadSchemas["suppliers.update"]> | z.infer<typeof payloadSchemas["suppliers.archive"]>;
+          if (!hasPermission(assignment.role, "supplier:manage")) {
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.permission_denied", entity_type: "supplier", entity_id: supplierPayload.supplierGlobalId, reason: "supplier:manage", details: JSON.stringify({ sourceOperationId: command.operationId }) });
+            return { operationId: command.operationId, status: "rejected", error: "Actor lacks supplier management permission." };
+          }
+          const [identity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "supplier"), eq(syncGlobalEntities.global_id, supplierPayload.supplierGlobalId))).for("update").limit(1);
+          const [deviceMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "supplier"), eq(syncEntityMappings.global_id, supplierPayload.supplierGlobalId))).for("update").limit(1);
+          let revision = 1;
+          let supplierId = identity ? Number(identity.local_id) : 0;
+          let inboxId: number;
+          if (command.action === "create") {
+            if (identity) return { operationId: command.operationId, status: "rejected", error: "Supplier global identity already exists." };
+            const values = (supplierPayload as z.infer<typeof payloadSchemas["suppliers.create"]>).values;
+            const duplicateCode = await tx.query.suppliers.findFirst({ where: and(eq(suppliers.branch_id, device.branch_id), eq(suppliers.code, values.code)) });
+            if (duplicateCode) {
+              const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+              await tx.update(syncCommandInbox).set({ result: { reason: "supplier_code_conflict" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+              await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "supplier", entity_global_id: supplierPayload.supplierGlobalId, local_payload: command.payload, server_snapshot: duplicateCode, reason: "The supplier code is already used in this branch." });
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.supplier.needs_review", entity_type: "supplier", entity_id: supplierPayload.supplierGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, conflictingSupplierId: duplicateCode.id }) });
+              return { operationId: command.operationId, status: "needs_review", result: { supplierGlobalId: supplierPayload.supplierGlobalId } };
+            }
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+            inboxId = inbox!.id;
+            const [created] = await tx.insert(suppliers).values({ branch_id: device.branch_id, code: values.code, name_en: values.nameEn, name_ar: values.nameAr, contact_name: values.contactName, phone: values.phone, email: values.email, address: values.address, notes: values.notes, is_active: true, created_by: actor.local_id, updated_by: actor.local_id }).returning();
+            supplierId = created!.id;
+            await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "supplier", global_id: supplierPayload.supplierGlobalId, local_id: String(supplierId), server_revision: 1 });
+            await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "supplier", global_id: supplierPayload.supplierGlobalId, local_id: String(supplierId), local_revision: 1, server_revision: 1 });
+          } else {
+            if (!identity || !deviceMapping || identity.branch_id !== device.branch_id) return { operationId: command.operationId, status: "rejected", error: "Supplier identity is unavailable in this branch." };
+            const baseRevision = "baseRevision" in supplierPayload ? supplierPayload.baseRevision : command.baseRevision;
+            if (deviceMapping.server_revision !== baseRevision) {
+              const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+              inboxId = inbox!.id;
+              const serverSupplier = await tx.query.suppliers.findFirst({ where: eq(suppliers.id, supplierId) });
+              await tx.update(syncCommandInbox).set({ result: { reason: "revision_conflict" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inboxId));
+              await tx.insert(syncConflicts).values({ inbox_id: inboxId, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "supplier", entity_global_id: supplierPayload.supplierGlobalId, local_payload: command.payload, server_snapshot: serverSupplier ?? {}, reason: "Supplier was changed on the central server after this device's base revision." });
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.supplier.needs_review", entity_type: "supplier", entity_id: supplierPayload.supplierGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, baseRevision, serverRevision: deviceMapping.server_revision }) });
+              return { operationId: command.operationId, status: "needs_review", result: { supplierGlobalId: supplierPayload.supplierGlobalId } };
+            }
+            if (command.action === "archive") {
+              const archive = supplierPayload as z.infer<typeof payloadSchemas["suppliers.archive"]>;
+              await tx.update(suppliers).set({ is_active: false, updated_by: actor.local_id, updated_at: new Date() }).where(eq(suppliers.id, supplierId));
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "supplier.archive", entity_type: "supplier", entity_id: supplierPayload.supplierGlobalId, reason: archive.reason });
+            } else {
+              const values = (supplierPayload as z.infer<typeof payloadSchemas["suppliers.update"]>).values;
+              await tx.update(suppliers).set({ code: values.code, name_en: values.nameEn, name_ar: values.nameAr, contact_name: values.contactName, phone: values.phone, email: values.email, address: values.address, notes: values.notes, updated_by: actor.local_id, updated_at: new Date() }).where(eq(suppliers.id, supplierId));
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "supplier.update", entity_type: "supplier", entity_id: supplierPayload.supplierGlobalId });
+            }
+            revision = deviceMapping.server_revision + 1;
+            await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, identity.id));
+            await tx.update(syncEntityMappings).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncEntityMappings.id, deviceMapping.id));
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+            inboxId = inbox!.id;
+          }
+          const result = { supplierGlobalId: supplierPayload.supplierGlobalId, revision };
+          await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inboxId));
+          await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "suppliers", entity_type: "supplier", entity_global_id: supplierPayload.supplierGlobalId, action: command.action, server_revision: revision, source_operation_id: command.operationId });
+          return { operationId: command.operationId, status: "accepted", result };
+        }
         if (command.domain === "products") {
           const productPayload = payload.data as z.infer<typeof payloadSchemas["products.create"]>;
           const productGlobalId = productPayload.productGlobalId;
@@ -753,7 +821,8 @@ export async function GET(request: NextRequest) {
     const isCheckout = change.domain === "checkout" && change.entity_type === "order_checkout";
     const isCancellation = change.domain === "checkout" && change.entity_type === "order_cancellation";
     const isStockMovement = change.domain === "inventory" && change.entity_type === "stock_movement";
-    if (!isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product"))) {
+    const isSupplier = change.domain === "suppliers" && change.entity_type === "supplier";
+    if (!isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && !isSupplier && ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product"))) {
       exported.push({ cursor: change.cursor, domain: change.domain, entityType: change.entity_type, entityGlobalId: change.entity_global_id, action: change.action, revision: change.server_revision, snapshot: null });
       continue;
     }
@@ -795,6 +864,13 @@ export async function GET(request: NextRequest) {
         if (!ingredient || !location || !actor) throw new Error("A stock movement change is missing a global ingredient, location, or actor mapping.");
         snapshot = { ingredientGlobalId: ingredient.global_id, locationGlobalId: location.global_id, actorGlobalId: actor.global_id, movementType: movement.movement_type, direction: movement.direction, quantityBase: movement.quantity_base, unitCostMicros: movement.unit_cost_micros, totalCostAmount: movement.total_cost_amount, sourceType: movement.source_type, sourceId: movement.source_id, idempotencyKey: movement.idempotency_key, reason: movement.reason, createdAt: movement.created_at.toISOString() };
       }
+    }
+    else if (isSupplier && mapping) {
+      const supplier = await db.query.suppliers.findFirst({ where: eq(suppliers.id, Number(mapping.local_id)) });
+      if (!supplier) throw new Error("A supplier change has no authoritative record.");
+      const [updatedBy] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, supplier.updated_by))).limit(1);
+      if (!updatedBy) throw new Error("A supplier change is missing its actor identity mapping.");
+      snapshot = { code: supplier.code, nameEn: supplier.name_en, nameAr: supplier.name_ar, contactName: supplier.contact_name, phone: supplier.phone, email: supplier.email, address: supplier.address, notes: supplier.notes, isActive: supplier.is_active, updatedByGlobalId: updatedBy.global_id };
     }
     else if (isOrder && mapping) {
       const order = await db.query.orders.findFirst({ where: eq(orders.id, Number(mapping.local_id)), with: { orderItems: { with: { modifiers: true } }, statusHistory: true } });

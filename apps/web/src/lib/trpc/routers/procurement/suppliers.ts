@@ -3,6 +3,8 @@ import { and, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { auditLogs, suppliers } from "@/lib/db/schema";
 
+type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 type SupplierFields = {
   branchId: number;
   code: string;
@@ -27,8 +29,7 @@ export async function assertSupplier(branchId: number, supplierId: number) {
   return supplier;
 }
 
-export async function createSupplier(input: SupplierFields, actorId: string) {
-  return db.transaction(async (tx) => {
+export async function createSupplier(tx: Transaction, input: SupplierFields, actorId: string) {
     const [supplier] = await tx
       .insert(suppliers)
       .values({
@@ -55,11 +56,9 @@ export async function createSupplier(input: SupplierFields, actorId: string) {
       details: JSON.stringify({ code: supplier.code }),
     });
     return supplier;
-  });
 }
 
-export async function updateSupplier(input: SupplierFields & { supplierId: number }, actorId: string) {
-  return db.transaction(async (tx) => {
+export async function updateSupplier(tx: Transaction, input: SupplierFields & { supplierId: number }, actorId: string) {
     const [supplier] = await tx
       .update(suppliers)
       .set({
@@ -85,11 +84,9 @@ export async function updateSupplier(input: SupplierFields & { supplierId: numbe
       entity_id: String(supplier.id),
     });
     return supplier;
-  });
 }
 
-export async function archiveSupplier(input: { branchId: number; supplierId: number; reason: string }, actorId: string) {
-  return db.transaction(async (tx) => {
+export async function archiveSupplier(tx: Transaction, input: { branchId: number; supplierId: number; reason: string }, actorId: string) {
     const [updated] = await tx
       .update(suppliers)
       .set({ is_active: false, updated_by: actorId, updated_at: new Date() })
@@ -105,5 +102,4 @@ export async function archiveSupplier(input: { branchId: number; supplierId: num
       reason: input.reason,
     });
     return updated;
-  });
 }

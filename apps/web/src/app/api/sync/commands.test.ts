@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { NextRequest } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, SCHEMA_DDL } from "@/lib/trpc/routers/__tests__/helpers";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, kitchenStations, menuCategories, menuItems, orderCancellations, orderCheckouts, orderPayments, orders, paymentMethods, printJobs, products, recipeComponents, recipeVersions, shiftCashMovements, staffAssignments, stockBalances, stockMovements, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, kitchenStations, menuCategories, menuItems, orderCancellations, orderCheckouts, orderPayments, orders, paymentMethods, printJobs, products, recipeComponents, recipeVersions, shiftCashMovements, staffAssignments, stockBalances, stockMovements, suppliers, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
 import { productImagePath } from "@/lib/media/product-images";
 
 const { pg, db } = createTestDb();
@@ -25,6 +25,7 @@ const menuItemGlobalId = "5575a74a-9bbc-4b99-9847-0bce2095e6ef";
 const stationGlobalId = "c40f7ab8-d0db-4f6b-811e-837dc0ba8ce7";
 const ingredientGlobalId = "7447115b-e944-465d-a4c4-53e54a4f4a1d";
 const locationGlobalId = "ddcc591a-67e9-4af9-9b2c-d618f49b3bc3";
+const supplierGlobalId = "13bfa1d7-1a74-4b6c-b399-0658e7f1afdb";
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -124,6 +125,11 @@ function makeStockAdjustmentCommand() {
   return { operationId: "82867db8-c9a8-4c8e-85be-f5b99f2e6e55", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "inventory", action: "adjust", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "stock-adjustment-command-001", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
 }
 
+function makeSupplierCommand() {
+  const payload = { supplierGlobalId, values: { code: "SYNC-SUP", nameEn: "Sync Supplier", nameAr: "مورد", contactName: null, phone: null, email: null, address: null, notes: "Paired device supplier" } };
+  return { operationId: "48488adb-15ce-4d67-bc95-4d180e932611", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "suppliers", action: "create", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "supplier-sync-create-001", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+}
+
 async function postCommands(commands: unknown[]) {
   return POST(new NextRequest("http://localhost/api/sync/commands", {
     method: "POST",
@@ -183,6 +189,7 @@ describe("paired customer command processing", () => {
       "checkout.cancel", "checkout.pay", "customers.create", "customers.delete", "customers.update", "inventory.adjust",
       "orders.create", "orders.transition", "orders.update", "printing.request", "printing.settings_update", "printing.transition",
       "products.create", "products.delete", "products.update", "shifts.close", "shifts.drawer_adjust", "shifts.open",
+      "suppliers.archive", "suppliers.create", "suppliers.update",
     ]);
     for (const command of Object.values(SYNC_COMMAND_REGISTRY)) {
       expect(typeof command.schema.safeParse).toBe("function");
@@ -204,6 +211,30 @@ describe("paired customer command processing", () => {
     const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
     const changes = (await response.json()).changes as Array<{ entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
     expect(changes.find((change) => change.entityGlobalId === command.payload.movementGlobalId)?.snapshot).toMatchObject({ ingredientGlobalId, locationGlobalId, direction: 1, quantityBase: 2_500, unitCostMicros: 125, sourceType: "inventory_adjustment" });
+  });
+
+  it("applies supplier creation once and exports its branch-scoped UUID snapshot", async () => {
+    const command = makeSupplierCommand();
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
+    let created = await db.query.suppliers.findFirst({ where: eq(suppliers.code, "SYNC-SUP") });
+    expect(created).toMatchObject({ branch_id: centralBranchId, name_en: "Sync Supplier", is_active: true });
+    expect((await db.select().from(suppliers).where(eq(suppliers.code, "SYNC-SUP"))).length).toBe(1);
+    const updatePayload = { supplierGlobalId, values: { ...command.payload.values, nameEn: "Updated Sync Supplier" }, baseRevision: 1 };
+    const updateCommand = { ...command, operationId: "9c64d171-ae7e-4449-8a9c-29b1cf7835a0", action: "update", payload: updatePayload, payloadHash: createHash("sha256").update(stableJson(updatePayload)).digest("hex"), idempotencyKey: "supplier-sync-update-001", baseRevision: 1 };
+    expect((await (await postCommands([updateCommand])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([updateCommand])).json()).results[0].status).toBe("already_applied");
+    created = await db.query.suppliers.findFirst({ where: eq(suppliers.code, "SYNC-SUP") });
+    expect(created?.name_en).toBe("Updated Sync Supplier");
+    const archivePayload = { supplierGlobalId, reason: "Supplier record verified for archive", baseRevision: 2, values: { ...updatePayload.values, isActive: true } };
+    const archiveCommand = { ...command, operationId: "b45d8eef-9187-42d8-a76b-343f9d89fc36", action: "archive", payload: archivePayload, payloadHash: createHash("sha256").update(stableJson(archivePayload)).digest("hex"), idempotencyKey: "supplier-sync-archive-001", baseRevision: 2 };
+    expect((await (await postCommands([archiveCommand])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([archiveCommand])).json()).results[0].status).toBe("already_applied");
+    created = await db.query.suppliers.findFirst({ where: eq(suppliers.code, "SYNC-SUP") });
+    expect(created?.is_active).toBe(false);
+    const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const changes = (await response.json()).changes as Array<{ entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
+    expect(changes.find((change) => change.entityGlobalId === supplierGlobalId)?.snapshot).toMatchObject({ code: "SYNC-SUP", nameEn: "Updated Sync Supplier", isActive: false, updatedByGlobalId: actorGlobalId });
   });
 
   it("applies print-setting commands once and exports a typed register snapshot", async () => {

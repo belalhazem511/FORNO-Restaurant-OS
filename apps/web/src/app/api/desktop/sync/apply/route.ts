@@ -3,7 +3,7 @@ import { and, eq, or, sql } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
-import { auditLogs, cashierShifts, customers, ingredients, inventoryLocations, orderCancellations, orderCheckouts, orderItemModifiers, orderItems, orderPayments, orderStatusHistory, orders, paymentMethods, printJobs, products, registerPrintPreferences, restaurantTables, shiftCashMovements, stockBalances, stockMovements, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox, transactions } from "@/lib/db/schema";
+import { auditLogs, cashierShifts, customers, ingredients, inventoryLocations, orderCancellations, orderCheckouts, orderItemModifiers, orderItems, orderPayments, orderStatusHistory, orders, paymentMethods, printJobs, products, registerPrintPreferences, restaurantTables, shiftCashMovements, stockBalances, stockMovements, suppliers, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox, transactions } from "@/lib/db/schema";
 import { movingWeightedAverage } from "@/lib/inventory/exact";
 
 export const runtime = "nodejs";
@@ -19,6 +19,7 @@ const printPreferencesSnapshot = z.object({ registerGlobalId: z.string().uuid(),
 const checkoutSnapshot = z.object({ orderGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), idempotencyKey: z.string(), subtotalAmount: z.number().int(), discountAmount: z.number().int(), payableAmount: z.number().int(), approvedByGlobalId: z.string().uuid().nullable(), createdAt: z.string().datetime(), payments: z.array(z.object({ paymentGlobalId: z.string().uuid(), transactionGlobalId: z.string().uuid(), methodCode: z.string(), amount: z.number().int(), tenderedAmount: z.number().int().nullable(), changeAmount: z.number().int(), createdAt: z.string().datetime() })) });
 const cancellationSnapshot = z.object({ orderGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid().nullable(), actorGlobalId: z.string().uuid(), idempotencyKey: z.string(), reason: z.string(), wasPaid: z.boolean(), inventoryDisposition: z.enum(["returned_unused", "prepared_discarded"]).nullable(), createdAt: z.string().datetime(), refunds: z.array(z.object({ refundGlobalId: z.string().uuid(), originalPaymentGlobalId: z.string().uuid(), transactionGlobalId: z.string().uuid(), methodCode: z.string(), amount: z.number().int(), createdAt: z.string().datetime() })) });
 const stockMovementSnapshot = z.object({ ingredientGlobalId: z.string().uuid(), locationGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), movementType: z.enum(["opening_balance", "manual_positive", "manual_negative", "negative_override"]), direction: z.union([z.literal(-1), z.literal(1)]), quantityBase: z.number().int().positive(), unitCostMicros: z.number().int().nonnegative(), totalCostAmount: z.number().int().nonnegative(), sourceType: z.literal("inventory_adjustment"), sourceId: z.string(), idempotencyKey: z.string(), reason: z.string().nullable(), createdAt: z.string().datetime() });
+const supplierSnapshot = z.object({ code: z.string(), nameEn: z.string(), nameAr: z.string(), contactName: z.string().nullable(), phone: z.string().nullable(), email: z.string().nullable(), address: z.string().nullable(), notes: z.string().nullable(), isActive: z.boolean(), updatedByGlobalId: z.string().uuid() });
 const changeSchema = z.object({ cursor: z.number().int().positive(), domain: z.string(), entityType: z.string(), entityGlobalId: z.string().uuid(), action: z.string(), revision: z.number().int().positive(), snapshot: z.unknown().nullable() });
 
 function authorized(request: NextRequest) {
@@ -55,14 +56,15 @@ export async function POST(request: NextRequest) {
         const isCheckout = change.domain === "checkout" && change.entityType === "order_checkout";
         const isCancellation = change.domain === "checkout" && change.entityType === "order_cancellation";
         const isStockMovement = change.domain === "inventory" && change.entityType === "stock_movement";
-        if (!isCustomer && !isProduct && !isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement) continue;
+        const isSupplier = change.domain === "suppliers" && change.entityType === "supplier";
+        if (!isCustomer && !isProduct && !isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && !isSupplier) continue;
         const isDelete = change.action === "delete" && change.snapshot === null;
         if (!isDelete && !change.snapshot) {
           if (isStockMovement) throw new Error("An authoritative stock movement arrived without its required snapshot.");
           continue;
         }
         const isShiftClose = isShift && change.action === "close";
-        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShiftClose ? shiftCloseSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : isCashMovement ? cashMovementSnapshot.safeParse(change.snapshot) : isOrder ? orderSnapshot.safeParse(change.snapshot) : isPrintJob ? printJobSnapshot.safeParse(change.snapshot) : isPrintPreferences ? printPreferencesSnapshot.safeParse(change.snapshot) : isCheckout ? checkoutSnapshot.safeParse(change.snapshot) : isCancellation ? cancellationSnapshot.safeParse(change.snapshot) : stockMovementSnapshot.safeParse(change.snapshot);
+        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShiftClose ? shiftCloseSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : isCashMovement ? cashMovementSnapshot.safeParse(change.snapshot) : isOrder ? orderSnapshot.safeParse(change.snapshot) : isPrintJob ? printJobSnapshot.safeParse(change.snapshot) : isPrintPreferences ? printPreferencesSnapshot.safeParse(change.snapshot) : isCheckout ? checkoutSnapshot.safeParse(change.snapshot) : isCancellation ? cancellationSnapshot.safeParse(change.snapshot) : isSupplier ? supplierSnapshot.safeParse(change.snapshot) : stockMovementSnapshot.safeParse(change.snapshot);
         if (parsedSnapshot && !parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
         const snapshot = parsedSnapshot?.success ? parsedSnapshot.data : null;
         const entityType = change.entityType;
@@ -165,6 +167,14 @@ export async function POST(request: NextRequest) {
             await tx.insert(auditLogs).values({ branch_id: device.branch_id, shift_id: Number(mapping.local_id), actor_user_id: closedBy.local_id, action: "sync.cashier_shift.closed", entity_type: "cashier_shift", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor, expectedCash: close.expectedCash, closingCash: close.closingCash, variance: close.variance }) });
             continue;
           }
+          if (isSupplier) {
+            const supplier = snapshot as z.infer<typeof supplierSnapshot>;
+            const [updatedBy] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, supplier.updatedByGlobalId))).limit(1);
+            if (!updatedBy) throw new Error("Pulled supplier references an unmapped actor.");
+            await tx.update(suppliers).set({ code: supplier.code, name_en: supplier.nameEn, name_ar: supplier.nameAr, contact_name: supplier.contactName, phone: supplier.phone, email: supplier.email, address: supplier.address, notes: supplier.notes, is_active: supplier.isActive, updated_by: updatedBy.local_id, updated_at: new Date() }).where(eq(suppliers.id, Number(mapping.local_id)));
+            await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
+            continue;
+          }
           if (isShift || isCashMovement) {
             await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
             continue;
@@ -179,6 +189,16 @@ export async function POST(request: NextRequest) {
           await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
         } else {
           if (isDelete) continue;
+          if (isSupplier) {
+            const supplier = snapshot as z.infer<typeof supplierSnapshot>;
+            const [actor] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, supplier.updatedByGlobalId))).limit(1);
+            if (!actor) throw new Error("Pulled supplier references an unmapped actor.");
+            const [created] = await tx.insert(suppliers).values({ branch_id: device.branch_id, code: supplier.code, name_en: supplier.nameEn, name_ar: supplier.nameAr, contact_name: supplier.contactName, phone: supplier.phone, email: supplier.email, address: supplier.address, notes: supplier.notes, is_active: supplier.isActive, created_by: actor.local_id, updated_by: actor.local_id }).returning();
+            await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "supplier", global_id: change.entityGlobalId, local_id: String(created!.id), local_revision: 1, server_revision: change.revision });
+            await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "supplier", global_id: change.entityGlobalId, local_id: String(created!.id), server_revision: change.revision });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.supplier.imported", entity_type: "supplier", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
+            continue;
+          }
           if (isStockMovement) {
             const movement = snapshot as z.infer<typeof stockMovementSnapshot>;
             const [ingredientMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "ingredient"), eq(syncEntityMappings.global_id, movement.ingredientGlobalId))).limit(1);

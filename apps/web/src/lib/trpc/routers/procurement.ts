@@ -10,6 +10,7 @@ import {
   purchaseOrders,
   staffAssignments,
   suppliers,
+  syncDevices,
   unitsOfMeasure,
 } from "@/lib/db/schema";
 import { convertScaledQuantity, multiplyDivide } from "@/lib/inventory/exact";
@@ -17,6 +18,7 @@ import { hasPermission, requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
 import { approvePurchaseOrder, cancelPurchaseOrder, submitPurchaseOrder } from "./procurement/purchase-order-lifecycle";
 import { archiveSupplier, assertSupplier, createSupplier, updateSupplier } from "./procurement/suppliers";
+import { ensureLocalGlobalMapping, executeLocalCommand } from "@/lib/sync/local-command";
 
 const branchInput = z.object({ branchId: z.number().int().positive() });
 const MAX_POSTGRES_INTEGER = 2_147_483_647;
@@ -172,7 +174,19 @@ export const procurementRouter = router({
     });
     if (duplicate)
       throw new TRPCError({ code: "CONFLICT", message: "Supplier code already exists in this branch" });
-    return createSupplier(input, ctx.user.id);
+    return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Supplier creation must use the paired device branch" });
+      return executeLocalCommand<typeof suppliers.$inferSelect>(tx, {
+      actorId: ctx.user.id,
+      domain: "suppliers",
+      action: "create",
+      entityType: "supplier",
+      localId: (supplier) => String(supplier.id),
+      payload: (supplierGlobalId, supplier) => ({ supplierGlobalId, values: { code: supplier.code, nameEn: supplier.name_en, nameAr: supplier.name_ar, contactName: supplier.contact_name, phone: supplier.phone, email: supplier.email, address: supplier.address, notes: supplier.notes } }),
+      }, (tx) => createSupplier(tx, input, ctx.user.id));
+    });
   }),
 
   updateSupplier: protectedProcedure
@@ -193,7 +207,16 @@ export const procurementRouter = router({
       });
       if (duplicate)
         throw new TRPCError({ code: "CONFLICT", message: "Supplier code already exists in this branch" });
-      return updateSupplier(input, ctx.user.id);
+      return db.transaction(async (tx) => {
+        const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+        const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+        if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Supplier updates must use the paired device branch" });
+        const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "supplier", localId: input.supplierId }) : undefined;
+        return executeLocalCommand<typeof suppliers.$inferSelect>(tx, {
+          actorId: ctx.user.id, domain: "suppliers", action: "update", entityType: "supplier", localId: (supplier) => String(supplier.id),
+          payload: (supplierGlobalId, supplier) => ({ supplierGlobalId, values: { code: supplier.code, nameEn: supplier.name_en, nameAr: supplier.name_ar, contactName: supplier.contact_name, phone: supplier.phone, email: supplier.email, address: supplier.address, notes: supplier.notes }, baseRevision: mapping?.server_revision ?? 0 }),
+        }, (tx) => updateSupplier(tx, input, ctx.user.id));
+      });
     }),
 
   archiveSupplier: protectedProcedure
@@ -206,7 +229,16 @@ export const procurementRouter = router({
     .mutation(async ({ ctx, input }) => {
       await requireStaff(ctx.user.id, input.branchId, "supplier:manage");
       await assertSupplier(input.branchId, input.supplierId);
-      return archiveSupplier(input, ctx.user.id);
+      return db.transaction(async (tx) => {
+        const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+        const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+        if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Supplier archive must use the paired device branch" });
+        const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "supplier", localId: input.supplierId }) : undefined;
+        return executeLocalCommand<typeof suppliers.$inferSelect>(tx, {
+          actorId: ctx.user.id, domain: "suppliers", action: "archive", entityType: "supplier", localId: (supplier) => String(supplier.id),
+          payload: (supplierGlobalId, supplier) => ({ supplierGlobalId, reason: input.reason, baseRevision: mapping?.server_revision ?? 0, values: { code: supplier.code, nameEn: supplier.name_en, nameAr: supplier.name_ar, contactName: supplier.contact_name, phone: supplier.phone, email: supplier.email, address: supplier.address, notes: supplier.notes, isActive: supplier.is_active } }),
+        }, (tx) => archiveSupplier(tx, input, ctx.user.id));
+      });
     }),
 
   purchaseOrders: protectedProcedure.input(branchInput).query(async ({ ctx, input }) => {
