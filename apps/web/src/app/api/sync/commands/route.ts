@@ -39,6 +39,13 @@ import {
   stockBalances,
   stockMovements,
   suppliers,
+  ingredientCategories,
+  unitsOfMeasure,
+  recipeVersions,
+  recipeComponents,
+  menuItemVariants,
+  menuItemModifierGroups,
+  modifierOptions,
 } from "@/lib/db/schema";
 import { createOrder } from "@/lib/trpc/routers/orders/create";
 import { payOrder } from "@/lib/trpc/routers/checkout/payment";
@@ -46,7 +53,7 @@ import { assertOrderTransition } from "@/lib/orders/lifecycle";
 import { issueOrderInventory } from "@/lib/inventory/service";
 import { cancelOrder } from "@/lib/trpc/routers/checkout/cancellation";
 import { postStockIncrease } from "@/lib/inventory/service";
-import { costMinorForQuantity } from "@/lib/inventory/exact";
+import { convertScaledQuantity, costMinorForQuantity } from "@/lib/inventory/exact";
 
 export const runtime = "nodejs";
 
@@ -58,6 +65,8 @@ const valuesSchema = z.object({
 });
 const productValuesSchema = z.object({ name: z.string().min(1).max(255), description: z.string().nullable(), price: z.number().int().nonnegative(), in_stock: z.number().int().nonnegative(), category: z.string().max(50).nullable(), imageKey: z.string().max(200).nullable() });
 const supplierValuesSchema = z.object({ code: z.string().min(2).max(40), nameEn: z.string().min(2).max(160), nameAr: z.string().min(2).max(160), contactName: z.string().nullable(), phone: z.string().nullable(), email: z.string().nullable(), address: z.string().nullable(), notes: z.string().nullable() });
+const ingredientValuesSchema = z.object({ sku: z.string().min(2).max(40), nameEn: z.string().min(2).max(120), nameAr: z.string().min(2).max(120), dimension: z.enum(["mass", "volume", "count"]), tracked: z.boolean(), reorderLevel: z.number().int().nonnegative(), lowStockThreshold: z.number().int().nonnegative(), parLevel: z.number().int().nonnegative().nullable(), allowNegative: z.boolean(), categoryCode: z.string(), locationCode: z.string(), unitCode: z.string() });
+const recipeComponentSchema = z.object({ ingredientGlobalId: z.string().uuid(), locationGlobalId: z.string().uuid(), unitGlobalId: z.string().uuid(), modifierOptionGlobalId: z.string().uuid().nullable(), quantityScaled: z.number().int().refine((value) => value !== 0) });
 const payloadSchemas = {
   "customers.create": z.object({ customerGlobalId: z.string().uuid(), values: valuesSchema }),
   "customers.update": z.object({ customerGlobalId: z.string().uuid(), values: valuesSchema }),
@@ -69,6 +78,11 @@ const payloadSchemas = {
   "suppliers.create": z.object({ supplierGlobalId: z.string().uuid(), values: supplierValuesSchema }),
   "suppliers.update": z.object({ supplierGlobalId: z.string().uuid(), values: supplierValuesSchema, baseRevision: z.number().int().nonnegative() }),
   "suppliers.archive": z.object({ supplierGlobalId: z.string().uuid(), reason: z.string().trim().min(3).max(500), baseRevision: z.number().int().nonnegative(), values: supplierValuesSchema.extend({ isActive: z.boolean() }) }),
+  "inventory.ingredient_create": z.object({ ingredientGlobalId: z.string().uuid(), values: ingredientValuesSchema }),
+  "inventory.ingredient_update": z.object({ ingredientGlobalId: z.string().uuid(), baseRevision: z.number().int().nonnegative(), values: ingredientValuesSchema }),
+  "inventory.ingredient_archive": z.object({ ingredientGlobalId: z.string().uuid(), reason: z.string().trim().min(3).max(500), baseRevision: z.number().int().nonnegative(), values: z.object({ sku: z.string(), isActive: z.boolean() }) }),
+  "inventory.recipe_create": z.object({ recipeVersionGlobalId: z.string().uuid(), menuItemGlobalId: z.string().uuid(), variantGlobalId: z.string().uuid().nullable(), version: z.number().int().positive(), yieldLossBps: z.number().int().min(0).max(9999), components: z.array(recipeComponentSchema).min(1) }),
+  "inventory.recipe_activate": z.object({ recipeVersionGlobalId: z.string().uuid(), reason: z.string().trim().min(3).max(500), baseRevision: z.number().int().nonnegative() }),
   "shifts.open": z.object({ shiftGlobalId: z.string().uuid(), registerGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() }),
   "shifts.close": z.object({ shiftGlobalId: z.string().uuid(), expectedCash: z.number().int(), closingCash: z.number().int().nonnegative(), closedAt: z.string().datetime() }),
   "shifts.drawer_adjust": z.object({ cashMovementGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid(), type: z.enum(["cash_in", "cash_out"]), amount: z.number().int().positive(), reason: z.string().trim().min(3).max(500), createdAt: z.string().datetime() }),
@@ -104,6 +118,11 @@ export const SYNC_COMMAND_REGISTRY = {
   "suppliers.create": { schema: payloadSchemas["suppliers.create"], permission: "supplier:manage", handler: "mutateSupplier", importer: "supplier" },
   "suppliers.update": { schema: payloadSchemas["suppliers.update"], permission: "supplier:manage", handler: "mutateSupplier", importer: "supplier" },
   "suppliers.archive": { schema: payloadSchemas["suppliers.archive"], permission: "supplier:manage", handler: "mutateSupplier", importer: "supplier" },
+  "inventory.ingredient_create": { schema: payloadSchemas["inventory.ingredient_create"], permission: "inventory:configure", handler: "mutateIngredient", importer: "ingredient" },
+  "inventory.ingredient_update": { schema: payloadSchemas["inventory.ingredient_update"], permission: "inventory:configure", handler: "mutateIngredient", importer: "ingredient" },
+  "inventory.ingredient_archive": { schema: payloadSchemas["inventory.ingredient_archive"], permission: "inventory:configure", handler: "mutateIngredient", importer: "ingredient" },
+  "inventory.recipe_create": { schema: payloadSchemas["inventory.recipe_create"], permission: "recipe:manage", handler: "mutateRecipe", importer: "recipe_version" },
+  "inventory.recipe_activate": { schema: payloadSchemas["inventory.recipe_activate"], permission: "recipe:manage", handler: "mutateRecipe", importer: "recipe_version" },
 } as const satisfies Record<keyof typeof payloadSchemas, { schema: z.ZodType; permission: string | null; handler: string; importer: string }>;
 const commandSchema = z.object({
   operationId: z.string().uuid(),
@@ -113,7 +132,7 @@ const commandSchema = z.object({
   registerGlobalId: z.string().uuid(),
   actorGlobalId: z.string().uuid(),
   domain: z.enum(["customers", "products", "shifts", "orders", "checkout", "printing", "inventory", "suppliers"]),
-  action: z.enum(["create", "update", "delete", "open", "drawer_adjust", "close", "pay", "cancel", "request", "transition", "settings_update", "adjust", "archive"]),
+  action: z.enum(["create", "update", "delete", "open", "drawer_adjust", "close", "pay", "cancel", "request", "transition", "settings_update", "adjust", "archive", "ingredient_create", "ingredient_update", "ingredient_archive", "recipe_create", "recipe_activate"]),
   schemaVersion: z.literal(1),
   payload: z.record(z.string(), z.unknown()),
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -631,6 +650,181 @@ export async function POST(request: NextRequest) {
           await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "stock_movement", entity_global_id: adjustment.movementGlobalId, action: "adjust", server_revision: 1, source_operation_id: command.operationId });
           return { operationId: command.operationId, status: "accepted", result };
         }
+        if (command.domain === "inventory" && ["ingredient_create", "ingredient_update", "ingredient_archive"].includes(command.action)) {
+          const data = payload.data as z.infer<typeof payloadSchemas["inventory.ingredient_create"]> | z.infer<typeof payloadSchemas["inventory.ingredient_update"]> | z.infer<typeof payloadSchemas["inventory.ingredient_archive"]>;
+          if (!hasPermission(assignment.role, "inventory:configure")) {
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.permission_denied", entity_type: "ingredient", entity_id: data.ingredientGlobalId, reason: "inventory:configure", details: JSON.stringify({ sourceOperationId: command.operationId }) });
+            return { operationId: command.operationId, status: "rejected", error: "Actor lacks ingredient configuration permission." };
+          }
+          const [identity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "ingredient"), eq(syncGlobalEntities.global_id, data.ingredientGlobalId))).for("update").limit(1);
+          const [deviceMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "ingredient"), eq(syncEntityMappings.global_id, data.ingredientGlobalId))).for("update").limit(1);
+          let ingredientId: number;
+          let revision = 1;
+          if (command.action === "ingredient_create") {
+            if (identity) return { operationId: command.operationId, status: "rejected", error: "Ingredient identity already exists." };
+            const values = (data as z.infer<typeof payloadSchemas["inventory.ingredient_create"]>).values;
+            const [category] = await tx.select().from(ingredientCategories).where(and(eq(ingredientCategories.branch_id, device.branch_id), eq(ingredientCategories.code, values.categoryCode))).limit(1);
+            const [location] = await tx.select().from(inventoryLocations).where(and(eq(inventoryLocations.branch_id, device.branch_id), eq(inventoryLocations.code, values.locationCode), eq(inventoryLocations.is_active, true))).limit(1);
+            const [unit] = await tx.select().from(unitsOfMeasure).where(eq(unitsOfMeasure.code, values.unitCode)).limit(1);
+            if (!category || !location || !unit || unit.dimension !== values.dimension) return { operationId: command.operationId, status: "rejected", error: "Ingredient reference data is unavailable or incompatible." };
+            const [duplicate] = await tx.select().from(ingredients).where(and(eq(ingredients.branch_id, device.branch_id), eq(ingredients.sku, values.sku))).limit(1);
+            if (duplicate) {
+              const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+              await tx.update(syncCommandInbox).set({ result: { reason: "ingredient_sku_conflict" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+              await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "ingredient", entity_global_id: data.ingredientGlobalId, local_payload: command.payload, server_snapshot: { sku: duplicate.sku, nameEn: duplicate.name_en }, reason: "The ingredient SKU is already used in this branch." });
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.ingredient.needs_review", entity_type: "ingredient", entity_id: data.ingredientGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
+              return { operationId: command.operationId, status: "needs_review", result: { ingredientGlobalId: data.ingredientGlobalId } };
+            }
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+            const [created] = await tx.insert(ingredients).values({ branch_id: device.branch_id, category_id: category.id, sku: values.sku, name_en: values.nameEn, name_ar: values.nameAr, base_unit_id: unit.id, dimension: values.dimension, default_location_id: location.id, is_active: true, is_tracked: values.tracked, reorder_level: values.reorderLevel, low_stock_threshold: values.lowStockThreshold, par_level: values.parLevel, allow_negative: values.allowNegative, average_unit_cost_micros: 0, created_by: actor.local_id, updated_by: actor.local_id }).returning();
+            ingredientId = created!.id;
+            await tx.insert(stockBalances).values({ branch_id: device.branch_id, location_id: location.id, ingredient_id: ingredientId, quantity_base: 0, average_unit_cost_micros: 0 });
+            const shared = { organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "ingredient", global_id: data.ingredientGlobalId, local_id: String(ingredientId), server_revision: 1 };
+            await tx.insert(syncGlobalEntities).values(shared);
+            await tx.insert(syncEntityMappings).values({ ...shared, device_id: device.id, local_revision: 1 });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.inventory.ingredient_created", entity_type: "ingredient", entity_id: data.ingredientGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
+            const result = { ingredientGlobalId: data.ingredientGlobalId, revision };
+            await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+            await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "ingredient", entity_global_id: data.ingredientGlobalId, action: command.action, server_revision: revision, source_operation_id: command.operationId });
+            return { operationId: command.operationId, status: "accepted", result };
+          }
+          if (command.action === "ingredient_update") {
+            const update = data as z.infer<typeof payloadSchemas["inventory.ingredient_update"]>;
+            if (!identity || !deviceMapping || deviceMapping.server_revision !== update.baseRevision) {
+              const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+              const [current] = identity ? await tx.select().from(ingredients).where(and(eq(ingredients.id, Number(identity.local_id)), eq(ingredients.branch_id, device.branch_id))).limit(1) : [undefined];
+              await tx.update(syncCommandInbox).set({ result: { reason: "revision_conflict" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+              await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "ingredient", entity_global_id: update.ingredientGlobalId, local_payload: command.payload, server_snapshot: current ? { sku: current.sku, nameEn: current.name_en, nameAr: current.name_ar, isActive: current.is_active } : {}, reason: "The ingredient changed or is unavailable centrally." });
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.ingredient.needs_review", entity_type: "ingredient", entity_id: update.ingredientGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, baseRevision: update.baseRevision }) });
+              return { operationId: command.operationId, status: "needs_review", result: { ingredientGlobalId: update.ingredientGlobalId } };
+            }
+            const values = update.values;
+            const [category] = await tx.select().from(ingredientCategories).where(and(eq(ingredientCategories.branch_id, device.branch_id), eq(ingredientCategories.code, values.categoryCode))).limit(1);
+            const [location] = await tx.select().from(inventoryLocations).where(and(eq(inventoryLocations.branch_id, device.branch_id), eq(inventoryLocations.code, values.locationCode), eq(inventoryLocations.is_active, true))).limit(1);
+            const [unit] = await tx.select().from(unitsOfMeasure).where(eq(unitsOfMeasure.code, values.unitCode)).limit(1);
+            const current = await tx.query.ingredients.findFirst({ where: and(eq(ingredients.id, Number(identity.local_id)), eq(ingredients.branch_id, device.branch_id)) });
+            if (!category || !location || !unit || !current || unit.dimension !== values.dimension || current.dimension !== values.dimension || current.base_unit_id !== unit.id) return { operationId: command.operationId, status: "rejected", error: "Ingredient references or immutable base unit are invalid." };
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+            await tx.update(ingredients).set({ name_en: values.nameEn, name_ar: values.nameAr, category_id: category.id, default_location_id: location.id, is_tracked: values.tracked, reorder_level: values.reorderLevel, low_stock_threshold: values.lowStockThreshold, par_level: values.parLevel, allow_negative: values.allowNegative, updated_by: actor.local_id, updated_at: new Date() }).where(eq(ingredients.id, current.id));
+            revision = deviceMapping.server_revision + 1;
+            await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, identity.id));
+            await tx.update(syncEntityMappings).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncEntityMappings.id, deviceMapping.id));
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.inventory.ingredient_updated", entity_type: "ingredient", entity_id: update.ingredientGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
+            const result = { ingredientGlobalId: update.ingredientGlobalId, revision };
+            await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+            await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "ingredient", entity_global_id: update.ingredientGlobalId, action: command.action, server_revision: revision, source_operation_id: command.operationId });
+            return { operationId: command.operationId, status: "accepted", result };
+          }
+          const archive = data as z.infer<typeof payloadSchemas["inventory.ingredient_archive"]>;
+          if (!identity || !deviceMapping || deviceMapping.server_revision !== archive.baseRevision) {
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+            const [current] = identity ? await tx.select().from(ingredients).where(and(eq(ingredients.id, Number(identity.local_id)), eq(ingredients.branch_id, device.branch_id))).limit(1) : [undefined];
+            await tx.update(syncCommandInbox).set({ result: { reason: "revision_conflict" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+            await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "ingredient", entity_global_id: archive.ingredientGlobalId, local_payload: command.payload, server_snapshot: current ? { sku: current.sku, isActive: current.is_active } : {}, reason: "The ingredient changed or is unavailable centrally." });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.ingredient.needs_review", entity_type: "ingredient", entity_id: archive.ingredientGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId }) });
+            return { operationId: command.operationId, status: "needs_review", result: { ingredientGlobalId: archive.ingredientGlobalId } };
+          }
+          ingredientId = Number(identity.local_id);
+          const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+          await tx.update(ingredients).set({ is_active: false, updated_by: actor.local_id, updated_at: new Date() }).where(and(eq(ingredients.id, ingredientId), eq(ingredients.branch_id, device.branch_id)));
+          revision = deviceMapping.server_revision + 1;
+          await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, identity.id));
+          await tx.update(syncEntityMappings).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncEntityMappings.id, deviceMapping.id));
+          await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.inventory.ingredient_archived", entity_type: "ingredient", entity_id: archive.ingredientGlobalId, reason: archive.reason });
+          const result = { ingredientGlobalId: archive.ingredientGlobalId, revision };
+          await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+          await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "ingredient", entity_global_id: archive.ingredientGlobalId, action: command.action, server_revision: revision, source_operation_id: command.operationId });
+          return { operationId: command.operationId, status: "accepted", result };
+        }
+        if (command.domain === "inventory" && (command.action === "recipe_create" || command.action === "recipe_activate")) {
+          const recipePayload = payload.data as z.infer<typeof payloadSchemas["inventory.recipe_create"]> | z.infer<typeof payloadSchemas["inventory.recipe_activate"]>;
+          if (!hasPermission(assignment.role, "recipe:manage")) {
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.permission_denied", entity_type: "recipe_version", entity_id: recipePayload.recipeVersionGlobalId, reason: "recipe:manage", details: JSON.stringify({ sourceOperationId: command.operationId }) });
+            return { operationId: command.operationId, status: "rejected", error: "Actor lacks recipe management permission." };
+          }
+          const [recipeIdentity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "recipe_version"), eq(syncGlobalEntities.global_id, recipePayload.recipeVersionGlobalId))).for("update").limit(1);
+          const [recipeMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "recipe_version"), eq(syncEntityMappings.global_id, recipePayload.recipeVersionGlobalId))).for("update").limit(1);
+          if (command.action === "recipe_create") {
+            const draft = recipePayload as z.infer<typeof payloadSchemas["inventory.recipe_create"]>;
+            if (recipeIdentity) return { operationId: command.operationId, status: "rejected", error: "Recipe version identity already exists." };
+            const resolve = async (type: string, globalId: string) => {
+              const [mapped] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, type), eq(syncGlobalEntities.global_id, globalId), eq(syncGlobalEntities.branch_id, device.branch_id))).limit(1);
+              return mapped ? Number(mapped.local_id) : 0;
+            };
+            const menuItemId = await resolve("menu_item", draft.menuItemGlobalId);
+            const variantId = draft.variantGlobalId ? await resolve("menu_item_variant", draft.variantGlobalId) : null;
+            if (!menuItemId || (draft.variantGlobalId && !variantId)) return { operationId: command.operationId, status: "retry_later", error: "Recipe menu dependencies have not synchronized." };
+            const menuItem = await tx.query.menuItems.findFirst({ where: eq(menuItems.id, menuItemId), with: { category: true } });
+            if (!menuItem || menuItem.category.branch_id !== device.branch_id) return { operationId: command.operationId, status: "rejected", error: "Recipe menu item is outside the paired branch." };
+            if (variantId) {
+              const variant = await tx.query.menuItemVariants.findFirst({ where: and(eq(menuItemVariants.id, variantId), eq(menuItemVariants.menu_item_id, menuItemId)) });
+              if (!variant) return { operationId: command.operationId, status: "rejected", error: "Recipe variant does not belong to the menu item." };
+            }
+            const resolved = [];
+            for (const component of draft.components) {
+              const ingredientId = await resolve("ingredient", component.ingredientGlobalId);
+              const locationId = await resolve("inventory_location", component.locationGlobalId);
+              const unitId = await resolve("unit_of_measure", component.unitGlobalId);
+              const modifierOptionId = component.modifierOptionGlobalId ? await resolve("modifier_option", component.modifierOptionGlobalId) : null;
+              if (!ingredientId || !locationId || !unitId || (component.modifierOptionGlobalId && !modifierOptionId)) return { operationId: command.operationId, status: "retry_later", error: "Recipe inventory dependencies have not synchronized." };
+              if (modifierOptionId) {
+                const option = await tx.query.modifierOptions.findFirst({ where: eq(modifierOptions.id, modifierOptionId) });
+                const link = option && await tx.query.menuItemModifierGroups.findFirst({ where: and(eq(menuItemModifierGroups.menu_item_id, menuItemId), eq(menuItemModifierGroups.modifier_group_id, option.modifier_group_id)) });
+                if (!link) return { operationId: command.operationId, status: "rejected", error: "Recipe modifier is not configured for the menu item." };
+              }
+              const [ingredient] = await tx.select().from(ingredients).where(and(eq(ingredients.id, ingredientId), eq(ingredients.branch_id, device.branch_id))).limit(1);
+              const [unit] = await tx.select().from(unitsOfMeasure).where(eq(unitsOfMeasure.id, unitId)).limit(1);
+              const [location] = await tx.select().from(inventoryLocations).where(and(eq(inventoryLocations.id, locationId), eq(inventoryLocations.branch_id, device.branch_id))).limit(1);
+              if (!ingredient || !unit || !location) return { operationId: command.operationId, status: "rejected", error: "Recipe component is outside the paired branch." };
+              const quantityBase = convertScaledQuantity({ quantityScaled: component.quantityScaled, fromDimension: unit.dimension, toDimension: ingredient.dimension, factor: { numerator: unit.base_numerator, denominator: unit.base_denominator } });
+              resolved.push({ ingredientId, locationId, unitId, modifierOptionId, quantityScaled: component.quantityScaled, quantityBase });
+            }
+            const latest = await tx.select().from(recipeVersions).where(and(eq(recipeVersions.menu_item_id, menuItemId), variantId ? eq(recipeVersions.variant_id, variantId) : sql`${recipeVersions.variant_id} is null`)).orderBy(sql`${recipeVersions.version} desc`).limit(1);
+            if ((latest[0]?.version ?? 0) + 1 !== draft.version) {
+              const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+              const current = latest[0];
+              await tx.update(syncCommandInbox).set({ result: { reason: "recipe_version_conflict" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+              await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "recipe_version", entity_global_id: draft.recipeVersionGlobalId, local_payload: command.payload, server_snapshot: { latestVersion: current?.version ?? 0 }, reason: "The recipe version sequence differs from the central history." });
+              await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.recipe.needs_review", entity_type: "recipe_version", entity_id: draft.recipeVersionGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, expectedVersion: (current?.version ?? 0) + 1, receivedVersion: draft.version }) });
+              return { operationId: command.operationId, status: "needs_review", result: { recipeVersionGlobalId: draft.recipeVersionGlobalId } };
+            }
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+            const [created] = await tx.insert(recipeVersions).values({ branch_id: device.branch_id, menu_item_id: menuItemId, variant_id: variantId, version: draft.version, status: "draft", effective_at: null, yield_loss_bps: draft.yieldLossBps, authored_by: actor.local_id }).returning();
+            await tx.insert(recipeComponents).values(resolved.map((row) => ({ recipe_version_id: created!.id, ingredient_id: row.ingredientId, source_location_id: row.locationId, unit_id: row.unitId, modifier_option_id: row.modifierOptionId, quantity_input_scaled: row.quantityScaled, quantity_base: row.quantityBase })));
+            const entityValues = { organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "recipe_version", global_id: draft.recipeVersionGlobalId, local_id: String(created!.id), server_revision: 1 };
+            await tx.insert(syncGlobalEntities).values(entityValues);
+            await tx.insert(syncEntityMappings).values({ ...entityValues, device_id: device.id, local_revision: 1 });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.recipe.created", entity_type: "recipe_version", entity_id: draft.recipeVersionGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, componentCount: resolved.length }) });
+            const result = { recipeVersionGlobalId: draft.recipeVersionGlobalId, revision: 1 };
+            await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+            await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "recipe_version", entity_global_id: draft.recipeVersionGlobalId, action: command.action, server_revision: 1, source_operation_id: command.operationId });
+            return { operationId: command.operationId, status: "accepted", result };
+          }
+          const activation = recipePayload as z.infer<typeof payloadSchemas["inventory.recipe_activate"]>;
+          if (!recipeIdentity || !recipeMapping || recipeMapping.server_revision !== activation.baseRevision) {
+            const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "needs_review" }).returning();
+            await tx.update(syncCommandInbox).set({ result: { reason: "revision_conflict" }, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+            await tx.insert(syncConflicts).values({ inbox_id: inbox!.id, organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "recipe_version", entity_global_id: activation.recipeVersionGlobalId, local_payload: command.payload, server_snapshot: { serverRevision: recipeMapping?.server_revision ?? null }, reason: "The recipe changed after the device's base revision." });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.recipe.needs_review", entity_type: "recipe_version", entity_id: activation.recipeVersionGlobalId, details: JSON.stringify({ sourceOperationId: command.operationId, baseRevision: activation.baseRevision, serverRevision: recipeMapping?.server_revision ?? null }) });
+            return { operationId: command.operationId, status: "needs_review", result: { recipeVersionGlobalId: activation.recipeVersionGlobalId } };
+          }
+          const version = await tx.query.recipeVersions.findFirst({ where: and(eq(recipeVersions.id, Number(recipeIdentity.local_id)), eq(recipeVersions.branch_id, device.branch_id)), with: { components: true } });
+          if (!version || version.status !== "draft" || !version.components.length) return { operationId: command.operationId, status: "rejected", error: "Only a complete draft recipe can be activated." };
+          const base = new Map<string, number>();
+          for (const component of version.components.filter((row) => row.modifier_option_id === null)) base.set(`${component.ingredient_id}:${component.source_location_id}`, (base.get(`${component.ingredient_id}:${component.source_location_id}`) ?? 0) + component.quantity_base);
+          if ([...base.values()].some((quantity) => quantity <= 0) || version.components.some((row) => row.modifier_option_id !== null && row.quantity_base < 0 && (base.get(`${row.ingredient_id}:${row.source_location_id}`) ?? 0) + row.quantity_base <= 0)) return { operationId: command.operationId, status: "rejected", error: "Recipe modifier quantities are invalid." };
+          const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+          await tx.update(recipeVersions).set({ status: "retired" }).where(and(eq(recipeVersions.menu_item_id, version.menu_item_id), version.variant_id ? eq(recipeVersions.variant_id, version.variant_id) : sql`${recipeVersions.variant_id} is null`, eq(recipeVersions.status, "active")));
+          await tx.update(recipeVersions).set({ status: "active", effective_at: new Date(), approved_by: actor.local_id, approved_at: new Date() }).where(eq(recipeVersions.id, version.id));
+          const revision = recipeMapping.server_revision + 1;
+          await tx.update(syncGlobalEntities).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncGlobalEntities.id, recipeIdentity.id));
+          await tx.update(syncEntityMappings).set({ server_revision: revision, updated_at: new Date() }).where(eq(syncEntityMappings.id, recipeMapping.id));
+          await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, approver_user_id: actor.local_id, action: "sync.recipe.activated", entity_type: "recipe_version", entity_id: activation.recipeVersionGlobalId, reason: activation.reason });
+          const result = { recipeVersionGlobalId: activation.recipeVersionGlobalId, revision, status: "active" };
+          await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+          await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "recipe_version", entity_global_id: activation.recipeVersionGlobalId, action: command.action, server_revision: revision, source_operation_id: command.operationId });
+          return { operationId: command.operationId, status: "accepted", result };
+        }
         if (command.domain === "suppliers") {
           const supplierPayload = payload.data as z.infer<typeof payloadSchemas["suppliers.create"]> | z.infer<typeof payloadSchemas["suppliers.update"]> | z.infer<typeof payloadSchemas["suppliers.archive"]>;
           if (!hasPermission(assignment.role, "supplier:manage")) {
@@ -822,7 +1016,9 @@ export async function GET(request: NextRequest) {
     const isCancellation = change.domain === "checkout" && change.entity_type === "order_cancellation";
     const isStockMovement = change.domain === "inventory" && change.entity_type === "stock_movement";
     const isSupplier = change.domain === "suppliers" && change.entity_type === "supplier";
-    if (!isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && !isSupplier && ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product"))) {
+    const isIngredient = change.domain === "inventory" && change.entity_type === "ingredient";
+    const isRecipe = change.domain === "inventory" && change.entity_type === "recipe_version";
+    if (!isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && !isSupplier && !isIngredient && !isRecipe && ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product"))) {
       exported.push({ cursor: change.cursor, domain: change.domain, entityType: change.entity_type, entityGlobalId: change.entity_global_id, action: change.action, revision: change.server_revision, snapshot: null });
       continue;
     }
@@ -871,6 +1067,25 @@ export async function GET(request: NextRequest) {
       const [updatedBy] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, supplier.updated_by))).limit(1);
       if (!updatedBy) throw new Error("A supplier change is missing its actor identity mapping.");
       snapshot = { code: supplier.code, nameEn: supplier.name_en, nameAr: supplier.name_ar, contactName: supplier.contact_name, phone: supplier.phone, email: supplier.email, address: supplier.address, notes: supplier.notes, isActive: supplier.is_active, updatedByGlobalId: updatedBy.global_id };
+    }
+    else if (isIngredient && mapping) {
+      const ingredient = await db.query.ingredients.findFirst({ where: eq(ingredients.id, Number(mapping.local_id)), with: { category: true, baseUnit: true, defaultLocation: true } });
+      if (ingredient) {
+        const [updatedBy] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, ingredient.updated_by))).limit(1);
+        if (updatedBy) snapshot = { sku: ingredient.sku, nameEn: ingredient.name_en, nameAr: ingredient.name_ar, dimension: ingredient.dimension, tracked: ingredient.is_tracked, reorderLevel: ingredient.reorder_level, lowStockThreshold: ingredient.low_stock_threshold, parLevel: ingredient.par_level, allowNegative: ingredient.allow_negative, isActive: ingredient.is_active, categoryCode: ingredient.category.code, locationCode: ingredient.defaultLocation.code, unitCode: ingredient.baseUnit.code, updatedByGlobalId: updatedBy.global_id };
+      }
+    }
+    else if (isRecipe && mapping) {
+      const recipe = await db.query.recipeVersions.findFirst({ where: eq(recipeVersions.id, Number(mapping.local_id)), with: { components: true } });
+      if (recipe) {
+        const identity = async (entityType: string, localId: string | number | null) => localId === null ? null : db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, entityType), eq(syncGlobalEntities.local_id, String(localId)))).limit(1).then(([row]) => row?.global_id ?? null);
+        const menuItemGlobalId = await identity("menu_item", recipe.menu_item_id);
+        const variantGlobalId = await identity("menu_item_variant", recipe.variant_id);
+        const authoredByGlobalId = await identity("user", recipe.authored_by);
+        const approvedByGlobalId = await identity("user", recipe.approved_by);
+        const components = await Promise.all(recipe.components.map(async (component) => ({ ingredientGlobalId: await identity("ingredient", component.ingredient_id), locationGlobalId: await identity("inventory_location", component.source_location_id), unitGlobalId: await identity("unit_of_measure", component.unit_id), modifierOptionGlobalId: await identity("modifier_option", component.modifier_option_id), quantityScaled: component.quantity_input_scaled })));
+        if (menuItemGlobalId && authoredByGlobalId && components.every((component) => component.ingredientGlobalId && component.locationGlobalId && component.unitGlobalId)) snapshot = { menuItemGlobalId, variantGlobalId, version: recipe.version, status: recipe.status, yieldLossBps: recipe.yield_loss_bps, effectiveAt: recipe.effective_at?.toISOString() ?? null, authoredByGlobalId, approvedByGlobalId, approvedAt: recipe.approved_at?.toISOString() ?? null, components };
+      }
     }
     else if (isOrder && mapping) {
       const order = await db.query.orders.findFirst({ where: eq(orders.id, Number(mapping.local_id)), with: { orderItems: { with: { modifiers: true } }, statusHistory: true } });

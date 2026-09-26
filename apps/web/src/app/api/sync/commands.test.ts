@@ -25,7 +25,10 @@ const menuItemGlobalId = "5575a74a-9bbc-4b99-9847-0bce2095e6ef";
 const stationGlobalId = "c40f7ab8-d0db-4f6b-811e-837dc0ba8ce7";
 const ingredientGlobalId = "7447115b-e944-465d-a4c4-53e54a4f4a1d";
 const locationGlobalId = "ddcc591a-67e9-4af9-9b2c-d618f49b3bc3";
+const unitGlobalId = "350e9e2f-8e33-44ec-92b0-e696a9f51548";
+const recipeVersionGlobalId = "9c66ef65-7373-4ca2-ac10-f737955f724e";
 const supplierGlobalId = "13bfa1d7-1a74-4b6c-b399-0658e7f1afdb";
+const newIngredientGlobalId = "bc47a0f7-00f1-4bcb-9dce-08fbab32bfca";
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -130,6 +133,16 @@ function makeSupplierCommand() {
   return { operationId: "48488adb-15ce-4d67-bc95-4d180e932611", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "suppliers", action: "create", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "supplier-sync-create-001", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
 }
 
+function makeIngredientCommand() {
+  const payload = { ingredientGlobalId: newIngredientGlobalId, values: { sku: "SYNC-NEW", nameEn: "New ingredient", nameAr: "مكون جديد", dimension: "mass", tracked: true, reorderLevel: 12, lowStockThreshold: 3, parLevel: null, allowNegative: false, categoryCode: "BASE", locationCode: "MAIN", unitCode: "SYNC-G" } };
+  return { operationId: "d0523796-e9eb-457f-9656-91f238bf55c9", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "inventory", action: "ingredient_create", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "ingredient-create-sync-001", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+}
+
+function makeRecipeCommand() {
+  const payload = { recipeVersionGlobalId, menuItemGlobalId, variantGlobalId: null, version: 2, yieldLossBps: 0, components: [{ ingredientGlobalId, locationGlobalId, unitGlobalId, modifierOptionGlobalId: null, quantityScaled: 100_000 }] };
+  return { operationId: "0db8334f-1b60-4b1a-9fe8-9b9b398e11d5", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "inventory", action: "recipe_create", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "recipe-create-sync-001", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+}
+
 async function postCommands(commands: unknown[]) {
   return POST(new NextRequest("http://localhost/api/sync/commands", {
     method: "POST",
@@ -166,6 +179,8 @@ beforeAll(async () => {
   const [unit] = await db.insert(unitsOfMeasure).values({ code: "SYNC-G", name_en: "Gram", name_ar: "جرام", dimension: "mass", base_numerator: 1_000, base_denominator: 1 }).returning();
   const [ingredient] = await db.insert(ingredients).values({ branch_id: branch!.id, category_id: ingredientCategory!.id, sku: "SYNC-BASE", name_en: "Base", name_ar: "أساسي", base_unit_id: unit!.id, dimension: "mass", default_location_id: location!.id, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, allow_negative: false, average_unit_cost_micros: 100, created_by: "central-owner", updated_by: "central-owner" }).returning();
   await db.insert(stockBalances).values({ branch_id: branch!.id, location_id: location!.id, ingredient_id: ingredient!.id, quantity_base: 100_000_000, average_unit_cost_micros: 100 });
+  await db.insert(syncGlobalEntities).values({ organization_id: organizationId, branch_id: branch!.id, entity_type: "unit_of_measure", global_id: unitGlobalId, local_id: String(unit!.id) });
+  await db.insert(syncEntityMappings).values({ organization_id: organizationId, device_id: deviceId, branch_id: branch!.id, entity_type: "unit_of_measure", global_id: unitGlobalId, local_id: String(unit!.id) });
   await db.insert(syncGlobalEntities).values([
     { organization_id: organizationId, branch_id: branch!.id, entity_type: "ingredient", global_id: ingredientGlobalId, local_id: String(ingredient!.id) },
     { organization_id: organizationId, branch_id: branch!.id, entity_type: "inventory_location", global_id: locationGlobalId, local_id: String(location!.id) },
@@ -186,7 +201,8 @@ describe("paired customer command processing", () => {
   it("registers a validated handler and reconciliation importer for each supported command", () => {
     const commandNames = Object.keys(SYNC_COMMAND_REGISTRY).sort();
     expect(commandNames).toEqual([
-      "checkout.cancel", "checkout.pay", "customers.create", "customers.delete", "customers.update", "inventory.adjust",
+      "checkout.cancel", "checkout.pay", "customers.create", "customers.delete", "customers.update", "inventory.adjust", "inventory.ingredient_archive", "inventory.ingredient_create", "inventory.ingredient_update",
+      "inventory.recipe_activate", "inventory.recipe_create",
       "orders.create", "orders.transition", "orders.update", "printing.request", "printing.settings_update", "printing.transition",
       "products.create", "products.delete", "products.update", "shifts.close", "shifts.drawer_adjust", "shifts.open",
       "suppliers.archive", "suppliers.create", "suppliers.update",
@@ -235,6 +251,55 @@ describe("paired customer command processing", () => {
     const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
     const changes = (await response.json()).changes as Array<{ entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
     expect(changes.find((change) => change.entityGlobalId === supplierGlobalId)?.snapshot).toMatchObject({ code: "SYNC-SUP", nameEn: "Updated Sync Supplier", isActive: false, updatedByGlobalId: actorGlobalId });
+  });
+
+  it("creates a branch-scoped ingredient exactly once with thresholds and no stock movement", async () => {
+    const command = makeIngredientCommand();
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
+    let created = await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-NEW") });
+    expect(created).toMatchObject({ branch_id: centralBranchId, reorder_level: 12, low_stock_threshold: 3, is_active: true });
+    expect((await db.select().from(ingredients).where(eq(ingredients.sku, "SYNC-NEW"))).length).toBe(1);
+    expect((await db.select().from(stockMovements).where(eq(stockMovements.ingredient_id, created!.id))).length).toBe(0);
+    const balance = await db.query.stockBalances.findFirst({ where: eq(stockBalances.ingredient_id, created!.id) });
+    expect(balance).toMatchObject({ quantity_base: 0, average_unit_cost_micros: 0 });
+    const updatePayload = { ingredientGlobalId: newIngredientGlobalId, baseRevision: 1, values: { ...command.payload.values, nameEn: "Updated ingredient", lowStockThreshold: 5 } };
+    const update = { ...command, operationId: "20bafe1c-9619-4fca-a487-524faad53f9f", action: "ingredient_update", payload: updatePayload, payloadHash: createHash("sha256").update(stableJson(updatePayload)).digest("hex"), idempotencyKey: "ingredient-update-sync-001", baseRevision: 1 };
+    expect((await (await postCommands([update])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([update])).json()).results[0].status).toBe("already_applied");
+    created = await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-NEW") });
+    expect(created).toMatchObject({ name_en: "Updated ingredient", low_stock_threshold: 5 });
+    const stalePayload = { ...updatePayload, values: { ...updatePayload.values, nameEn: "Concurrent local edit" } };
+    const staleUpdate = { ...update, operationId: "8ccf55e8-b8c7-4e0c-94b8-34ce1e75916e", payload: stalePayload, payloadHash: createHash("sha256").update(stableJson(stalePayload)).digest("hex"), idempotencyKey: "ingredient-update-stale-001" };
+    expect((await (await postCommands([staleUpdate])).json()).results[0].status).toBe("needs_review");
+    expect((await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-NEW") }))?.name_en).toBe("Updated ingredient");
+    const archivePayload = { ingredientGlobalId: newIngredientGlobalId, reason: "Retired ingredient configuration", baseRevision: 2, values: { sku: "SYNC-NEW", isActive: true } };
+    const archive = { ...command, operationId: "0c1c0b6d-278a-4d6e-8479-3a43c4576900", action: "ingredient_archive", payload: archivePayload, payloadHash: createHash("sha256").update(stableJson(archivePayload)).digest("hex"), idempotencyKey: "ingredient-archive-sync-001", baseRevision: 2 };
+    expect((await (await postCommands([archive])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([archive])).json()).results[0].status).toBe("already_applied");
+    created = await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-NEW") });
+    expect(created?.is_active).toBe(false);
+    expect((await db.select().from(stockMovements).where(eq(stockMovements.ingredient_id, created!.id))).length).toBe(0);
+  });
+
+  it("creates and activates immutable recipe history exactly once without stock effects", async () => {
+    const beforeMovements = (await db.select().from(stockMovements)).length;
+    const create = makeRecipeCommand();
+    expect((await (await postCommands([create])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([create])).json()).results[0].status).toBe("already_applied");
+    const draft = await db.query.recipeVersions.findFirst({ where: eq(recipeVersions.version, 2), with: { components: true } });
+    expect(draft).toMatchObject({ branch_id: centralBranchId, status: "draft", yield_loss_bps: 0 });
+    expect(draft?.components[0]).toMatchObject({ ingredient_id: expect.any(Number), source_location_id: expect.any(Number), quantity_input_scaled: 100_000, quantity_base: 100_000_000 });
+    const activationPayload = { recipeVersionGlobalId, reason: "Approved central recipe", baseRevision: 1 };
+    const activation = { ...create, operationId: "12d78960-0562-4624-a67f-b6ea765d26e7", action: "recipe_activate", payload: activationPayload, payloadHash: createHash("sha256").update(stableJson(activationPayload)).digest("hex"), idempotencyKey: "recipe-activate-sync-001", baseRevision: 1 };
+    expect((await (await postCommands([activation])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([activation])).json()).results[0].status).toBe("already_applied");
+    expect((await db.select().from(recipeVersions).where(eq(recipeVersions.id, draft!.id)))[0]?.status).toBe("active");
+    expect((await db.select().from(recipeVersions).where(eq(recipeVersions.id, 1)))[0]?.status).toBe("retired");
+    expect((await db.select().from(stockMovements)).length).toBe(beforeMovements);
+    const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const changes = (await response.json()).changes as Array<{ entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
+    expect(changes.find((change) => change.entityGlobalId === recipeVersionGlobalId)?.snapshot).toMatchObject({ status: "active", version: 2, yieldLossBps: 0 });
   });
 
   it("applies print-setting commands once and exports a typed register snapshot", async () => {

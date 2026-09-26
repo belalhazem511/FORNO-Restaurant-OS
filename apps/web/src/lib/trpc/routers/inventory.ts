@@ -109,10 +109,48 @@ export const inventoryRouter = router({
     const [{ category, location }, unit] = await Promise.all([branchEntities(input.branchId, { categoryId: input.categoryId, locationId: input.defaultLocationId }), db.query.unitsOfMeasure.findFirst({ where: eq(unitsOfMeasure.id, input.baseUnitId) })]);
     if (!category || !location || !unit || unit.dimension !== input.dimension) throw new Error("The ingredient base unit must match its measurement dimension");
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Ingredient changes must use the paired device branch" });
+      const categoryMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient_category", localId: category.id }) : undefined;
+      const locationMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "inventory_location", localId: location.id }) : undefined;
+      const unitMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "unit_of_measure", localId: unit.id }) : undefined;
+      return executeLocalCommand<typeof ingredients.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "inventory", action: "ingredient_create", entityType: "ingredient", localId: (row) => String(row.id),
+        dependsOnGlobalIds: () => [categoryMapping?.global_id, locationMapping?.global_id, unitMapping?.global_id].filter((id): id is string => Boolean(id)),
+        payload: (ingredientGlobalId, row) => ({ ingredientGlobalId, values: { sku: row.sku, nameEn: row.name_en, nameAr: row.name_ar, dimension: row.dimension, tracked: row.is_tracked, reorderLevel: row.reorder_level, lowStockThreshold: row.low_stock_threshold, parLevel: row.par_level, allowNegative: row.allow_negative, categoryCode: category.code, locationCode: location.code, unitCode: unit.code } }),
+      }, async (tx) => {
       const [ingredient] = await tx.insert(ingredients).values({ branch_id: input.branchId, category_id: input.categoryId, sku: input.sku, name_en: input.nameEn, name_ar: input.nameAr, base_unit_id: input.baseUnitId, dimension: input.dimension, default_location_id: input.defaultLocationId, is_active: true, is_tracked: input.tracked, reorder_level: input.reorderLevel, low_stock_threshold: input.lowStockThreshold, par_level: input.parLevel ?? null, allow_negative: input.allowNegative, average_unit_cost_micros: 0, created_by: ctx.user.id, updated_by: ctx.user.id }).returning();
       await tx.insert(stockBalances).values({ branch_id: input.branchId, location_id: input.defaultLocationId, ingredient_id: ingredient.id, quantity_base: 0, average_unit_cost_micros: 0 });
       await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "inventory.ingredient_create", entity_type: "ingredient", entity_id: String(ingredient.id), details: JSON.stringify({ sku: input.sku }) });
       return ingredient;
+      });
+    });
+  }),
+
+  updateIngredient: protectedProcedure.input(branchInput.extend({
+    ingredientId: z.number().int().positive(), categoryId: z.number().int().positive(), nameEn: z.string().trim().min(2).max(120), nameAr: z.string().trim().min(2).max(120), baseUnitId: z.number().int().positive(), dimension: z.enum(["mass", "volume", "count"]), defaultLocationId: z.number().int().positive(), tracked: z.boolean(), reorderLevel: z.number().int().nonnegative(), lowStockThreshold: z.number().int().nonnegative(), parLevel: z.number().int().nonnegative().nullable().optional(), allowNegative: z.boolean(),
+  })).mutation(async ({ ctx, input }) => {
+    await requireStaff(ctx.user.id, input.branchId, "inventory:configure");
+    const [{ category, location, ingredient }, unit] = await Promise.all([branchEntities(input.branchId, { ingredientId: input.ingredientId, categoryId: input.categoryId, locationId: input.defaultLocationId }), db.query.unitsOfMeasure.findFirst({ where: eq(unitsOfMeasure.id, input.baseUnitId) })]);
+    if (!ingredient || !category || !location || !unit || unit.dimension !== input.dimension || ingredient.dimension !== input.dimension || ingredient.base_unit_id !== input.baseUnitId) throw new Error("Ingredient dimension and base unit cannot change after stock history exists");
+    return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Ingredient changes must use the paired device branch" });
+      const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient", localId: ingredient.id }) : undefined;
+      const categoryMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient_category", localId: category.id }) : undefined;
+      const locationMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "inventory_location", localId: location.id }) : undefined;
+      const unitMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "unit_of_measure", localId: unit.id }) : undefined;
+      return executeLocalCommand<typeof ingredients.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "inventory", action: "ingredient_update", entityType: "ingredient", localId: (row) => String(row.id),
+        dependsOnGlobalIds: () => [categoryMapping?.global_id, locationMapping?.global_id, unitMapping?.global_id].filter((id): id is string => Boolean(id)),
+        payload: (ingredientGlobalId, row) => ({ ingredientGlobalId, baseRevision: mapping?.server_revision ?? 0, values: { sku: row.sku, nameEn: row.name_en, nameAr: row.name_ar, dimension: row.dimension, tracked: row.is_tracked, reorderLevel: row.reorder_level, lowStockThreshold: row.low_stock_threshold, parLevel: row.par_level, allowNegative: row.allow_negative, categoryCode: category.code, locationCode: location.code, unitCode: unit.code } }),
+      }, async (tx) => {
+        const [updated] = await tx.update(ingredients).set({ category_id: input.categoryId, name_en: input.nameEn, name_ar: input.nameAr, default_location_id: input.defaultLocationId, is_tracked: input.tracked, reorder_level: input.reorderLevel, low_stock_threshold: input.lowStockThreshold, par_level: input.parLevel ?? null, allow_negative: input.allowNegative, updated_by: ctx.user.id, updated_at: new Date() }).where(eq(ingredients.id, ingredient.id)).returning();
+        await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "inventory.ingredient_update", entity_type: "ingredient", entity_id: String(updated!.id), details: JSON.stringify({ sku: updated!.sku }) });
+        return updated!;
+      });
     });
   }),
 
@@ -120,9 +158,18 @@ export const inventoryRouter = router({
     await requireStaff(ctx.user.id, input.branchId, "inventory:configure");
     const { ingredient } = await branchEntities(input.branchId, input);
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Ingredient changes must use the paired device branch" });
+      const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient", localId: ingredient!.id }) : undefined;
+      return executeLocalCommand<typeof ingredients.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "inventory", action: "ingredient_archive", entityType: "ingredient", localId: (row) => String(row.id),
+        payload: (ingredientGlobalId, row) => ({ ingredientGlobalId, reason: input.reason, baseRevision: mapping?.server_revision ?? 0, values: { sku: row.sku, isActive: row.is_active } }),
+      }, async (tx) => {
       const [updated] = await tx.update(ingredients).set({ is_active: false, updated_by: ctx.user.id, updated_at: new Date() }).where(eq(ingredients.id, ingredient!.id)).returning();
       await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "inventory.ingredient_archive", entity_type: "ingredient", entity_id: String(updated.id), reason: input.reason });
       return updated;
+      });
     });
   }),
 
@@ -210,11 +257,29 @@ export const inventoryRouter = router({
       return { ...component, quantityBase };
     });
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Recipe changes must use the paired device branch" });
+      const references = new Map<string, string>();
+      if (device) {
+        const ids: Array<[string, number]> = [["menu_item", input.menuItemId], ...resolved.flatMap((row) => [["ingredient", row.ingredientId], ["inventory_location", row.locationId], ["unit_of_measure", row.unitId], ...(row.modifierOptionId ? [["modifier_option", row.modifierOptionId] as [string, number]] : [])] as Array<[string, number]>)];
+        if (input.variantId) ids.push(["menu_item_variant", input.variantId]);
+        for (const [entityType, localId] of ids) {
+          const reference = await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType, localId });
+          references.set(`${entityType}:${localId}`, reference.global_id);
+        }
+      }
       const latest = await tx.select().from(recipeVersions).where(and(eq(recipeVersions.menu_item_id, input.menuItemId), input.variantId ? eq(recipeVersions.variant_id, input.variantId) : isNull(recipeVersions.variant_id))).orderBy(desc(recipeVersions.version)).limit(1);
-      const [version] = await tx.insert(recipeVersions).values({ branch_id: input.branchId, menu_item_id: input.menuItemId, variant_id: input.variantId ?? null, version: (latest[0]?.version ?? 0) + 1, status: "draft", effective_at: null, yield_loss_bps: input.yieldLossBps, authored_by: ctx.user.id }).returning();
-      await tx.insert(recipeComponents).values(resolved.map((component) => ({ recipe_version_id: version.id, ingredient_id: component.ingredientId, source_location_id: component.locationId, modifier_option_id: component.modifierOptionId ?? null, unit_id: component.unitId, quantity_input_scaled: component.quantityScaled, quantity_base: component.quantityBase })));
-      await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "recipe.create", entity_type: "recipe_version", entity_id: String(version.id), details: JSON.stringify({ version: version.version, componentCount: resolved.length }) });
-      return version;
+      return executeLocalCommand<typeof recipeVersions.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "inventory", action: "recipe_create", entityType: "recipe_version", localId: (row) => String(row.id),
+        dependsOnGlobalIds: () => [...references.values()],
+        payload: (recipeVersionGlobalId, version) => ({ recipeVersionGlobalId, menuItemGlobalId: references.get(`menu_item:${input.menuItemId}`) ?? null, variantGlobalId: input.variantId ? references.get(`menu_item_variant:${input.variantId}`) ?? null : null, version: version.version, yieldLossBps: input.yieldLossBps, components: resolved.map((component) => ({ ingredientGlobalId: references.get(`ingredient:${component.ingredientId}`) ?? null, locationGlobalId: references.get(`inventory_location:${component.locationId}`) ?? null, unitGlobalId: references.get(`unit_of_measure:${component.unitId}`) ?? null, modifierOptionGlobalId: component.modifierOptionId ? references.get(`modifier_option:${component.modifierOptionId}`) ?? null : null, quantityScaled: component.quantityScaled })) }),
+      }, async (tx) => {
+        const [version] = await tx.insert(recipeVersions).values({ branch_id: input.branchId, menu_item_id: input.menuItemId, variant_id: input.variantId ?? null, version: (latest[0]?.version ?? 0) + 1, status: "draft", effective_at: null, yield_loss_bps: input.yieldLossBps, authored_by: ctx.user.id }).returning();
+        await tx.insert(recipeComponents).values(resolved.map((component) => ({ recipe_version_id: version.id, ingredient_id: component.ingredientId, source_location_id: component.locationId, modifier_option_id: component.modifierOptionId ?? null, unit_id: component.unitId, quantity_input_scaled: component.quantityScaled, quantity_base: component.quantityBase })));
+        await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "recipe.create", entity_type: "recipe_version", entity_id: String(version.id), details: JSON.stringify({ version: version.version, componentCount: resolved.length }) });
+        return version;
+      });
     });
   }),
 
@@ -223,6 +288,14 @@ export const inventoryRouter = router({
     return db.transaction(async (tx) => {
       const version = await tx.query.recipeVersions.findFirst({ where: and(eq(recipeVersions.id, input.recipeVersionId), eq(recipeVersions.branch_id, input.branchId)), with: { components: true } });
       if (!version || version.status !== "draft" || !version.components.length) throw new Error("Only a complete draft recipe can be activated");
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Recipe changes must use the paired device branch" });
+      const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "recipe_version", localId: version.id }) : undefined;
+      return executeLocalCommand<typeof recipeVersions.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "inventory", action: "recipe_activate", entityType: "recipe_version", localId: (row) => String(row.id),
+        payload: (recipeVersionGlobalId) => ({ recipeVersionGlobalId, reason: input.reason, baseRevision: mapping?.server_revision ?? 0 }),
+      }, async (tx) => {
       const base = new Map<string, number>();
       for (const component of version.components.filter((row) => row.modifier_option_id == null)) base.set(`${component.ingredient_id}:${component.source_location_id}`, (base.get(`${component.ingredient_id}:${component.source_location_id}`) ?? 0) + component.quantity_base);
       if ([...base.values()].some((quantity) => quantity <= 0)) throw new Error("Recipe base quantities must remain positive");
@@ -231,6 +304,7 @@ export const inventoryRouter = router({
       const [active] = await tx.update(recipeVersions).set({ status: "active", effective_at: new Date(), approved_by: ctx.user.id, approved_at: new Date() }).where(eq(recipeVersions.id, version.id)).returning();
       await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, approver_user_id: ctx.user.id, action: "recipe.activate", entity_type: "recipe_version", entity_id: String(active.id), reason: input.reason, details: JSON.stringify({ version: active.version }) });
       return active;
+      });
     });
   }),
 

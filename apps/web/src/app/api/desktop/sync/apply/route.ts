@@ -3,8 +3,8 @@ import { and, eq, or, sql } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
-import { auditLogs, cashierShifts, customers, ingredients, inventoryLocations, orderCancellations, orderCheckouts, orderItemModifiers, orderItems, orderPayments, orderStatusHistory, orders, paymentMethods, printJobs, products, registerPrintPreferences, restaurantTables, shiftCashMovements, stockBalances, stockMovements, suppliers, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox, transactions } from "@/lib/db/schema";
-import { movingWeightedAverage } from "@/lib/inventory/exact";
+import { auditLogs, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, menuItemVariants, menuItems, modifierOptions, orderCancellations, orderCheckouts, orderItemModifiers, orderItems, orderPayments, orderStatusHistory, orders, paymentMethods, printJobs, products, recipeComponents, recipeVersions, registerPrintPreferences, restaurantTables, shiftCashMovements, stockBalances, stockMovements, suppliers, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox, transactions, unitsOfMeasure } from "@/lib/db/schema";
+import { convertScaledQuantity, movingWeightedAverage } from "@/lib/inventory/exact";
 
 export const runtime = "nodejs";
 const customerSnapshot = z.object({ name: z.string(), email: z.string().email(), phone: z.string().nullable(), status: z.string().nullable() });
@@ -20,6 +20,8 @@ const checkoutSnapshot = z.object({ orderGlobalId: z.string().uuid(), shiftGloba
 const cancellationSnapshot = z.object({ orderGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid().nullable(), actorGlobalId: z.string().uuid(), idempotencyKey: z.string(), reason: z.string(), wasPaid: z.boolean(), inventoryDisposition: z.enum(["returned_unused", "prepared_discarded"]).nullable(), createdAt: z.string().datetime(), refunds: z.array(z.object({ refundGlobalId: z.string().uuid(), originalPaymentGlobalId: z.string().uuid(), transactionGlobalId: z.string().uuid(), methodCode: z.string(), amount: z.number().int(), createdAt: z.string().datetime() })) });
 const stockMovementSnapshot = z.object({ ingredientGlobalId: z.string().uuid(), locationGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), movementType: z.enum(["opening_balance", "manual_positive", "manual_negative", "negative_override"]), direction: z.union([z.literal(-1), z.literal(1)]), quantityBase: z.number().int().positive(), unitCostMicros: z.number().int().nonnegative(), totalCostAmount: z.number().int().nonnegative(), sourceType: z.literal("inventory_adjustment"), sourceId: z.string(), idempotencyKey: z.string(), reason: z.string().nullable(), createdAt: z.string().datetime() });
 const supplierSnapshot = z.object({ code: z.string(), nameEn: z.string(), nameAr: z.string(), contactName: z.string().nullable(), phone: z.string().nullable(), email: z.string().nullable(), address: z.string().nullable(), notes: z.string().nullable(), isActive: z.boolean(), updatedByGlobalId: z.string().uuid() });
+const ingredientSnapshot = z.object({ sku: z.string(), nameEn: z.string(), nameAr: z.string(), dimension: z.enum(["mass", "volume", "count"]), tracked: z.boolean(), reorderLevel: z.number().int(), lowStockThreshold: z.number().int(), parLevel: z.number().int().nullable(), allowNegative: z.boolean(), isActive: z.boolean(), categoryCode: z.string(), locationCode: z.string(), unitCode: z.string(), updatedByGlobalId: z.string().uuid() });
+const recipeSnapshot = z.object({ menuItemGlobalId: z.string().uuid(), variantGlobalId: z.string().uuid().nullable(), version: z.number().int().positive(), status: z.enum(["draft", "active", "retired"]), yieldLossBps: z.number().int().min(0).max(9999), effectiveAt: z.string().datetime().nullable(), authoredByGlobalId: z.string().uuid(), approvedByGlobalId: z.string().uuid().nullable(), approvedAt: z.string().datetime().nullable(), components: z.array(z.object({ ingredientGlobalId: z.string().uuid(), locationGlobalId: z.string().uuid(), unitGlobalId: z.string().uuid(), modifierOptionGlobalId: z.string().uuid().nullable(), quantityScaled: z.number().int().refine((value) => value !== 0) })) });
 const changeSchema = z.object({ cursor: z.number().int().positive(), domain: z.string(), entityType: z.string(), entityGlobalId: z.string().uuid(), action: z.string(), revision: z.number().int().positive(), snapshot: z.unknown().nullable() });
 
 function authorized(request: NextRequest) {
@@ -39,6 +41,7 @@ export async function POST(request: NextRequest) {
     await db.transaction(async (tx) => {
       const [device] = await tx.select().from(syncDevices).where(eq(syncDevices.id, deviceId)).for("update").limit(1);
       if (!device) throw new Error("Local device identity is missing.");
+      if (Number(body.nextCursor) === device.last_pulled_cursor && changes.every((item) => item.success && item.data.cursor <= device.last_pulled_cursor)) return;
       if (Number(body.nextCursor) < device.last_pulled_cursor) throw new Error("Change cursor cannot move backwards.");
       let previousCursor = device.last_pulled_cursor;
       for (const parsed of changes) {
@@ -57,21 +60,23 @@ export async function POST(request: NextRequest) {
         const isCancellation = change.domain === "checkout" && change.entityType === "order_cancellation";
         const isStockMovement = change.domain === "inventory" && change.entityType === "stock_movement";
         const isSupplier = change.domain === "suppliers" && change.entityType === "supplier";
-        if (!isCustomer && !isProduct && !isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && !isSupplier) continue;
+        const isIngredient = change.domain === "inventory" && change.entityType === "ingredient";
+        const isRecipe = change.domain === "inventory" && change.entityType === "recipe_version";
+        if (!isCustomer && !isProduct && !isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && !isSupplier && !isIngredient && !isRecipe) continue;
         const isDelete = change.action === "delete" && change.snapshot === null;
         if (!isDelete && !change.snapshot) {
           if (isStockMovement) throw new Error("An authoritative stock movement arrived without its required snapshot.");
           continue;
         }
         const isShiftClose = isShift && change.action === "close";
-        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShiftClose ? shiftCloseSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : isCashMovement ? cashMovementSnapshot.safeParse(change.snapshot) : isOrder ? orderSnapshot.safeParse(change.snapshot) : isPrintJob ? printJobSnapshot.safeParse(change.snapshot) : isPrintPreferences ? printPreferencesSnapshot.safeParse(change.snapshot) : isCheckout ? checkoutSnapshot.safeParse(change.snapshot) : isCancellation ? cancellationSnapshot.safeParse(change.snapshot) : isSupplier ? supplierSnapshot.safeParse(change.snapshot) : stockMovementSnapshot.safeParse(change.snapshot);
+        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShiftClose ? shiftCloseSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : isCashMovement ? cashMovementSnapshot.safeParse(change.snapshot) : isOrder ? orderSnapshot.safeParse(change.snapshot) : isPrintJob ? printJobSnapshot.safeParse(change.snapshot) : isPrintPreferences ? printPreferencesSnapshot.safeParse(change.snapshot) : isCheckout ? checkoutSnapshot.safeParse(change.snapshot) : isCancellation ? cancellationSnapshot.safeParse(change.snapshot) : isSupplier ? supplierSnapshot.safeParse(change.snapshot) : isIngredient ? ingredientSnapshot.safeParse(change.snapshot) : isRecipe ? recipeSnapshot.safeParse(change.snapshot) : stockMovementSnapshot.safeParse(change.snapshot);
         if (parsedSnapshot && !parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
         const snapshot = parsedSnapshot?.success ? parsedSnapshot.data : null;
         const entityType = change.entityType;
         const mapping = await tx.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, entityType), eq(syncEntityMappings.global_id, change.entityGlobalId)) });
         if (mapping) {
           const queuedCommands = await tx.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.state, "pending")));
-          const globalKey = isShift ? "shiftGlobalId" : isCashMovement ? "cashMovementGlobalId" : isPrintJob ? "jobGlobalId" : isPrintPreferences ? "preferenceGlobalId" : isCheckout ? "checkoutGlobalId" : isCancellation ? "cancellationGlobalId" : isStockMovement ? "movementGlobalId" : `${entityType}GlobalId`;
+          const globalKey = isShift ? "shiftGlobalId" : isCashMovement ? "cashMovementGlobalId" : isPrintJob ? "jobGlobalId" : isPrintPreferences ? "preferenceGlobalId" : isCheckout ? "checkoutGlobalId" : isCancellation ? "cancellationGlobalId" : isStockMovement ? "movementGlobalId" : isRecipe ? "recipeVersionGlobalId" : `${entityType}GlobalId`;
           const queued = queuedCommands.find((item) => item.domain === change.domain && item.payload[globalKey] === change.entityGlobalId);
           if (queued) {
             const operationId = randomUUID();
@@ -175,6 +180,28 @@ export async function POST(request: NextRequest) {
             await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
             continue;
           }
+          if (isIngredient) {
+            const value = snapshot as z.infer<typeof ingredientSnapshot>;
+            const [category] = await tx.select().from(ingredientCategories).where(and(eq(ingredientCategories.branch_id, device.branch_id), eq(ingredientCategories.code, value.categoryCode))).limit(1);
+            const [location] = await tx.select().from(inventoryLocations).where(and(eq(inventoryLocations.branch_id, device.branch_id), eq(inventoryLocations.code, value.locationCode))).limit(1);
+            const [unit] = await tx.select().from(unitsOfMeasure).where(eq(unitsOfMeasure.code, value.unitCode)).limit(1);
+            const [actor] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, value.updatedByGlobalId))).limit(1);
+            if (!category || !location || !unit || !actor || unit.dimension !== value.dimension) throw new Error("Ingredient snapshot references unavailable local configuration.");
+            await tx.update(ingredients).set({ category_id: category.id, sku: value.sku, name_en: value.nameEn, name_ar: value.nameAr, dimension: value.dimension, base_unit_id: unit.id, default_location_id: location.id, is_tracked: value.tracked, reorder_level: value.reorderLevel, low_stock_threshold: value.lowStockThreshold, par_level: value.parLevel, allow_negative: value.allowNegative, is_active: value.isActive, updated_by: actor.local_id, updated_at: new Date() }).where(eq(ingredients.id, Number(mapping.local_id)));
+            await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
+            continue;
+          }
+          if (isRecipe) {
+            const recipe = snapshot as z.infer<typeof recipeSnapshot>;
+            const [localVersion] = await tx.select().from(recipeVersions).where(eq(recipeVersions.id, Number(mapping.local_id))).for("update").limit(1);
+            if (!localVersion) throw new Error("Mapped recipe version is missing locally.");
+            if (recipe.status === "active") await tx.update(recipeVersions).set({ status: "retired" }).where(and(eq(recipeVersions.menu_item_id, localVersion.menu_item_id), localVersion.variant_id ? eq(recipeVersions.variant_id, localVersion.variant_id) : sql`${recipeVersions.variant_id} is null`, eq(recipeVersions.status, "active")));
+            const [approver] = recipe.approvedByGlobalId ? await tx.select({ local_id: syncEntityMappings.local_id }).from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, recipe.approvedByGlobalId))).limit(1) : [undefined];
+            if (recipe.approvedByGlobalId && !approver) throw new Error("Recipe activation references an unmapped approver.");
+            await tx.update(recipeVersions).set({ status: recipe.status, effective_at: recipe.effectiveAt ? new Date(recipe.effectiveAt) : null, approved_by: approver?.local_id ?? null, approved_at: recipe.approvedAt ? new Date(recipe.approvedAt) : null }).where(eq(recipeVersions.id, localVersion.id));
+            await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
+            continue;
+          }
           if (isShift || isCashMovement) {
             await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
             continue;
@@ -197,6 +224,49 @@ export async function POST(request: NextRequest) {
             await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "supplier", global_id: change.entityGlobalId, local_id: String(created!.id), local_revision: 1, server_revision: change.revision });
             await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "supplier", global_id: change.entityGlobalId, local_id: String(created!.id), server_revision: change.revision });
             await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.supplier.imported", entity_type: "supplier", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
+            continue;
+          }
+          if (isIngredient) {
+            const value = snapshot as z.infer<typeof ingredientSnapshot>;
+            const [category] = await tx.select().from(ingredientCategories).where(and(eq(ingredientCategories.branch_id, device.branch_id), eq(ingredientCategories.code, value.categoryCode))).limit(1);
+            const [location] = await tx.select().from(inventoryLocations).where(and(eq(inventoryLocations.branch_id, device.branch_id), eq(inventoryLocations.code, value.locationCode))).limit(1);
+            const [unit] = await tx.select().from(unitsOfMeasure).where(eq(unitsOfMeasure.code, value.unitCode)).limit(1);
+            const [actor] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, value.updatedByGlobalId))).limit(1);
+            if (!category || !location || !unit || !actor || unit.dimension !== value.dimension) throw new Error("Ingredient snapshot references unavailable local configuration.");
+            const [created] = await tx.insert(ingredients).values({ branch_id: device.branch_id, category_id: category.id, sku: value.sku, name_en: value.nameEn, name_ar: value.nameAr, dimension: value.dimension, base_unit_id: unit.id, default_location_id: location.id, is_active: value.isActive, is_tracked: value.tracked, reorder_level: value.reorderLevel, low_stock_threshold: value.lowStockThreshold, par_level: value.parLevel, allow_negative: value.allowNegative, average_unit_cost_micros: 0, created_by: actor.local_id, updated_by: actor.local_id }).returning();
+            await tx.insert(stockBalances).values({ branch_id: device.branch_id, location_id: location.id, ingredient_id: created!.id, quantity_base: 0, average_unit_cost_micros: 0 });
+            await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "ingredient", global_id: change.entityGlobalId, local_id: String(created!.id), local_revision: 1, server_revision: change.revision });
+            await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "ingredient", global_id: change.entityGlobalId, local_id: String(created!.id), server_revision: change.revision });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.ingredient.imported", entity_type: "ingredient", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor }) });
+            continue;
+          }
+          if (isRecipe) {
+            const recipe = snapshot as z.infer<typeof recipeSnapshot>;
+            const findMapping = async (entityType: string, globalId: string) => tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, entityType), eq(syncEntityMappings.global_id, globalId))).limit(1).then(([row]) => row);
+            const menuItem = await findMapping("menu_item", recipe.menuItemGlobalId);
+            const variant = recipe.variantGlobalId ? await findMapping("menu_item_variant", recipe.variantGlobalId) : undefined;
+            const author = await findMapping("user", recipe.authoredByGlobalId);
+            const approver = recipe.approvedByGlobalId ? await findMapping("user", recipe.approvedByGlobalId) : undefined;
+            if (!menuItem || (recipe.variantGlobalId && !variant) || !author || (recipe.approvedByGlobalId && !approver)) throw new Error("Recipe snapshot references an unmapped menu or actor.");
+            const resolved = [];
+            for (const component of recipe.components) {
+              const ingredient = await findMapping("ingredient", component.ingredientGlobalId);
+              const location = await findMapping("inventory_location", component.locationGlobalId);
+              const unit = await findMapping("unit_of_measure", component.unitGlobalId);
+              const modifier = component.modifierOptionGlobalId ? await findMapping("modifier_option", component.modifierOptionGlobalId) : undefined;
+              if (!ingredient || !location || !unit || (component.modifierOptionGlobalId && !modifier)) throw new Error("Recipe snapshot references an unmapped inventory dependency.");
+              const ingredientRow = await tx.query.ingredients.findFirst({ where: eq(ingredients.id, Number(ingredient.local_id)) });
+              const unitRow = await tx.query.unitsOfMeasure.findFirst({ where: eq(unitsOfMeasure.id, Number(unit.local_id)) });
+              if (!ingredientRow || !unitRow) throw new Error("Recipe snapshot unit or ingredient is unavailable.");
+              const quantityBase = convertScaledQuantity({ quantityScaled: component.quantityScaled, fromDimension: unitRow.dimension, toDimension: ingredientRow.dimension, factor: { numerator: unitRow.base_numerator, denominator: unitRow.base_denominator } });
+              resolved.push({ ingredient_id: Number(ingredient.local_id), source_location_id: Number(location.local_id), unit_id: Number(unit.local_id), modifier_option_id: modifier ? Number(modifier.local_id) : null, quantity_input_scaled: component.quantityScaled, quantity_base: quantityBase });
+            }
+            if (recipe.status === "active") await tx.update(recipeVersions).set({ status: "retired" }).where(and(eq(recipeVersions.branch_id, device.branch_id), eq(recipeVersions.menu_item_id, Number(menuItem.local_id)), variant ? eq(recipeVersions.variant_id, Number(variant.local_id)) : sql`${recipeVersions.variant_id} is null`, eq(recipeVersions.status, "active")));
+            const [created] = await tx.insert(recipeVersions).values({ branch_id: device.branch_id, menu_item_id: Number(menuItem.local_id), variant_id: variant ? Number(variant.local_id) : null, version: recipe.version, status: recipe.status, yield_loss_bps: recipe.yieldLossBps, effective_at: recipe.effectiveAt ? new Date(recipe.effectiveAt) : null, authored_by: author.local_id, approved_by: approver?.local_id ?? null, approved_at: recipe.approvedAt ? new Date(recipe.approvedAt) : null }).returning();
+            await tx.insert(recipeComponents).values(resolved.map((row) => ({ recipe_version_id: created!.id, ...row })));
+            await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "recipe_version", global_id: change.entityGlobalId, local_id: String(created!.id), local_revision: 1, server_revision: change.revision });
+            await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "recipe_version", global_id: change.entityGlobalId, local_id: String(created!.id), server_revision: change.revision });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: author.local_id, action: "sync.recipe.imported", entity_type: "recipe_version", entity_id: change.entityGlobalId, details: JSON.stringify({ cursor: change.cursor, status: recipe.status }) });
             continue;
           }
           if (isStockMovement) {
