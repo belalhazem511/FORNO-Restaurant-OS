@@ -82,7 +82,7 @@ export async function seedSales(branchId: number, userId: string, paymentByName:
     }).where(eq(orders.id, seededOrder.id));
     if (created) {
       await db.insert(orderItems).values({ order_id: created.id, menu_item_id: menuItem.id, product_id: menuItem.product_id, quantity: 1, price: menuItem.base_price });
-      await db.insert(orderStatusHistory).values({ order_id: created.id, from_status: null, to_status: "completed", changed_by: userId, note: "FORNO demo order" });
+      await db.insert(orderStatusHistory).values({ order_id: created.id, from_status: null, to_status: "completed", changed_by: userId, note: "SOLO demo order" });
     }
     let checkout = await db.query.orderCheckouts.findFirst({ where: eq(orderCheckouts.order_id, seededOrder.id) });
     if (!checkout) {

@@ -49,7 +49,7 @@ export async function seedRestaurant(branchId: number, userId: string) {
   const itemSeeds = [
     { code: "MARGHERITA", name_en: "Margherita Pizza", name_ar: "بيتزا مارجريتا", category: "PIZZA", station: "PIZZA", price: 12500 },
     { code: "PEPPERONI", name_en: "Pepperoni Pizza", name_ar: "بيتزا بيبروني", category: "PIZZA", station: "PIZZA", price: 16500 },
-    { code: "FORNO-SPECIAL", name_en: "FORNO Special Pizza", name_ar: "بيتزا فورنو سبيشيال", category: "PIZZA", station: "PIZZA", price: 19500 },
+    { code: "FORNO-SPECIAL", name_en: "SOLO Special Pizza", name_ar: "بيتزا SOLO الخاصة", category: "PIZZA", station: "PIZZA", price: 19500 },
     { code: "CHICKEN-DONER", name_en: "Chicken Doner Sandwich", name_ar: "ساندوتش دونر فراخ", category: "DONER", station: "DONER", price: 9500 },
     { code: "BEEF-DONER", name_en: "Beef Doner Sandwich", name_ar: "ساندوتش دونر لحم", category: "DONER", station: "DONER", price: 11500 },
     { code: "CAPPUCCINO", name_en: "Cappuccino", name_ar: "كابتشينو", category: "CAFE", station: "CAFE", price: 6500 },
@@ -60,7 +60,7 @@ export async function seedRestaurant(branchId: number, userId: string) {
   for (const item of itemSeeds) {
     await db.insert(products).values({
       name: item.name_en,
-      description: `${item.name_en} prepared fresh at FORNO`,
+      description: `${item.name_en} prepared fresh at SOLO`,
       price: item.price,
       in_stock: 100,
       user_uid: userId,
@@ -73,8 +73,8 @@ export async function seedRestaurant(branchId: number, userId: string) {
       code: item.code,
       name_en: item.name_en,
       name_ar: item.name_ar,
-      description_en: `Prepared fresh at FORNO`,
-      description_ar: "يُحضّر طازجًا في فورنو",
+      description_en: `Prepared fresh at SOLO`,
+      description_ar: "يُحضّر طازجًا في SOLO",
       category_id: categoryByCode.get(item.category)!,
       kitchen_station_id: stationByCode.get(item.station)!,
       product_id: product!.id,

@@ -7,7 +7,7 @@ import { desktopPaths } from "./runtime-paths.js";
 import { createLocalBackup, restoreLocalBackup } from "./local-backups.js";
 import { CURRENT_LOCAL_SCHEMA_VERSION, readLocalSchemaVersion, writeLocalSchemaVersion } from "./local-schema-version.js";
 
-app.setName("FORNO Restaurant OS");
+app.setName("SOLO Restaurant OS");
 if (process.env.NODE_ENV === "test" && process.env.FORNO_DESKTOP_DATA_DIR) {
   app.setPath("userData", join(process.env.FORNO_DESKTOP_DATA_DIR, "electron-profile"));
 }
@@ -329,9 +329,9 @@ async function withPausedDatabase<T>(operation: () => Promise<T>, allowUpgradeGa
       const version = await readLocalSchemaVersion(schemaVersionPath);
       if (version === null || version < CURRENT_LOCAL_SCHEMA_VERSION) {
         runtimeState = "upgrade_required";
-        await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(upgradeHtml())}`);
+        await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(upgradeHtml().replaceAll("FORNO", "SOLO"))}`);
       } else if (version > CURRENT_LOCAL_SCHEMA_VERSION) {
-        throw new Error("The restored database belongs to a newer FORNO version. Existing recovery data was preserved.");
+        throw new Error("The restored database belongs to a newer SOLO version. Existing recovery data was preserved.");
       } else {
         await startLocalServer();
         await mainWindow?.loadURL(`${SERVER_ORIGIN}/admin/storage`);
@@ -355,7 +355,7 @@ async function completeOwnerSetup(input: { name: string; email: string; password
 }
 
 function setupHtml() {
-  return setupHtmlDocument().replace("<title>", "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'\"><title>");
+  return setupHtmlDocument().replaceAll("FORNO", "SOLO").replace("<title>", "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'\"><title>");
 }
 
 function setupHtmlDocument() {
@@ -404,7 +404,7 @@ function createWindow() {
       const version = await readLocalSchemaVersion(schemaVersionPath);
       if (version === null || version < CURRENT_LOCAL_SCHEMA_VERSION) {
         runtimeState = "upgrade_required";
-        await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(upgradeHtml())}`);
+        await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(upgradeHtml().replaceAll("FORNO", "SOLO"))}`);
         return;
       }
       if (version > CURRENT_LOCAL_SCHEMA_VERSION) throw new Error("This local database was opened by a newer FORNO version. It was preserved; install a compatible application version.");
@@ -417,7 +417,7 @@ function createWindow() {
     }
   })().catch(async (error) => {
     runtimeState = "failed";
-    await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(startupErrorHtml(error instanceof Error ? error.message : "Local startup failed."))}`);
+    await mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(startupErrorHtml(error instanceof Error ? error.message : "Local startup failed.").replaceAll("FORNO", "SOLO"))}`);
   });
 }
 
@@ -476,10 +476,10 @@ ipcMain.handle("desktop:restore-backup", async (event, confirmed: boolean) => {
   assertStoragePage(event);
   if (confirmed !== true) throw new Error("Explicit restore confirmation is required.");
   const selection = await dialog.showOpenDialog(mainWindow!, {
-    title: "Select a FORNO backup",
+    title: "Select a SOLO backup",
     defaultPath: localPaths.backups,
     properties: ["openFile"],
-    filters: [{ name: "FORNO backup", extensions: ["tar"] }],
+    filters: [{ name: "SOLO backup", extensions: ["tar"] }],
   });
   if (selection.canceled || selection.filePaths.length !== 1) return { restored: false as const };
   const result = await withPausedDatabase(() => restoreLocalBackup(localPaths.root, selection.filePaths[0]!), true);

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
 export type DesktopPaths = {
@@ -18,7 +19,9 @@ export function desktopPaths(appDataDirectory: string, env: NodeJS.ProcessEnv = 
   if (testDirectory && !isAbsolute(testDirectory)) {
     throw new Error("FORNO_DESKTOP_DATA_DIR must be an absolute isolated test path.");
   }
-  const root = resolve(testDirectory ?? join(appDataDirectory, "FORNO Restaurant OS"));
+  const soloRoot = join(appDataDirectory, "SOLO Restaurant OS");
+  const legacyFornoRoot = join(appDataDirectory, "FORNO Restaurant OS");
+  const root = resolve(testDirectory ?? (existsSync(soloRoot) || !existsSync(legacyFornoRoot) ? soloRoot : legacyFornoRoot));
   return {
     root,
     database: join(root, "data", "pglite"),

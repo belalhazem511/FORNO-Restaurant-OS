@@ -13,7 +13,7 @@ export async function seed() {
   await seedProcurement(branchId, userId);
   await seedStockOperations(branchId, userId);
   await seedSales(branchId, userId, paymentByName);
-  console.log(`FORNO seed ready: ${demoLogin.email} and ${demoLogin.cashierEmail} / ${demoLogin.password}`);
+  console.log(`SOLO seed ready: ${demoLogin.email} and ${demoLogin.cashierEmail} / ${demoLogin.password}`);
 }
 
 if (import.meta.main) {

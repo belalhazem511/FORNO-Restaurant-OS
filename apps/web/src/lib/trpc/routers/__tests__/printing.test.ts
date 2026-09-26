@@ -57,7 +57,7 @@ beforeAll(async () => {
     { id: "print-outsider", name: "Other Branch", email: "print-other@test.local", emailVerified: true, createdAt: new Date(), updatedAt: new Date() },
   ]);
   const branches = await db.insert(schema.branches).values([
-    { code: "PRINT", name_en: "FORNO Print Branch", name_ar: "فرع فورنو للطباعة", address_en: "Cairo", address_ar: "القاهرة", phone: "0100", currency: "EGP", timezone: "Africa/Cairo", is_active: true },
+    { code: "PRINT", name_en: "SOLO Print Branch", name_ar: "فرع SOLO للطباعة", address_en: "Cairo", address_ar: "القاهرة", phone: "0100", currency: "EGP", timezone: "Africa/Cairo", is_active: true },
     { code: "OTHER-PRINT", name_en: "Other", name_ar: "آخر", currency: "EGP", timezone: "Africa/Cairo", is_active: true },
   ]).returning();
   branchId = branches[0].id;

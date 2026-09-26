@@ -59,8 +59,8 @@ export class IndexedDbOfflineStore implements OfflineStore {
         if (!database.objectStoreNames.contains(META)) database.createObjectStore(META, { keyPath: "key" });
       };
       request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error ?? new Error("Unable to open FORNO offline storage"));
-      request.onblocked = () => reject(new Error("FORNO offline storage upgrade is blocked by another tab"));
+      request.onerror = () => reject(request.error ?? new Error("Unable to open SOLO offline storage"));
+      request.onblocked = () => reject(new Error("SOLO offline storage upgrade is blocked by another tab"));
     });
     return this.database;
   }

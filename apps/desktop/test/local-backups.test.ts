@@ -34,6 +34,6 @@ describe("local storage backups", () => {
     expect(await readFile(join(temporaryRoot, "data", "pglite-marker.txt"), "utf8")).toBe("original");
     expect(await readFile(join(temporaryRoot, "media", "product.webp"), "utf8")).toBe("image");
     expect(await readFile(join(restored.recoveryPath, "data", "pglite-marker.txt"), "utf8")).toBe("changed");
-    expect(backup.filename).toMatch(/^forno-backup-20260925-123000-[a-f0-9]{8}\.tar$/);
+    expect(backup.filename).toMatch(/^solo-backup-20260925-123000-[a-f0-9]{8}\.tar$/);
   });
 });

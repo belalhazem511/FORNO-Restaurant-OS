@@ -377,7 +377,7 @@ const messages = {
     reprintReason: "Mandatory reprint reason",
     reprintPermission: "A manager, administrator, or owner must authorize reprints.",
     previewOpened: "Print preview opened. The browser cannot confirm that paper was produced.",
-    popupBlocked: "The preview popup was blocked. Allow popups for FORNO, then try again.",
+    popupBlocked: "The preview popup was blocked. Allow popups for SOLO, then try again.",
     requestFailed: "The print request could not be created.",
     settings: "Thermal printing settings",
     paperWidth: "Paper width",

@@ -18,7 +18,7 @@ export default function DesktopSetupPage() {
     setError("");
     const data = new FormData(event.currentTarget);
     try {
-      if (!window.fornoDesktop) throw new Error("This setup screen is available only inside the FORNO desktop application.");
+      if (!window.fornoDesktop) throw new Error("This setup screen is available only inside the SOLO desktop application.");
       await window.fornoDesktop.completeOwnerSetup({
         name: String(data.get("name") ?? ""),
         email: String(data.get("email") ?? ""),

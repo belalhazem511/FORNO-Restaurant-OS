@@ -7,11 +7,11 @@ import "./globals.css";
 import { OfflineProvider } from "@/components/offline/offline-provider";
 
 export const metadata: Metadata = {
-  title: "FORNO Restaurant OS",
+  title: "SOLO Restaurant OS",
   description: "Connected restaurant POS, inventory, menu, and operations dashboard",
   manifest: "/manifest.webmanifest",
-  applicationName: "FORNO Restaurant OS",
-  appleWebApp: { capable: true, title: "FORNO POS", statusBarStyle: "default" },
+  applicationName: "SOLO Restaurant OS",
+  appleWebApp: { capable: true, title: "SOLO POS", statusBarStyle: "default" },
 };
 
 export default async function RootLayout({

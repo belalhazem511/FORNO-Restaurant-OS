@@ -90,7 +90,7 @@ export function buildOfflineCashReceipt(input: {
     checkoutIdempotencyKey: input.checkoutIdempotencyKey,
     priceSnapshot: { reference: input.snapshot.priceSnapshot.reference, revision: input.snapshot.priceSnapshot.revision, expiresAt: new Date(input.snapshot.priceSnapshot.expiresAt).toISOString() },
     checkoutAt: input.checkoutAt,
-    restaurant: { name: { en: "FORNO Restaurant", ar: "مطعم فورنو" }, branch: { en: input.snapshot.branch.name_en, ar: input.snapshot.branch.name_ar }, address: { en: input.snapshot.branch.address_en ?? "", ar: input.snapshot.branch.address_ar ?? "" }, phone: input.snapshot.branch.phone },
+    restaurant: { name: { en: "SOLO Restaurant", ar: "مطعم SOLO" }, branch: { en: input.snapshot.branch.name_en, ar: input.snapshot.branch.name_ar }, address: { en: input.snapshot.branch.address_en ?? "", ar: input.snapshot.branch.address_ar ?? "" }, phone: input.snapshot.branch.phone },
     operator: { cashier: input.snapshot.cashier.name, register: { en: input.snapshot.register.name_en, ar: input.snapshot.register.name_ar, code: input.snapshot.register.code }, shiftNumber: String(input.snapshot.shift.id) },
     order: { type: input.orderType, area: area ? { en: area.name_en, ar: area.name_ar } : null, table: table ? { en: table.name_en, ar: table.name_ar } : null, customerName: input.delivery?.name ?? null, customerPhone: input.delivery?.phone ?? null, deliveryAddress: input.delivery?.address ?? null },
     items: input.cart.map((line) => {

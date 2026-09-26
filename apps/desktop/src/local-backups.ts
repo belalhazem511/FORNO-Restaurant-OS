@@ -4,7 +4,7 @@ import { basename, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const STORES = ["data", "media", "documents", "sync"] as const;
-const BACKUP_NAME = /^forno-backup-\d{8}-\d{6}-[a-f0-9]{8}\.tar$/;
+const BACKUP_NAME = /^(?:solo|forno)-backup-\d{8}-\d{6}-[a-f0-9]{8}\.tar$/i;
 
 function runTar(args: string[]) {
   return new Promise<string>((resolveOutput, reject) => {
@@ -46,7 +46,7 @@ export async function createLocalBackup(root: string, now = new Date()) {
   await mkdir(backupDirectory, { recursive: true });
   for (const store of STORES) await stat(join(absoluteRoot, store));
   const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
-  const filename = `forno-backup-${stamp}-${randomUUID().slice(0, 8)}.tar`;
+  const filename = `solo-backup-${stamp}-${randomUUID().slice(0, 8)}.tar`;
   const temporary = join(backupDirectory, `.${filename}.partial`);
   const destination = join(backupDirectory, filename);
   try {
@@ -68,7 +68,7 @@ export async function restoreLocalBackup(root: string, archivePath: string) {
   const absoluteArchive = resolve(archivePath);
   const archiveRelative = relative(backups, absoluteArchive);
   if (!archiveRelative || archiveRelative.startsWith(`..${sep}`) || archiveRelative === ".." || !BACKUP_NAME.test(basename(absoluteArchive))) {
-    throw new Error("Select a dated FORNO backup from this device.");
+    throw new Error("Select a dated SOLO backup from this device.");
   }
   const listing = await runTar(["-tf", absoluteArchive]);
   validateBackupEntries(listing.split(/\r?\n/).filter(Boolean));

@@ -136,7 +136,7 @@ export function AdminLayout({ children }: { children: React.ReactNode }) {
                 onClick={() => setMobileMenuOpen(false)}
               >
                 <Package2Icon className="h-6 w-6" />
-                <span>FORNO Restaurant OS</span>
+                <span>SOLO Restaurant OS</span>
               </Link>
               <Button
                 variant="ghost"

@@ -104,7 +104,7 @@ export async function seedInventory(branchId: number, userId: string) {
     const quantityBase = convertScaledQuantity({ quantityScaled: parseDecimalToScaled(seed.opening), fromDimension: seed.dimension, toDimension: seed.dimension, factor: { numerator: openingUnit.base_numerator, denominator: openingUnit.base_denominator } });
     await db.transaction((tx) => postStockIncrease(tx, {
       branchId, locationId: ingredient.default_location_id, ingredientId: ingredient.id, quantityBase, unitCostMicros: seed.unitCostMicros,
-      actorUserId: userId, idempotencyKey: `seed-opening:${branchId}:${seed.sku}`, movementType: "opening_balance", reason: "Deterministic FORNO opening stock",
+      actorUserId: userId, idempotencyKey: `seed-opening:${branchId}:${seed.sku}`, movementType: "opening_balance", reason: "Deterministic SOLO opening stock",
     }));
     if (seed.package) await db.insert(ingredientPackageConversions).values({ ingredient_id: ingredient.id, code: seed.package.code, name_en: seed.package.name_en, name_ar: seed.package.name_ar, base_numerator: seed.package.numerator, base_denominator: 1, is_active: true }).onConflictDoNothing();
   }

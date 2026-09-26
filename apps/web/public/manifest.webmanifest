@@ -1,6 +1,6 @@
 {
-  "name": "FORNO Restaurant OS",
-  "short_name": "FORNO POS",
+  "name": "SOLO Restaurant OS",
+  "short_name": "SOLO POS",
   "description": "Offline-capable restaurant point of sale",
   "start_url": "/admin/pos",
   "scope": "/",

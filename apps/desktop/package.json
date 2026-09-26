@@ -19,7 +19,7 @@
   },
   "build": {
     "appId": "com.forno.restaurantos",
-    "productName": "FORNO Restaurant OS",
+    "productName": "SOLO Restaurant OS",
     "directories": {
       "output": "../../release"
     },
@@ -40,12 +40,17 @@
     ],
     "win": {
       "target": ["nsis", "portable"],
-      "artifactName": "FORNO-${version}-${arch}.${ext}"
+      "artifactName": "SOLO-${version}-${arch}.${ext}"
     },
     "nsis": {
+      "artifactName": "SOLO-Setup-x64.exe",
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "SOLO-Portable-x64.exe"
     }
   }
 }
