@@ -6,12 +6,13 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { NextRequest } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, SCHEMA_DDL } from "@/lib/trpc/routers/__tests__/helpers";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, kitchenStations, menuCategories, menuItems, orderCancellations, orderCheckouts, orderPayments, orders, paymentMethods, printJobs, products, recipeComponents, recipeVersions, shiftCashMovements, staffAssignments, stockBalances, stockMovements, suppliers, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredientPackageConversions, ingredients, inventoryLocations, kitchenStations, menuCategories, menuItems, orderCancellations, orderCheckouts, orderPayments, orders, paymentMethods, printJobs, products, purchaseOrderLines, purchaseOrders, purchaseReceiptLines, purchaseReceiptReversals, purchaseReceipts, recipeComponents, recipeVersions, shiftCashMovements, staffAssignments, stockBalances, stockMovements, supplierReturnLines, supplierReturnReversals, supplierReturns, suppliers, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
 import { productImagePath } from "@/lib/media/product-images";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
 const { GET, POST, SYNC_COMMAND_REGISTRY } = await import("./commands/route");
+const { applyAuthoritativeChanges } = await import("../desktop/sync/apply/import-authoritative-changes");
 const { POST: uploadProductMedia } = await import("./media/route");
 const deviceId = "b2d90704-052a-4a37-a0fc-0464bf8c9e0a";
 const organizationId = "ce9b25aa-39de-41c8-8d07-6c4ad0b5b967";
@@ -29,6 +30,7 @@ const unitGlobalId = "350e9e2f-8e33-44ec-92b0-e696a9f51548";
 const recipeVersionGlobalId = "9c66ef65-7373-4ca2-ac10-f737955f724e";
 const supplierGlobalId = "13bfa1d7-1a74-4b6c-b399-0658e7f1afdb";
 const newIngredientGlobalId = "bc47a0f7-00f1-4bcb-9dce-08fbab32bfca";
+const purchaseOrderGlobalId = "294188d3-1cec-4ec7-8151-5029b41e1e07";
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -143,6 +145,22 @@ function makeRecipeCommand() {
   return { operationId: "0db8334f-1b60-4b1a-9fe8-9b9b398e11d5", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "inventory", action: "recipe_create", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "recipe-create-sync-001", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
 }
 
+function makePurchaseOrderCommand(input: { action: string; operationId: string; idempotencyKey: string; baseRevision?: number; reason?: string }) {
+  const commandLine = { ingredientGlobalId, unitGlobalId, packageConversionGlobalId: null, packageConversionCode: null, quantityScaled: 2_000, unitPriceMinor: 125, notes: null };
+  const payload = input.action === "purchase_order_create"
+    ? { purchaseOrderGlobalId, supplierGlobalId, poNumber: "PO-SYNC-01", expectedDate: null, notes: "No stock effect before receiving", supplierSnapshot: { code: "SYNC-SUP", nameEn: "Sync Supplier", nameAr: "مورد" }, lines: [commandLine] }
+    : input.action === "purchase_order_lines_update"
+      ? { purchaseOrderGlobalId, baseRevision: input.baseRevision ?? 1, poNumber: "PO-SYNC-01", lines: [{ ...commandLine, quantityScaled: 3_000 }] }
+      : input.action === "purchase_order_cancel"
+        ? { purchaseOrderGlobalId, baseRevision: input.baseRevision ?? 1, expectedStatus: "draft", reason: input.reason ?? "Cancelled before approval" }
+        : { purchaseOrderGlobalId, baseRevision: input.baseRevision ?? 1, expectedStatus: input.action === "purchase_order_submit" ? "draft" : "submitted" };
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "procurement", action: input.action, schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: input.baseRevision ?? 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+}
+
+function makeSupplyMutation(input: { domain: "procurement" | "receiving" | "supplier_returns"; action: string; operationId: string; idempotencyKey: string; payload: Record<string, unknown>; baseRevision?: number; dependencies?: string[] }) {
+  return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: input.domain, action: input.action, schemaVersion: 1, payload: input.payload, payloadHash: createHash("sha256").update(stableJson(input.payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: input.baseRevision ?? 0, dependencies: input.dependencies ?? [], deviceTimestamp: new Date().toISOString() };
+}
+
 async function postCommands(commands: unknown[]) {
   return POST(new NextRequest("http://localhost/api/sync/commands", {
     method: "POST",
@@ -204,7 +222,10 @@ describe("paired customer command processing", () => {
       "checkout.cancel", "checkout.pay", "customers.create", "customers.delete", "customers.update", "inventory.adjust", "inventory.ingredient_archive", "inventory.ingredient_create", "inventory.ingredient_update",
       "inventory.recipe_activate", "inventory.recipe_create",
       "orders.create", "orders.transition", "orders.update", "printing.request", "printing.settings_update", "printing.transition",
-      "products.create", "products.delete", "products.update", "shifts.close", "shifts.drawer_adjust", "shifts.open",
+      "procurement.purchase_order_approve", "procurement.purchase_order_cancel", "procurement.purchase_order_create", "procurement.purchase_order_lines_update", "procurement.purchase_order_submit",
+      "products.create", "products.delete", "products.update", "receiving.receipt_create", "receiving.receipt_edit", "receiving.receipt_post", "receiving.receipt_reverse",
+      "shifts.close", "shifts.drawer_adjust", "shifts.open",
+      "supplier_returns.return_approve", "supplier_returns.return_cancel", "supplier_returns.return_create", "supplier_returns.return_dispatch", "supplier_returns.return_edit", "supplier_returns.return_reverse", "supplier_returns.return_submit",
       "suppliers.archive", "suppliers.create", "suppliers.update",
     ]);
     for (const command of Object.values(SYNC_COMMAND_REGISTRY)) {
@@ -251,6 +272,279 @@ describe("paired customer command processing", () => {
     const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
     const changes = (await response.json()).changes as Array<{ entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
     expect(changes.find((change) => change.entityGlobalId === supplierGlobalId)?.snapshot).toMatchObject({ code: "SYNC-SUP", nameEn: "Updated Sync Supplier", isActive: false, updatedByGlobalId: actorGlobalId });
+  });
+
+  it("applies draft purchase-order edits and lifecycle without stock effects", async () => {
+    await db.update(suppliers).set({ is_active: true }).where(eq(suppliers.code, "SYNC-SUP"));
+    const beforeMovements = (await db.select().from(stockMovements)).length;
+    const create = makePurchaseOrderCommand({ action: "purchase_order_create", operationId: "1783c165-a895-4658-9fe3-6295af8ad8be", idempotencyKey: "po-sync-create-001" });
+    expect((await (await postCommands([create])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([create])).json()).results[0].status).toBe("already_applied");
+    let order = await db.query.purchaseOrders.findFirst({ where: eq(purchaseOrders.po_number, "PO-SYNC-01"), with: { lines: true } });
+    expect(order).toMatchObject({ status: "draft", receiving_status: "not_received", subtotal_amount: 250, total_amount: 250 });
+    const update = makePurchaseOrderCommand({ action: "purchase_order_lines_update", operationId: "4e79b44c-32f1-43fd-9e26-af69543f8fe9", idempotencyKey: "po-sync-lines-001", baseRevision: 1 });
+    expect((await (await postCommands([update])).json()).results[0].status).toBe("accepted");
+    order = await db.query.purchaseOrders.findFirst({ where: eq(purchaseOrders.po_number, "PO-SYNC-01"), with: { lines: true } });
+    expect(order?.lines[0]?.quantity_input_scaled).toBe(3_000);
+    const submit = makePurchaseOrderCommand({ action: "purchase_order_submit", operationId: "02bf7992-5ef4-4575-a139-a93cb6dcde1b", idempotencyKey: "po-sync-submit-001", baseRevision: 2 });
+    expect((await (await postCommands([submit])).json()).results[0].status).toBe("accepted");
+    const approve = makePurchaseOrderCommand({ action: "purchase_order_approve", operationId: "cc61d733-f7d7-4fae-a87a-8ccf061c0a4c", idempotencyKey: "po-sync-approve-001", baseRevision: 3 });
+    expect((await (await postCommands([approve])).json()).results[0].status).toBe("accepted");
+    order = await db.query.purchaseOrders.findFirst({ where: eq(purchaseOrders.po_number, "PO-SYNC-01"), with: { lines: true } });
+    expect(order?.status).toBe("approved");
+    expect((await db.select().from(stockMovements)).length).toBe(beforeMovements);
+    const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const changes = (await response.json()).changes as Array<{ entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
+    expect(changes.find((change) => change.entityGlobalId === purchaseOrderGlobalId)?.snapshot).toMatchObject({ status: "approved", subtotalAmount: 375, lines: [{ quantityScaled: 3_000, lineTotalAmount: 375 }] });
+  });
+
+  it("synchronizes receipt posting, return dispatch and reversal snapshots exactly once", async () => {
+    const receiptGlobalId = "c3017869-8cb1-4ee5-901e-2f4e2829586a";
+    const createOperation = "db3b1c1a-e442-4319-9ac9-abf5c9e1537e";
+    const create = makeSupplyMutation({ domain: "receiving", action: "receipt_create", operationId: createOperation, idempotencyKey: "receipt-sync-create-001", dependencies: ["cc61d733-f7d7-4fae-a87a-8ccf061c0a4c"], payload: { receiptGlobalId, purchaseOrderGlobalId, locationGlobalId, receiptNumber: "GRN-SYNC-01", supplierDeliveryNote: null, supplierInvoiceReference: null, receivedAt: new Date().toISOString(), notes: "sync test", lines: [{ poLineIndex: 0, acceptedQuantityScaled: 1_000, rejectedQuantityScaled: 0, damagedQuantityScaled: 0, actualUnitPriceMinor: null, notes: null }] } });
+    expect((await (await postCommands([create])).json()).results[0].status).toBe("accepted");
+    const receiptId = (await db.query.purchaseReceipts.findFirst({ where: eq(purchaseReceipts.receipt_number, "GRN-SYNC-01") }))!.id;
+    const stockBeforePost = (await db.query.stockBalances.findFirst({ where: eq(stockBalances.ingredient_id, (await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-BASE") }))!.id) }))!.quantity_base;
+    expect((await db.select().from(stockMovements).where(eq(stockMovements.purchase_receipt_id, receiptId))).length).toBe(0);
+    const post = makeSupplyMutation({ domain: "receiving", action: "receipt_post", operationId: "c8ff26aa-572f-492a-8517-7a19f029d8dc", idempotencyKey: "receipt-sync-post-001", baseRevision: 1, dependencies: [createOperation], payload: { receiptGlobalId, baseRevision: 1, approveVariance: false, varianceReason: null, overreceive: false, overreceiveReason: null } });
+    expect((await (await postCommands([post])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([post])).json()).results[0].status).toBe("already_applied");
+    const postedLines = await db.select().from(stockMovements).where(eq(stockMovements.purchase_receipt_id, receiptId));
+    expect(postedLines).toHaveLength(1);
+    expect(postedLines[0]).toMatchObject({ movement_type: "purchase_receipt", direction: 1 });
+    const returnGlobalId = "76d715f5-477c-4b12-99a4-655493a0c68a";
+    const returnCreate = makeSupplyMutation({ domain: "supplier_returns", action: "return_create", operationId: "46cedf05-884b-425b-97fb-765246862b36", idempotencyKey: "return-sync-create-001", dependencies: [post.operationId], payload: { supplierReturnGlobalId: returnGlobalId, receiptGlobalId, returnNumber: "RTV-SYNC-01", reasonCode: "damaged", reason: "Damaged on arrival", notes: null, evidenceMetadata: [], lines: [{ receiptLineIndex: 0, quantityScaled: 100, notes: null }] } });
+    expect((await (await postCommands([returnCreate])).json()).results[0].status).toBe("accepted");
+    const submit = makeSupplyMutation({ domain: "supplier_returns", action: "return_submit", operationId: "8484090a-66e6-4c32-983a-948aa5184055", idempotencyKey: "return-sync-submit-001", baseRevision: 1, dependencies: [returnCreate.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 1, reason: null, idempotencyKey: "return-sync-submit-hist-001" } });
+    expect((await (await postCommands([submit])).json()).results[0].status).toBe("accepted");
+    const approve = makeSupplyMutation({ domain: "supplier_returns", action: "return_approve", operationId: "4da2d532-1649-4688-ac44-bcb3dcbd550e", idempotencyKey: "return-sync-approve-001", baseRevision: 2, dependencies: [submit.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 2, reason: "Verified return approval", idempotencyKey: "return-sync-approve-hist-01" } });
+    expect((await (await postCommands([approve])).json()).results[0].status).toBe("accepted");
+    const dispatch = makeSupplyMutation({ domain: "supplier_returns", action: "return_dispatch", operationId: "202993e2-bf27-4f27-9eb1-3bec8c59b643", idempotencyKey: "return-sync-dispatch-001", baseRevision: 3, dependencies: [approve.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 3, reason: "Handed to supplier", idempotencyKey: "return-sync-dispatch-hist1" } });
+    expect((await (await postCommands([dispatch])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([dispatch])).json()).results[0].status).toBe("already_applied");
+    const reversal = makeSupplyMutation({ domain: "supplier_returns", action: "return_reverse", operationId: "a5f5d5a4-192e-45d5-8c0d-0247ff0b0f8d", idempotencyKey: "return-sync-reverse-001", baseRevision: 4, dependencies: [dispatch.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 4, reason: "Dispatch entered in error", idempotencyKey: "return-sync-reverse-hist1" } });
+    expect((await (await postCommands([reversal])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([reversal])).json()).results[0].status).toBe("already_applied");
+    const returnRow = await db.query.supplierReturns.findFirst({ where: eq(supplierReturns.return_number, "RTV-SYNC-01"), with: { lines: true, statusHistory: true, reversals: true } });
+    expect(returnRow).toMatchObject({ status: "reversed" });
+    expect(returnRow?.statusHistory.length).toBe(5);
+    expect(returnRow?.reversals).toHaveLength(1);
+    expect((await db.select().from(stockMovements).where(eq(stockMovements.supplier_return_id, returnRow!.id))).length).toBe(2);
+    expect((await db.query.purchaseReceipts.findFirst({ where: eq(purchaseReceipts.id, receiptId) }))?.status).toBe("posted");
+    const receiptReverse = makeSupplyMutation({ domain: "receiving", action: "receipt_reverse", operationId: "46a2bb6e-8cc4-436e-b8a3-52d0e0381d98", idempotencyKey: "receipt-sync-reverse-001", baseRevision: 2, dependencies: [reversal.operationId], payload: { reversalGlobalId: "69bec583-c35a-46c2-9eef-44f1b037b53a", receiptGlobalId, baseRevision: 2, reason: "Reverse original receipt", idempotencyKey: "receipt-reversal-record-001" } });
+    expect((await (await postCommands([receiptReverse])).json()).results[0]).toMatchObject({ status: "needs_review" });
+    const receiptAfter = await db.query.purchaseReceipts.findFirst({ where: eq(purchaseReceipts.id, receiptId) });
+    expect(receiptAfter?.status).toBe("needs_review");
+    expect((await db.select().from(stockMovements).where(and(eq(stockMovements.purchase_receipt_id, receiptId), eq(stockMovements.movement_type, "purchase_receipt_reversal")))).length).toBe(0);
+    const pull = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const changes = (await pull.json()).changes as Array<{ cursor: number; entityType: string; entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
+    expect(changes.find((change) => change.entityType === "purchase_receipt" && change.entityGlobalId === receiptGlobalId)?.snapshot).toMatchObject({ status: "needs_review", lines: [{ acceptedQuantityBase: expect.any(Number) }], movements: expect.any(Array) });
+    expect(changes.find((change) => change.entityType === "supplier_return" && change.entityGlobalId === returnGlobalId)?.snapshot).toMatchObject({ status: "reversed", histories: expect.any(Array), movements: expect.any(Array), reversal: expect.any(Object) });
+    const latestReceiptChange = changes.filter((change) => change.entityType === "purchase_receipt" && change.entityGlobalId === receiptGlobalId).at(-1)!;
+    const latestReturnChange = changes.filter((change) => change.entityType === "supplier_return" && change.entityGlobalId === returnGlobalId).at(-1)!;
+    const actorIdentity = await db.query.syncGlobalEntities.findFirst({ where: and(eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.global_id, actorGlobalId)) });
+    await db.insert(syncEntityMappings).values({ organization_id: organizationId, device_id: deviceId, branch_id: centralBranchId, entity_type: "user", global_id: actorGlobalId, local_id: actorIdentity!.local_id, local_revision: 1, server_revision: 1 }).onConflictDoNothing();
+    const beforePeerApply = await db.select().from(stockMovements);
+    const previousDesktopMode = process.env.FORNO_DESKTOP_MODE;
+    const previousSetupToken = process.env.FORNO_DESKTOP_SETUP_TOKEN;
+    const previousDeviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+    process.env.FORNO_DESKTOP_MODE = "1";
+    process.env.FORNO_DESKTOP_SETUP_TOKEN = "isolated-sync-test-token";
+    process.env.FORNO_DESKTOP_DEVICE_ID = deviceId;
+    let applyResponse: Response;
+    try {
+      const firstReceiptChange = changes.find((change) => change.entityType === "purchase_receipt" && change.entityGlobalId === receiptGlobalId)!;
+      const invalidReturnChange = { ...latestReturnChange, snapshot: { ...latestReturnChange.snapshot!, receiptGlobalId: "4dd67c3d-106b-4950-9fb6-6ec8f75066f6" } };
+      const beforeFailedImport = {
+        receiptLines: (await db.select().from(purchaseReceiptLines).where(eq(purchaseReceiptLines.receipt_id, receiptId))).length,
+        receiptReversals: (await db.select().from(purchaseReceiptReversals).where(eq(purchaseReceiptReversals.receipt_id, receiptId))).length,
+        returnLines: (await db.select().from(supplierReturnLines).where(eq(supplierReturnLines.supplier_return_id, returnRow!.id))).length,
+        returnReversals: (await db.select().from(supplierReturnReversals).where(eq(supplierReturnReversals.supplier_return_id, returnRow!.id))).length,
+        movements: (await db.select().from(stockMovements)).length,
+        mappings: (await db.select().from(syncEntityMappings).where(eq(syncEntityMappings.device_id, deviceId))).length,
+        balance: (await db.query.stockBalances.findFirst({ where: eq(stockBalances.ingredient_id, (await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-BASE") }))!.id) }))!.quantity_base,
+      };
+      const failedPage = await applyAuthoritativeChanges(new NextRequest("http://localhost/api/desktop/sync/apply", { method: "POST", headers: { "content-type": "application/json", "x-forno-desktop-setup": "isolated-sync-test-token" }, body: JSON.stringify({ changes: [firstReceiptChange, invalidReturnChange], nextCursor: latestReturnChange.cursor }) }), db);
+      expect(failedPage.status).toBe(409);
+      expect((await db.query.purchaseReceipts.findFirst({ where: eq(purchaseReceipts.id, receiptId) }))?.status).toBe("needs_review");
+      expect((await db.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }))?.last_pulled_cursor).toBe(0);
+      expect((await db.select().from(purchaseReceiptLines).where(eq(purchaseReceiptLines.receipt_id, receiptId))).length).toBe(beforeFailedImport.receiptLines);
+      expect((await db.select().from(purchaseReceiptReversals).where(eq(purchaseReceiptReversals.receipt_id, receiptId))).length).toBe(beforeFailedImport.receiptReversals);
+      expect((await db.select().from(supplierReturnLines).where(eq(supplierReturnLines.supplier_return_id, returnRow!.id))).length).toBe(beforeFailedImport.returnLines);
+      expect((await db.select().from(supplierReturnReversals).where(eq(supplierReturnReversals.supplier_return_id, returnRow!.id))).length).toBe(beforeFailedImport.returnReversals);
+      expect((await db.select().from(stockMovements)).length).toBe(beforeFailedImport.movements);
+      expect((await db.select().from(syncEntityMappings).where(eq(syncEntityMappings.device_id, deviceId))).length).toBe(beforeFailedImport.mappings);
+      expect((await db.query.stockBalances.findFirst({ where: eq(stockBalances.ingredient_id, (await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-BASE") }))!.id) }))!.quantity_base).toBe(beforeFailedImport.balance);
+      applyResponse = await applyAuthoritativeChanges(new NextRequest("http://localhost/api/desktop/sync/apply", { method: "POST", headers: { "content-type": "application/json", "x-forno-desktop-setup": "isolated-sync-test-token" }, body: JSON.stringify({ changes: [latestReturnChange, latestReceiptChange], nextCursor: latestReceiptChange.cursor }) }), db);
+      const outboxBeforeReplay = await db.select().from(syncOutbox);
+      const replay = await applyAuthoritativeChanges(new NextRequest("http://localhost/api/desktop/sync/apply", { method: "POST", headers: { "content-type": "application/json", "x-forno-desktop-setup": "isolated-sync-test-token" }, body: JSON.stringify({ changes: [latestReturnChange, latestReceiptChange], nextCursor: latestReceiptChange.cursor }) }), db);
+      expect(replay.status).toBe(200);
+      expect(await db.select().from(syncOutbox)).toEqual(outboxBeforeReplay);
+    } finally {
+      if (previousDesktopMode === undefined) delete process.env.FORNO_DESKTOP_MODE; else process.env.FORNO_DESKTOP_MODE = previousDesktopMode;
+      if (previousSetupToken === undefined) delete process.env.FORNO_DESKTOP_SETUP_TOKEN; else process.env.FORNO_DESKTOP_SETUP_TOKEN = previousSetupToken;
+      if (previousDeviceId === undefined) delete process.env.FORNO_DESKTOP_DEVICE_ID; else process.env.FORNO_DESKTOP_DEVICE_ID = previousDeviceId;
+    }
+    expect(applyResponse.status).toBe(200);
+    expect((await db.select().from(stockMovements))).toHaveLength(beforePeerApply.length);
+    expect((await db.select().from(purchaseReceipts).where(eq(purchaseReceipts.id, receiptId))).length).toBe(1);
+    expect((await db.select().from(supplierReturnLines).where(eq(supplierReturnLines.supplier_return_id, returnRow!.id))).length).toBe(1);
+    expect((await db.select().from(purchaseReceiptReversals).where(eq(purchaseReceiptReversals.receipt_id, receiptId))).length).toBe(1);
+    expect((await (await postCommands([receiptReverse])).json()).results[0].status).toBe("needs_review");
+
+    const safeReceiptGlobalId = "654a6c0a-f460-4db6-aa8b-52c85089812c";
+    const safeCreate = makeSupplyMutation({ domain: "receiving", action: "receipt_create", operationId: "9a88a85d-55d7-42fa-b8b2-40de12b84429", idempotencyKey: "receipt-sync-safe-create-1", dependencies: ["cc61d733-f7d7-4fae-a87a-8ccf061c0a4c"], payload: { receiptGlobalId: safeReceiptGlobalId, purchaseOrderGlobalId, locationGlobalId, receiptNumber: "GRN-SYNC-02", supplierDeliveryNote: null, supplierInvoiceReference: null, receivedAt: new Date().toISOString(), notes: null, lines: [{ poLineIndex: 0, acceptedQuantityScaled: 100, rejectedQuantityScaled: 0, damagedQuantityScaled: 0, actualUnitPriceMinor: null, notes: null }] } });
+    expect((await (await postCommands([safeCreate])).json()).results[0].status).toBe("accepted");
+    const safePost = makeSupplyMutation({ domain: "receiving", action: "receipt_post", operationId: "72a16bdc-ed6a-4570-9214-5364e3db7191", idempotencyKey: "receipt-sync-safe-post-1", baseRevision: 1, dependencies: [safeCreate.operationId], payload: { receiptGlobalId: safeReceiptGlobalId, baseRevision: 1, approveVariance: false, varianceReason: null, overreceive: false, overreceiveReason: null } });
+    expect((await (await postCommands([safePost])).json()).results[0].status).toBe("accepted");
+    const safeReverse = makeSupplyMutation({ domain: "receiving", action: "receipt_reverse", operationId: "696bd568-9a9b-4f4f-bf59-929b6027c49b", idempotencyKey: "receipt-sync-safe-reverse1", baseRevision: 2, dependencies: [safePost.operationId], payload: { reversalGlobalId: "eab8e41f-6a1a-44dc-ad78-d21ded169de5", receiptGlobalId: safeReceiptGlobalId, baseRevision: 2, reason: "Safe receipt correction", idempotencyKey: "receipt-sync-safe-reversal-record" } });
+    expect((await (await postCommands([safeReverse])).json()).results[0]).toMatchObject({ status: "accepted", result: { status: "reversed" } });
+    expect((await (await postCommands([safeReverse])).json()).results[0].status).toBe("already_applied");
+    const safeReceipt = await db.query.purchaseReceipts.findFirst({ where: eq(purchaseReceipts.receipt_number, "GRN-SYNC-02") });
+    expect(safeReceipt?.status).toBe("reversed");
+    expect((await db.select().from(stockMovements).where(and(eq(stockMovements.purchase_receipt_id, safeReceipt!.id), eq(stockMovements.movement_type, "purchase_receipt_reversal")))).length).toBe(1);
+  });
+
+  it("keeps an unsafe supplier-return reversal in Needs Review without compensating movements", async () => {
+    const receiptGlobalId = "854ee9fc-529d-4fb9-864d-cf34fe75ea61";
+    const create = makeSupplyMutation({ domain: "receiving", action: "receipt_create", operationId: "a8eeec8a-7b6a-46aa-a5f6-c8027175c4b9", idempotencyKey: "receipt-unsafe-return-create", dependencies: ["cc61d733-f7d7-4fae-a87a-8ccf061c0a4c"], payload: { receiptGlobalId, purchaseOrderGlobalId, locationGlobalId, receiptNumber: "GRN-UNSAFE-RTV", supplierDeliveryNote: null, supplierInvoiceReference: null, receivedAt: new Date().toISOString(), notes: null, lines: [{ poLineIndex: 0, acceptedQuantityScaled: 100, rejectedQuantityScaled: 0, damagedQuantityScaled: 0, actualUnitPriceMinor: null, notes: null }] } });
+    expect((await (await postCommands([create])).json()).results[0].status).toBe("accepted");
+    const post = makeSupplyMutation({ domain: "receiving", action: "receipt_post", operationId: "2b46ef47-6b59-46d2-9767-550f2eb4c513", idempotencyKey: "receipt-unsafe-return-post", baseRevision: 1, dependencies: [create.operationId], payload: { receiptGlobalId, baseRevision: 1, approveVariance: false, varianceReason: null, overreceive: false, overreceiveReason: null } });
+    expect((await (await postCommands([post])).json()).results[0].status).toBe("accepted");
+    const receipt = await db.query.purchaseReceipts.findFirst({ where: eq(purchaseReceipts.receipt_number, "GRN-UNSAFE-RTV"), with: { lines: true } });
+    const returnGlobalId = "d9a49121-0559-439c-9470-535f84b280ea";
+    const returnCreate = makeSupplyMutation({ domain: "supplier_returns", action: "return_create", operationId: "00ca56c1-dba1-4e4d-b733-8741bf70cc38", idempotencyKey: "return-unsafe-create", dependencies: [post.operationId], payload: { supplierReturnGlobalId: returnGlobalId, receiptGlobalId, returnNumber: "RTV-UNSAFE-01", reasonCode: "damaged", reason: "Damaged", notes: null, evidenceMetadata: [], lines: [{ receiptLineIndex: 0, quantityScaled: 10, notes: null }] } });
+    expect((await (await postCommands([returnCreate])).json()).results[0].status).toBe("accepted");
+    const submit = makeSupplyMutation({ domain: "supplier_returns", action: "return_submit", operationId: "86d6148d-2bc1-440d-86e6-7335fe006e63", idempotencyKey: "return-unsafe-submit", baseRevision: 1, dependencies: [returnCreate.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 1, reason: null, idempotencyKey: "return-unsafe-submit-history" } });
+    expect((await (await postCommands([submit])).json()).results[0].status).toBe("accepted");
+    const approve = makeSupplyMutation({ domain: "supplier_returns", action: "return_approve", operationId: "cd99d5d3-dd49-41cc-8964-cb3edc4279cd", idempotencyKey: "return-unsafe-approve", baseRevision: 2, dependencies: [submit.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 2, reason: "Approved", idempotencyKey: "return-unsafe-approve-history" } });
+    expect((await (await postCommands([approve])).json()).results[0].status).toBe("accepted");
+    const dispatch = makeSupplyMutation({ domain: "supplier_returns", action: "return_dispatch", operationId: "9ba4bb18-3afe-4e57-bef8-415e83e28795", idempotencyKey: "return-unsafe-dispatch", baseRevision: 3, dependencies: [approve.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 3, reason: "Dispatched", idempotencyKey: "return-unsafe-dispatch-history" } });
+    expect((await (await postCommands([dispatch])).json()).results[0].status).toBe("accepted");
+    const returnRow = await db.query.supplierReturns.findFirst({ where: eq(supplierReturns.return_number, "RTV-UNSAFE-01"), with: { statusHistory: true } });
+    const dispatchMovements = await db.select().from(stockMovements).where(eq(stockMovements.supplier_return_id, returnRow!.id));
+    const laterActivity = makeStockAdjustmentCommand();
+    const laterPayload = { ...laterActivity.payload, movementGlobalId: "a7e77a22-46db-4889-8c3f-5e6bd23fdc8c", idempotencyKey: "return-unsafe-later-stock" };
+    const laterCommand = { ...laterActivity, operationId: "fddda9c0-fbc9-4f82-b39d-0eb322d4755e", payload: laterPayload, payloadHash: createHash("sha256").update(stableJson(laterPayload)).digest("hex"), idempotencyKey: "return-unsafe-later-command" };
+    expect((await (await postCommands([laterCommand])).json()).results[0].status).toBe("accepted");
+    const reverse = makeSupplyMutation({ domain: "supplier_returns", action: "return_reverse", operationId: "be3a770b-16de-4e28-87ef-40f2bb1c27f2", idempotencyKey: "return-unsafe-reverse", baseRevision: 4, dependencies: [dispatch.operationId, laterCommand.operationId], payload: { supplierReturnGlobalId: returnGlobalId, baseRevision: 4, reason: "Check unsafe reversal", idempotencyKey: "return-unsafe-reversal-record" } });
+    const first = (await (await postCommands([reverse])).json()).results[0];
+    expect(first.status).toBe("needs_review");
+    const afterFirst = await db.query.supplierReturns.findFirst({ where: eq(supplierReturns.id, returnRow!.id), with: { statusHistory: true, reversals: true } });
+    const afterMovements = await db.select().from(stockMovements).where(eq(stockMovements.supplier_return_id, returnRow!.id));
+    expect(afterFirst?.status).toBe("needs_review");
+    expect(afterFirst?.statusHistory).toHaveLength(returnRow!.statusHistory.length + 1);
+    expect(afterFirst?.statusHistory.at(-1)).toMatchObject({ from_status: "dispatched", to_status: "needs_review" });
+    expect(afterFirst?.reversals).toHaveLength(1);
+    expect(afterMovements).toHaveLength(dispatchMovements.length);
+    expect(afterMovements).toEqual(dispatchMovements);
+    expect((await (await postCommands([reverse])).json()).results[0]).toMatchObject({ status: "needs_review", operationId: reverse.operationId });
+    expect(await db.select().from(stockMovements).where(eq(stockMovements.supplier_return_id, returnRow!.id))).toHaveLength(dispatchMovements.length);
+    expect(afterFirst?.statusHistory).toHaveLength(returnRow!.statusHistory.length + 1);
+    expect(await db.select().from(purchaseReceiptLines).where(eq(purchaseReceiptLines.receipt_id, receipt!.id))).toHaveLength(1);
+  });
+
+  it("revalidates procurement permissions and branch scope before writing", async () => {
+    const beforeOrders = (await db.select().from(purchaseOrders)).length;
+    const beforeReturns = (await db.select().from(supplierReturns)).length;
+    await db.update(staffAssignments).set({ role: "manager" }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
+    const managerPayload = { ...makePurchaseOrderCommand({ action: "purchase_order_create", operationId: "d27f64ab-0fc2-4cf3-b1eb-8c32dd22cf2e", idempotencyKey: "manager-po-create" }).payload, purchaseOrderGlobalId: "5a9189b0-108f-49e8-8cca-26055f8a226e", poNumber: "PO-MANAGER-SYNC" };
+    const managerCommand = makePurchaseOrderCommand({ action: "purchase_order_create", operationId: "d27f64ab-0fc2-4cf3-b1eb-8c32dd22cf2e", idempotencyKey: "manager-po-create" });
+    const managerResult = { ...managerCommand, payload: managerPayload, payloadHash: createHash("sha256").update(stableJson(managerPayload)).digest("hex") };
+    expect((await (await postCommands([managerResult])).json()).results[0].status).toBe("accepted");
+    expect((await db.select().from(purchaseOrders))).toHaveLength(beforeOrders + 1);
+    await db.update(staffAssignments).set({ role: "cashier" }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
+    const receipt = await db.query.purchaseReceipts.findFirst({ where: eq(purchaseReceipts.receipt_number, "GRN-SYNC-01"), with: { lines: true } });
+    const deniedPayload = { supplierReturnGlobalId: "e3f56d14-bf49-49c1-b120-3d70f36c3bb3", receiptGlobalId: "c3017869-8cb1-4ee5-901e-2f4e2829586a", returnNumber: "RTV-CASHIER-DENIED", reasonCode: "damaged", reason: "Unauthorized", notes: null, evidenceMetadata: [], lines: [{ receiptLineIndex: 0, quantityScaled: 1, notes: null }] };
+    const denied = makeSupplyMutation({ domain: "supplier_returns", action: "return_create", operationId: "2166f6c5-ad53-4904-b1d0-f109d99a8cf8", idempotencyKey: "cashier-return-denied", payload: deniedPayload });
+    expect((await (await postCommands([denied])).json()).results[0].status).toBe("rejected");
+    expect(await db.select().from(supplierReturns)).toHaveLength(beforeReturns);
+    const wrongBranch = { ...managerCommand, operationId: "5ae83092-18a7-4d2c-a2f0-86013fa4ec07", branchGlobalId: "52716c4a-84d4-49c6-ab9d-e302f45f3d9b", idempotencyKey: "wrong-branch-po", payload: { ...managerPayload, purchaseOrderGlobalId: "c6453d4d-2a73-42d4-8d68-9b70ccbd9b5e", poNumber: "PO-WRONG-BRANCH" } };
+    wrongBranch.payloadHash = createHash("sha256").update(stableJson(wrongBranch.payload)).digest("hex");
+    expect((await (await postCommands([wrongBranch])).json()).results[0].status).toBe("rejected");
+    expect((await db.select().from(purchaseOrders))).toHaveLength(beforeOrders + 1);
+    expect(receipt?.lines).toHaveLength(1);
+    await db.update(staffAssignments).set({ role: "owner" }).where(and(eq(staffAssignments.user_id, "central-owner"), eq(staffAssignments.branch_id, centralBranchId)));
+  });
+
+  it("rejects procurement and receiving references owned by another branch without partial writes", async () => {
+    const branchBGlobal = "56c9e883-f280-42fa-8ddf-7740ec5b4601";
+    const supplierBGlobal = "f8a9a8a2-ccbe-482f-a653-fefcffaaeb17";
+    const ingredientBGlobal = "82418fac-0315-483f-8431-f3e96801e81f";
+    const locationBGlobal = "8a24c74f-c65e-4e21-8678-3fcd2a2e77c5";
+    const poBGlobal = "56c926e4-0e18-4502-9d9a-2c841671ebef";
+    const receiptBGlobal = "8a25ed0b-ab5d-4846-a7dc-60e762984b42";
+    const returnBGlobal = "489a4ce2-8012-40c8-9d8b-e1445f8d9b96";
+    const [branchB] = await db.insert(branches).values({ code: "SYNC-B", name_en: "Branch B", name_ar: "الفرع ب", currency: "EGP", timezone: "Africa/Cairo", is_active: true }).returning();
+    const [locationB] = await db.insert(inventoryLocations).values({ branch_id: branchB!.id, code: "STORE-B", name_en: "Store B", name_ar: "مخزن ب", is_active: true }).returning();
+    const [categoryB] = await db.insert(ingredientCategories).values({ branch_id: branchB!.id, code: "RAW-B", name_en: "Raw B", name_ar: "خام ب", is_active: true }).returning();
+    const [ingredientB] = await db.insert(ingredients).values({ branch_id: branchB!.id, category_id: categoryB!.id, sku: "BRANCH-B-ING", name_en: "Branch B ingredient", name_ar: "مكون الفرع ب", base_unit_id: 1, dimension: "mass", default_location_id: locationB!.id, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, allow_negative: false, average_unit_cost_micros: 0, created_by: "central-owner", updated_by: "central-owner" }).returning();
+    const [supplierB] = await db.insert(suppliers).values({ branch_id: branchB!.id, code: "BRANCH-B-SUP", name_en: "Branch B supplier", name_ar: "مورد الفرع ب", is_active: true, created_by: "central-owner", updated_by: "central-owner" }).returning();
+    await db.insert(ingredientPackageConversions).values({ ingredient_id: ingredientB!.id, code: "CASE-B", name_en: "Case B", name_ar: "عبوة ب", base_numerator: 12_000, base_denominator: 1, is_active: true });
+    const [poB] = await db.insert(purchaseOrders).values({ branch_id: branchB!.id, supplier_id: supplierB!.id, supplier_code_snapshot: supplierB!.code, supplier_name_en_snapshot: supplierB!.name_en, supplier_name_ar_snapshot: supplierB!.name_ar, po_number: "PO-BRANCH-B", status: "approved", receiving_status: "not_received", currency: "EGP", subtotal_amount: 10, total_amount: 10, idempotency_key: "cross-branch-po-b", created_by: "central-owner" }).returning();
+    const [poLineB] = await db.insert(purchaseOrderLines).values({ purchase_order_id: poB!.id, ingredient_id: ingredientB!.id, unit_id: 1, package_conversion_id: null, ingredient_sku: ingredientB!.sku, ingredient_name_en: ingredientB!.name_en, ingredient_name_ar: ingredientB!.name_ar, unit_code: "SYNC-G", quantity_input_scaled: 1_000, quantity_base: 1_000, conversion_numerator_snapshot: 1, conversion_denominator_snapshot: 1, unit_price_minor: 10, line_total_amount: 10 }).returning();
+    const [receiptB] = await db.insert(purchaseReceipts).values({ branch_id: branchB!.id, purchase_order_id: poB!.id, supplier_id: supplierB!.id, supplier_code_snapshot: supplierB!.code, supplier_name_en_snapshot: supplierB!.name_en, supplier_name_ar_snapshot: supplierB!.name_ar, po_number_snapshot: poB!.po_number, receipt_number: "GRN-BRANCH-B", location_id: locationB!.id, received_by: "central-owner", status: "posted", idempotency_key: "cross-branch-receipt-b", posted_at: new Date() }).returning();
+    const [receiptLineB] = await db.insert(purchaseReceiptLines).values({ receipt_id: receiptB!.id, purchase_order_line_id: poLineB!.id, ingredient_id: ingredientB!.id, ingredient_sku_snapshot: ingredientB!.sku, ingredient_name_en_snapshot: ingredientB!.name_en, ingredient_name_ar_snapshot: ingredientB!.name_ar, unit_id: 1, unit_code_snapshot: "SYNC-G", conversion_numerator_snapshot: 1, conversion_denominator_snapshot: 1, ordered_quantity_base_snapshot: 1_000, po_unit_price_minor_snapshot: 10, quantity_input_scaled: 1_000, accepted_quantity_base: 1_000, rejected_quantity_base: 0, damaged_quantity_base: 0, actual_unit_price_minor: 10, accepted_unit_cost_micros_snapshot: 10_000, balance_quantity_before: 0, balance_unit_cost_before: 0, ingredient_average_unit_cost_before: 0, line_total_amount: 10 }).returning();
+    const [returnB] = await db.insert(supplierReturns).values({ branch_id: branchB!.id, supplier_id: supplierB!.id, purchase_order_id: poB!.id, receipt_id: receiptB!.id, location_id: locationB!.id, return_number: "RTV-BRANCH-B", supplier_code_snapshot: supplierB!.code, supplier_name_en_snapshot: supplierB!.name_en, supplier_name_ar_snapshot: supplierB!.name_ar, po_number_snapshot: poB!.po_number, receipt_number_snapshot: receiptB!.receipt_number, reason_code: "damaged", status: "draft", idempotency_key: "cross-branch-return-b", expected_credit_amount: 10, created_by: "central-owner" }).returning();
+    await db.insert(supplierReturnLines).values({ supplier_return_id: returnB!.id, receipt_line_id: receiptLineB!.id, ingredient_id: ingredientB!.id, ingredient_sku_snapshot: ingredientB!.sku, ingredient_name_en_snapshot: ingredientB!.name_en, ingredient_name_ar_snapshot: ingredientB!.name_ar, dimension_snapshot: "mass", unit_id: 1, unit_code_snapshot: "SYNC-G", conversion_numerator_snapshot: 1, conversion_denominator_snapshot: 1, quantity_input_scaled: 100, quantity_base: 100, accepted_quantity_base_snapshot: 1_000, original_unit_cost_micros_snapshot: 10_000, expected_credit_amount: 1 });
+    await db.insert(syncGlobalEntities).values([
+      { organization_id: organizationId, branch_id: branchB!.id, entity_type: "branch", global_id: branchBGlobal, local_id: String(branchB!.id) },
+      { organization_id: organizationId, branch_id: branchB!.id, entity_type: "supplier", global_id: supplierBGlobal, local_id: String(supplierB!.id) },
+      { organization_id: organizationId, branch_id: branchB!.id, entity_type: "ingredient", global_id: ingredientBGlobal, local_id: String(ingredientB!.id) },
+      { organization_id: organizationId, branch_id: branchB!.id, entity_type: "inventory_location", global_id: locationBGlobal, local_id: String(locationB!.id) },
+      { organization_id: organizationId, branch_id: branchB!.id, entity_type: "purchase_order", global_id: poBGlobal, local_id: String(poB!.id) },
+      { organization_id: organizationId, branch_id: branchB!.id, entity_type: "purchase_receipt", global_id: receiptBGlobal, local_id: String(receiptB!.id) },
+      { organization_id: organizationId, branch_id: branchB!.id, entity_type: "supplier_return", global_id: returnBGlobal, local_id: String(returnB!.id) },
+    ]);
+    const initial = {
+      purchaseOrders: (await db.select().from(purchaseOrders)).length,
+      purchaseOrderLines: (await db.select().from(purchaseOrderLines)).length,
+      receipts: (await db.select().from(purchaseReceipts)).length,
+      receiptLines: (await db.select().from(purchaseReceiptLines)).length,
+      returns: (await db.select().from(supplierReturns)).length,
+      returnLines: (await db.select().from(supplierReturnLines)).length,
+      movements: (await db.select().from(stockMovements)).length,
+      changes: (await db.select().from(syncChangeLog)).length,
+      balances: await db.select().from(stockBalances),
+      ingredientCosts: await db.select({ id: ingredients.id, averageUnitCost: ingredients.average_unit_cost_micros }).from(ingredients),
+    };
+    const makeRejectedPo = (operationId: string, idempotencyKey: string, supplierId: string, ingredientId: string, number: string) => {
+      const base = makePurchaseOrderCommand({ action: "purchase_order_create", operationId, idempotencyKey });
+      const payload = { ...(base.payload as Record<string, unknown>), purchaseOrderGlobalId: crypto.randomUUID(), supplierGlobalId: supplierId, poNumber: number, lines: [{ ingredientGlobalId: ingredientId, unitGlobalId, packageConversionGlobalId: null, packageConversionCode: ingredientId === ingredientBGlobal ? "CASE-B" : null, quantityScaled: 1_000, unitPriceMinor: 10, notes: null }] };
+      return { ...base, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex") };
+    };
+    const commands = [
+      makeRejectedPo("b88a3578-6880-48e7-9fbb-6eab38999901", "cross-po-supplier", supplierBGlobal, ingredientGlobalId, "PO-CROSS-SUPPLIER"),
+      makeRejectedPo("b88a3578-6880-48e7-9fbb-6eab38999902", "cross-po-ingredient", supplierGlobalId, ingredientBGlobal, "PO-CROSS-INGREDIENT"),
+      makeSupplyMutation({ domain: "receiving", action: "receipt_create", operationId: "b88a3578-6880-48e7-9fbb-6eab38999903", idempotencyKey: "cross-receipt-po", payload: { receiptGlobalId: crypto.randomUUID(), purchaseOrderGlobalId: poBGlobal, locationGlobalId, receiptNumber: "GRN-CROSS-PO", supplierDeliveryNote: null, supplierInvoiceReference: null, receivedAt: new Date().toISOString(), notes: null, lines: [{ poLineIndex: 0, acceptedQuantityScaled: 1, rejectedQuantityScaled: 0, damagedQuantityScaled: 0, actualUnitPriceMinor: null, notes: null }] } }),
+      makeSupplyMutation({ domain: "receiving", action: "receipt_create", operationId: "b88a3578-6880-48e7-9fbb-6eab38999904", idempotencyKey: "cross-receipt-location", payload: { receiptGlobalId: crypto.randomUUID(), purchaseOrderGlobalId, locationGlobalId: locationBGlobal, receiptNumber: "GRN-CROSS-LOCATION", supplierDeliveryNote: null, supplierInvoiceReference: null, receivedAt: new Date().toISOString(), notes: null, lines: [{ poLineIndex: 0, acceptedQuantityScaled: 1, rejectedQuantityScaled: 0, damagedQuantityScaled: 0, actualUnitPriceMinor: null, notes: null }] } }),
+      makeSupplyMutation({ domain: "supplier_returns", action: "return_create", operationId: "b88a3578-6880-48e7-9fbb-6eab38999905", idempotencyKey: "cross-return-receipt", payload: { supplierReturnGlobalId: crypto.randomUUID(), receiptGlobalId: receiptBGlobal, returnNumber: "RTV-CROSS-RECEIPT", reasonCode: "damaged", reason: null, notes: null, evidenceMetadata: [], lines: [{ receiptLineIndex: 0, quantityScaled: 1, notes: null }] } }),
+      makeSupplyMutation({ domain: "procurement", action: "purchase_order_submit", operationId: "b88a3578-6880-48e7-9fbb-6eab38999906", idempotencyKey: "cross-po-lifecycle", baseRevision: 1, payload: { purchaseOrderGlobalId: poBGlobal, baseRevision: 1, expectedStatus: "draft" } }),
+      makeSupplyMutation({ domain: "receiving", action: "receipt_post", operationId: "b88a3578-6880-48e7-9fbb-6eab38999907", idempotencyKey: "cross-receipt-lifecycle", baseRevision: 1, payload: { receiptGlobalId: receiptBGlobal, baseRevision: 1, approveVariance: false, varianceReason: null, overreceive: false, overreceiveReason: null } }),
+      makeSupplyMutation({ domain: "supplier_returns", action: "return_submit", operationId: "b88a3578-6880-48e7-9fbb-6eab38999908", idempotencyKey: "cross-return-lifecycle", baseRevision: 1, payload: { supplierReturnGlobalId: returnBGlobal, baseRevision: 1, reason: null, idempotencyKey: "cross-return-submit-history" } }),
+      makeSupplyMutation({ domain: "supplier_returns", action: "return_dispatch", operationId: "b88a3578-6880-48e7-9fbb-6eab38999909", idempotencyKey: "cross-return-dispatch", baseRevision: 1, payload: { supplierReturnGlobalId: returnBGlobal, baseRevision: 1, reason: "Must remain branch scoped", idempotencyKey: "cross-return-dispatch-history" } }),
+    ];
+    for (const command of commands) {
+      const first = (await (await postCommands([command])).json()).results[0];
+      expect(first.status).toBe("rejected");
+      const retry = (await (await postCommands([command])).json()).results[0];
+      expect(retry.status).toBe("rejected");
+      expect(retry.operationId).toBe(command.operationId);
+    }
+    expect({
+      purchaseOrders: (await db.select().from(purchaseOrders)).length,
+      purchaseOrderLines: (await db.select().from(purchaseOrderLines)).length,
+      receipts: (await db.select().from(purchaseReceipts)).length,
+      receiptLines: (await db.select().from(purchaseReceiptLines)).length,
+      returns: (await db.select().from(supplierReturns)).length,
+      returnLines: (await db.select().from(supplierReturnLines)).length,
+      movements: (await db.select().from(stockMovements)).length,
+      changes: (await db.select().from(syncChangeLog)).length,
+      balances: await db.select().from(stockBalances),
+      ingredientCosts: await db.select({ id: ingredients.id, averageUnitCost: ingredients.average_unit_cost_micros }).from(ingredients),
+    }).toEqual(initial);
+    expect((await db.select().from(purchaseReceipts).where(eq(purchaseReceipts.id, receiptB!.id))).length).toBe(1);
+    expect((await db.select().from(supplierReturns).where(eq(supplierReturns.id, returnB!.id))).length).toBe(1);
   });
 
   it("creates a branch-scoped ingredient exactly once with thresholds and no stock movement", async () => {

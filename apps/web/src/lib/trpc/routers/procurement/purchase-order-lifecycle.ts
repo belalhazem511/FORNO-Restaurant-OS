@@ -1,10 +1,16 @@
 import { TRPCError } from "@trpc/server";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { auditLogs, purchaseOrderLines, purchaseOrders } from "@/lib/db/schema";
+import { auditLogs, purchaseOrderLines, purchaseOrders, syncDevices } from "@/lib/db/schema";
+import { ensureLocalGlobalMapping, executeLocalCommand } from "@/lib/sync/local-command";
 
 export async function submitPurchaseOrder(input: { branchId: number; purchaseOrderId: number }, actorId: string) {
   return db.transaction(async (tx) => {
+    const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+    const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+    if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Purchase orders must use the paired device branch" });
+    const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_order", localId: input.purchaseOrderId }) : undefined;
+    return executeLocalCommand<typeof purchaseOrders.$inferSelect>(tx, { actorId, domain: "procurement", action: "purchase_order_submit", entityType: "purchase_order", localId: (row) => String(row.id), payload: (purchaseOrderGlobalId, row) => ({ purchaseOrderGlobalId, baseRevision: mapping?.server_revision ?? 0, expectedStatus: row.status }) }, async (tx) => {
     const [order] = await tx.select().from(purchaseOrders).where(and(
       eq(purchaseOrders.id, input.purchaseOrderId),
       eq(purchaseOrders.branch_id, input.branchId),
@@ -16,11 +22,17 @@ export async function submitPurchaseOrder(input: { branchId: number; purchaseOrd
     const [updated] = await tx.update(purchaseOrders).set({ status: "submitted", submitted_by: actorId, updated_at: new Date() }).where(eq(purchaseOrders.id, order.id)).returning();
     await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: actorId, action: "purchase_order.submit", entity_type: "purchase_order", entity_id: String(order.id) });
     return updated;
+    });
   });
 }
 
 export async function approvePurchaseOrder(input: { branchId: number; purchaseOrderId: number }, actorId: string) {
   return db.transaction(async (tx) => {
+    const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+    const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+    if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Purchase orders must use the paired device branch" });
+    const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_order", localId: input.purchaseOrderId }) : undefined;
+    return executeLocalCommand<typeof purchaseOrders.$inferSelect>(tx, { actorId, domain: "procurement", action: "purchase_order_approve", entityType: "purchase_order", localId: (row) => String(row.id), payload: (purchaseOrderGlobalId, row) => ({ purchaseOrderGlobalId, baseRevision: mapping?.server_revision ?? 0, expectedStatus: row.status }) }, async (tx) => {
     const [order] = await tx.select().from(purchaseOrders).where(and(
       eq(purchaseOrders.id, input.purchaseOrderId),
       eq(purchaseOrders.branch_id, input.branchId),
@@ -30,11 +42,17 @@ export async function approvePurchaseOrder(input: { branchId: number; purchaseOr
     const [updated] = await tx.update(purchaseOrders).set({ status: "approved", approved_by: actorId, updated_at: new Date() }).where(eq(purchaseOrders.id, order.id)).returning();
     await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: actorId, approver_user_id: actorId, action: "purchase_order.approve", entity_type: "purchase_order", entity_id: String(order.id) });
     return updated;
+    });
   });
 }
 
 export async function cancelPurchaseOrder(input: { branchId: number; purchaseOrderId: number; reason: string }, actorId: string) {
   return db.transaction(async (tx) => {
+    const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+    const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+    if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Purchase orders must use the paired device branch" });
+    const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_order", localId: input.purchaseOrderId }) : undefined;
+    return executeLocalCommand<typeof purchaseOrders.$inferSelect>(tx, { actorId, domain: "procurement", action: "purchase_order_cancel", entityType: "purchase_order", localId: (row) => String(row.id), payload: (purchaseOrderGlobalId, row) => ({ purchaseOrderGlobalId, baseRevision: mapping?.server_revision ?? 0, reason: input.reason, expectedStatus: row.status }) }, async (tx) => {
     const [order] = await tx.select().from(purchaseOrders).where(and(
       eq(purchaseOrders.id, input.purchaseOrderId),
       eq(purchaseOrders.branch_id, input.branchId),
@@ -44,5 +62,6 @@ export async function cancelPurchaseOrder(input: { branchId: number; purchaseOrd
     const [updated] = await tx.update(purchaseOrders).set({ status: "cancelled", cancelled_by: actorId, cancellation_reason: input.reason, updated_at: new Date() }).where(eq(purchaseOrders.id, order.id)).returning();
     await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: actorId, action: "purchase_order.cancel", entity_type: "purchase_order", entity_id: String(order.id), reason: input.reason });
     return updated;
+    });
   });
 }

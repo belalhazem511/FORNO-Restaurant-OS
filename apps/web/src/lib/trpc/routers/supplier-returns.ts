@@ -1,4 +1,5 @@
 import { TRPCError } from "@trpc/server";
+import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/lib/db";
@@ -7,10 +8,12 @@ import {
   purchaseReceiptLines, purchaseReceipts, stockBalances, stockMovements, staffAssignments,
   supplierReturnLines, supplierReturnReversals, supplierReturnStatusHistory, supplierReturns,
   suppliers, unitsOfMeasure,
+  syncDevices,
 } from "@/lib/db/schema";
 import { costMinorForQuantity, convertScaledQuantity, movingWeightedAverage } from "@/lib/inventory/exact";
 import { hasPermission, requireStaff, type Permission } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
+import { ensureLocalGlobalMapping, executeLocalCommand } from "@/lib/sync/local-command";
 
 const branchInput = z.object({ branchId: z.number().int().positive() });
 const MAX_INT = 2_147_483_647;
@@ -41,6 +44,25 @@ async function authorize(userId: string, branchId: number, permission: Permissio
 
 async function audit(tx: DbTransaction, branchId: number, actorId: string, action: string, returnId: number, reason?: string, details?: unknown) {
   await tx.insert(auditLogs).values({ branch_id: branchId, actor_user_id: actorId, action, entity_type: "supplier_return", entity_id: String(returnId), reason: reason ?? null, details: details == null ? null : JSON.stringify(details) });
+}
+
+async function queueReturnCommand(
+  tx: DbTransaction,
+  input: { branchId: number; userId: string; returnId: number; action: string; idempotencyKey: string; payload: (globalId: string, baseRevision: number) => Record<string, unknown> },
+) {
+  const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+  if (process.env.FORNO_DESKTOP_MODE !== "1" || !deviceId) return;
+  const device = await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) });
+  if (!device) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "The local synchronization identity is unavailable" });
+  if (device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Supplier returns must use the paired device branch" });
+  const row = await tx.query.supplierReturns.findFirst({ where: and(eq(supplierReturns.id, input.returnId), eq(supplierReturns.branch_id, input.branchId)) });
+  if (!row) throw new TRPCError({ code: "NOT_FOUND", message: "Supplier return not found in this branch" });
+  const receipt = await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_receipt", localId: row.receipt_id });
+  const returnMapping = await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "supplier_return", localId: input.returnId });
+  await executeLocalCommand(tx, {
+    actorId: input.userId, domain: "supplier_returns", action: input.action, entityType: "supplier_return", localId: () => String(input.returnId), idempotencyKey: input.idempotencyKey,
+    dependsOnGlobalIds: () => [receipt.global_id], payload: (globalId) => input.payload(globalId, returnMapping.server_revision),
+  }, async () => input.returnId);
 }
 
 async function addHistory(tx: DbTransaction, input: { row: typeof supplierReturns.$inferSelect; from: string | null; to: typeof supplierReturns.$inferSelect.status; actorId: string; key: string; reason?: string | null }) {
@@ -180,8 +202,19 @@ export const supplierReturnsRouter = router({
       return returnBundle(existing.id, input.branchId, true);
     }
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Supplier returns must use the paired device branch" });
+      const receiptMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_receipt", localId: input.receiptId }) : undefined;
+      let commandLines: Array<{ receiptLineIndex: number; quantityScaled: number; notes: string | null }> = [];
+      return executeLocalCommand<typeof supplierReturns.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "supplier_returns", action: "return_create", entityType: "supplier_return", localId: (row) => String(row.id), idempotencyKey: input.idempotencyKey,
+        dependsOnGlobalIds: () => [receiptMapping?.global_id].filter((id): id is string => Boolean(id)),
+        payload: (supplierReturnGlobalId) => ({ supplierReturnGlobalId, receiptGlobalId: receiptMapping?.global_id, returnNumber: input.returnNumber, reasonCode: input.reasonCode, reason: input.reason ?? null, notes: input.notes ?? null, evidenceMetadata: input.evidenceMetadata ?? [], lines: commandLines }),
+      }, async (tx) => {
       const source = await tx.query.purchaseReceipts.findFirst({ where: and(eq(purchaseReceipts.id, input.receiptId), eq(purchaseReceipts.branch_id, input.branchId)), with: { lines: true, supplier: true, purchaseOrder: true } });
       if (!source || source.status !== "posted") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Returns require a posted, unreversed receipt in this branch" });
+      const sourceLineIndex = new Map(source.lines.map((line, index) => [line.id, index]));
       const sourceLines = new Map(source.lines.map((line) => [line.id, line]));
       const seen = new Set<number>();
       let credit = 0;
@@ -199,6 +232,7 @@ export const supplierReturnsRouter = router({
         credit = safeAdd(credit, expectedCredit, "Expected supplier credit", MAX_INT);
         prepared.push({ sourceLine, ingredient, input: line, quantityBase, expectedCredit });
       }
+      commandLines = prepared.map((line) => ({ receiptLineIndex: sourceLineIndex.get(line.sourceLine.id)!, quantityScaled: line.input.quantityScaled, notes: line.input.notes ?? null }));
       const [created] = await tx.insert(supplierReturns).values({
         branch_id: input.branchId, supplier_id: source.supplier_id, purchase_order_id: source.purchase_order_id,
         receipt_id: source.id, location_id: source.location_id, return_number: input.returnNumber,
@@ -227,6 +261,7 @@ export const supplierReturnsRouter = router({
       await addHistory(tx, { row: created, from: null, to: "draft", actorId: ctx.user.id, key: `${input.idempotencyKey}:created` });
       await audit(tx, input.branchId, ctx.user.id, "supplier_return.create", created.id, undefined, { receiptId: source.id, lineCount: prepared.length, lines: prepared.map(({ sourceLine, quantityBase, expectedCredit }) => ({ receiptLineId: sourceLine.id, quantityBase, expectedCreditMinor: expectedCredit })) });
       return created;
+      });
     });
   }),
 
@@ -236,7 +271,7 @@ export const supplierReturnsRouter = router({
       const [row] = await tx.select().from(supplierReturns).where(and(eq(supplierReturns.id, input.returnId), eq(supplierReturns.branch_id, input.branchId))).for("update");
       if (!row) throw new TRPCError({ code: "NOT_FOUND", message: "Supplier return not found in this branch" });
       if (row.status !== "draft") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Only Draft returns can be edited; submitted lines are immutable" });
-      const oldLines = await tx.query.supplierReturnLines.findMany({ where: eq(supplierReturnLines.supplier_return_id, row.id) });
+      const oldLines = await tx.query.supplierReturnLines.findMany({ where: eq(supplierReturnLines.supplier_return_id, row.id), orderBy: [asc(supplierReturnLines.receipt_line_id)] });
       const byReceipt = new Map(oldLines.map((line) => [line.receipt_line_id, line]));
       const seen = new Set<number>();
       const editedLineDetails: Array<{ receiptLineId: number; quantityBase: number; expectedCreditMinor: number }> = [];
@@ -261,6 +296,8 @@ export const supplierReturnsRouter = router({
       if (reasonCode === "other" && !reason?.trim()) throw new TRPCError({ code: "BAD_REQUEST", message: "Describe the return reason" });
       await tx.update(supplierReturns).set({ reason_code: reasonCode, reason, notes: input.notes === undefined ? row.notes : input.notes, evidence_metadata: input.evidenceMetadata ? JSON.stringify(input.evidenceMetadata) : row.evidence_metadata, expected_credit_amount: credit, updated_at: new Date() }).where(eq(supplierReturns.id, row.id));
       await audit(tx, input.branchId, ctx.user.id, "supplier_return.draft_update", row.id, reason ?? undefined, { lineCount: seen.size, lines: editedLineDetails });
+      const receiptLineIndex = new Map(oldLines.map((line, index) => [line.receipt_line_id, index]));
+      await queueReturnCommand(tx, { branchId: input.branchId, userId: ctx.user.id, returnId: row.id, action: "return_edit", idempotencyKey: randomUUID(), payload: (globalId, baseRevision) => ({ supplierReturnGlobalId: globalId, baseRevision, reasonCode, reason, notes: input.notes === undefined ? row.notes : input.notes, evidenceMetadata: input.evidenceMetadata ?? null, quantities: input.lines.map((line) => ({ lineIndex: receiptLineIndex.get(line.receiptLineId)!, quantityScaled: line.quantityScaled, notes: line.notes ?? null })) }) });
       return row.id;
     }).then((id) => returnBundle(id, input.branchId, true));
   }),
@@ -340,6 +377,8 @@ async function transition(input: { userId: string; branchId: number; returnId: n
     const [updated] = await tx.update(supplierReturns).set({ ...patch, updated_at: now }).where(eq(supplierReturns.id, row.id)).returning();
     await addHistory(tx, { row, from: row.status, to: updated.status, actorId: input.userId, key: input.key, reason: input.reason });
     await audit(tx, input.branchId, input.userId, `supplier_return.${updated.status}`, row.id, input.reason);
+    const action = input.to === "submitted" ? "return_submit" : input.to === "approved" ? "return_approve" : "return_cancel";
+    await queueReturnCommand(tx, { branchId: input.branchId, userId: input.userId, returnId: row.id, action, idempotencyKey: input.key, payload: (globalId, baseRevision) => ({ supplierReturnGlobalId: globalId, baseRevision, reason: input.reason ?? null, idempotencyKey: input.key }) });
     return updated;
   });
 }
@@ -414,6 +453,7 @@ async function dispatchReturn(input: { branchId: number; returnId: number; userI
     const [updated] = await tx.update(supplierReturns).set({ status: "dispatched", dispatched_by: input.userId, dispatched_at: now, valuation_amount: valuationTotal, cost_variance_amount: variance, updated_at: now }).where(eq(supplierReturns.id, row.id)).returning();
     await addHistory(tx, { row, from: "approved", to: "dispatched", actorId: input.userId, key: input.key, reason: input.reason });
     await audit(tx, input.branchId, input.userId, "supplier_return.dispatch", row.id, input.reason ?? row.reason ?? undefined, { expectedCreditMinor: row.expected_credit_amount, valuationMinor: valuationTotal, varianceMinor: variance, lineCount: lines.length, lines: dispatchAuditLines });
+    await queueReturnCommand(tx, { branchId: input.branchId, userId: input.userId, returnId: row.id, action: "return_dispatch", idempotencyKey: input.key, payload: (globalId, baseRevision) => ({ supplierReturnGlobalId: globalId, baseRevision, reason: input.reason ?? null, idempotencyKey: input.key }) });
     return updated;
   });
 }
@@ -463,6 +503,7 @@ async function reverseDispatch(input: { branchId: number; returnId: number; user
     const [updated] = await tx.update(supplierReturns).set({ status: finalStatus, reversed_by: safe ? input.userId : null, reversed_at: safe ? now : null, needs_review_reason: safe ? null : "Reversal requires manual review: dispatch snapshot or destination balance is invalid", updated_at: now }).where(eq(supplierReturns.id, row.id)).returning();
     await addHistory(tx, { row, from: row.status, to: finalStatus, actorId: input.userId, key: `${input.key}:history`, reason: input.reason });
     await audit(tx, input.branchId, input.userId, safe ? "supplier_return.reverse_dispatch" : "supplier_return.needs_review", row.id, input.reason, { reversalId: reversal.id, stockRestored: safe, lines: safe ? lines.map((line) => ({ supplierReturnLineId: line.id, receiptLineId: line.receipt_line_id, quantityBase: line.quantity_base, dispatchUnitCostMicros: line.dispatch_unit_cost_micros_snapshot, dispatchValuationMinor: line.dispatch_valuation_amount })) : [] });
+    await queueReturnCommand(tx, { branchId: input.branchId, userId: input.userId, returnId: row.id, action: "return_reverse", idempotencyKey: input.key, payload: (globalId, baseRevision) => ({ supplierReturnGlobalId: globalId, baseRevision, reason: input.reason, idempotencyKey: input.key }) });
     return reversal;
   });
 }

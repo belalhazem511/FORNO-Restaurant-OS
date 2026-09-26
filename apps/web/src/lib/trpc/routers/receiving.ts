@@ -16,11 +16,13 @@ import {
   stockMovements,
   staffAssignments,
   suppliers,
+  syncDevices,
   unitsOfMeasure,
 } from "@/lib/db/schema";
 import { costMinorForQuantity, convertScaledQuantity, movingWeightedAverage, multiplyDivide, multiplyDivideFactors } from "@/lib/inventory/exact";
 import { hasPermission, requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
+import { ensureLocalGlobalMapping, executeLocalCommand } from "@/lib/sync/local-command";
 
 const branchInput = z.object({ branchId: z.number().int().positive() });
 const lineInput = z.object({
@@ -32,6 +34,7 @@ const lineInput = z.object({
   notes: z.string().trim().max(500).nullable().optional(),
 }).refine((line) => line.acceptedQuantityScaled + line.rejectedQuantityScaled + line.damagedQuantityScaled > 0, "Enter a received quantity");
 const MAX_POSTGRES_INTEGER = 2_147_483_647;
+type PurchaseReceiptWithLines = typeof purchaseReceipts.$inferSelect & { lines: (typeof purchaseReceiptLines.$inferSelect)[] };
 
 function safeAdd(left: number, right: number, label: string) {
   const result = left + right;
@@ -138,7 +141,18 @@ export const receivingRouter = router({
       if (acceptedPrice > MAX_POSTGRES_INTEGER) throw new TRPCError({ code: "BAD_REQUEST", message: "Receipt total exceeds supported EGP range" });
       resolved.push({ poLine, input: line, numerator, denominator, quantityInputScaled, accepted, rejected, damaged, actualPrice, unitCostMicros, acceptedPrice });
     }
+    const poLineIndex = new Map(order.lines.map((line, index) => [line.id, index]));
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Receiving must use the paired device branch" });
+      const poMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_order", localId: order.id }) : undefined;
+      const locationMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "inventory_location", localId: location.id }) : undefined;
+      return executeLocalCommand<PurchaseReceiptWithLines>(tx, {
+        actorId: ctx.user.id, domain: "receiving", action: "receipt_create", entityType: "purchase_receipt", localId: (row) => String(row.id), idempotencyKey: input.idempotencyKey,
+        dependsOnGlobalIds: () => [poMapping?.global_id, locationMapping?.global_id].filter((id): id is string => Boolean(id)),
+        payload: (receiptGlobalId, row) => ({ receiptGlobalId, purchaseOrderGlobalId: poMapping?.global_id, locationGlobalId: locationMapping?.global_id, receiptNumber: input.receiptNumber, supplierDeliveryNote: input.supplierDeliveryNote ?? null, supplierInvoiceReference: input.supplierInvoiceReference ?? null, receivedAt: input.receivedAt ?? new Date().toISOString(), notes: input.notes ?? null, lines: resolved.map((line) => ({ poLineIndex: poLineIndex.get(line.poLine.id), acceptedQuantityScaled: line.input.acceptedQuantityScaled, rejectedQuantityScaled: line.input.rejectedQuantityScaled, damagedQuantityScaled: line.input.damagedQuantityScaled, actualUnitPriceMinor: line.actualPrice, notes: line.input.notes ?? null })) }),
+      }, async (tx) => {
       const [lockedOrder] = await tx.select().from(purchaseOrders).where(and(eq(purchaseOrders.id, order.id), eq(purchaseOrders.branch_id, input.branchId))).for("update");
       if (!lockedOrder || lockedOrder.status !== "approved") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Only approved purchase orders can be received" });
       const [receipt] = await tx.insert(purchaseReceipts).values({
@@ -190,6 +204,7 @@ export const receivingRouter = router({
       })));
       await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "purchase_receipt.create", entity_type: "purchase_receipt", entity_id: String(receipt.id), details: JSON.stringify({ receiptNumber: receipt.receipt_number, purchaseOrderId: order.id, lineCount: resolved.length }) });
       return { ...receipt, lines: await tx.query.purchaseReceiptLines.findMany({ where: eq(purchaseReceiptLines.receipt_id, receipt.id) }) };
+      });
     });
   }),
 
@@ -202,9 +217,20 @@ export const receivingRouter = router({
   })).mutation(async ({ ctx, input }) => {
     await requireStaff(ctx.user.id, input.branchId, "purchase-receipt:create");
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Receipt edits must use the paired device branch" });
+      const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_receipt", localId: input.receiptId }) : undefined;
+      const poLinePositions = new Map<number, number>();
+      return executeLocalCommand<typeof purchaseReceipts.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "receiving", action: "receipt_edit", entityType: "purchase_receipt", localId: (row) => String(row.id),
+        payload: (receiptGlobalId) => ({ receiptGlobalId, baseRevision: mapping?.server_revision ?? 0, supplierDeliveryNote: input.supplierDeliveryNote ?? null, supplierInvoiceReference: input.supplierInvoiceReference ?? null, notes: input.notes ?? null, lines: input.lines.map((line) => ({ poLineIndex: poLinePositions.get(line.purchaseOrderLineId), acceptedQuantityScaled: line.acceptedQuantityScaled, rejectedQuantityScaled: line.rejectedQuantityScaled, damagedQuantityScaled: line.damagedQuantityScaled, actualUnitPriceMinor: line.actualUnitPriceMinor ?? null, notes: line.notes ?? null })) }),
+      }, async (tx) => {
       const [receipt] = await tx.select().from(purchaseReceipts).where(and(eq(purchaseReceipts.id, input.receiptId), eq(purchaseReceipts.branch_id, input.branchId))).for("update");
       if (!receipt) throw new TRPCError({ code: "NOT_FOUND", message: "Receipt not found in this branch" });
       if (receipt.status !== "draft") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Only draft receipts can be edited" });
+      const poLines = await tx.query.purchaseOrderLines.findMany({ where: eq(purchaseOrderLines.purchase_order_id, receipt.purchase_order_id), orderBy: [asc(purchaseOrderLines.id)] });
+      poLines.forEach((line, index) => poLinePositions.set(line.id, index));
       // Draft line identity and conversion snapshots are immutable to clients; edit amounts against the saved snapshots.
       const oldLines = await tx.query.purchaseReceiptLines.findMany({ where: eq(purchaseReceiptLines.receipt_id, receipt.id) });
       const oldByPoLine = new Map(oldLines.map((line) => [line.purchase_order_line_id, line]));
@@ -228,6 +254,7 @@ export const receivingRouter = router({
       const [updated] = await tx.update(purchaseReceipts).set({ supplier_delivery_note: input.supplierDeliveryNote ?? null, supplier_invoice_reference: input.supplierInvoiceReference ?? null, notes: input.notes ?? null, updated_at: new Date() }).where(eq(purchaseReceipts.id, receipt.id)).returning();
       await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, action: "purchase_receipt.draft_update", entity_type: "purchase_receipt", entity_id: String(receipt.id) });
       return updated;
+      });
     });
   }),
 
@@ -239,6 +266,14 @@ export const receivingRouter = router({
       if (!input.overreceiveReason) throw new TRPCError({ code: "BAD_REQUEST", message: "An over-receiving reason is required" });
     }
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Receiving must use the paired device branch" });
+      const mapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_receipt", localId: input.receiptId }) : undefined;
+      return executeLocalCommand<PurchaseReceiptWithLines>(tx, {
+        actorId: ctx.user.id, domain: "receiving", action: "receipt_post", entityType: "purchase_receipt", localId: (row) => String(row.id), idempotencyKey: `receipt-post:${input.receiptId}`,
+        payload: (receiptGlobalId) => ({ receiptGlobalId, baseRevision: mapping?.server_revision ?? 0, approveVariance: input.approveVariance, varianceReason: input.varianceReason ?? null, overreceive: input.overreceive, overreceiveReason: input.overreceiveReason ?? null }),
+      }, async (tx) => {
       const [receipt] = await tx.select().from(purchaseReceipts).where(and(eq(purchaseReceipts.id, input.receiptId), eq(purchaseReceipts.branch_id, input.branchId))).for("update");
       if (!receipt) throw new TRPCError({ code: "NOT_FOUND", message: "Receipt not found in this branch" });
       if (receipt.status === "posted") return { ...receipt, lines: await tx.query.purchaseReceiptLines.findMany({ where: eq(purchaseReceiptLines.receipt_id, receipt.id) }) };
@@ -308,12 +343,22 @@ export const receivingRouter = router({
       if (lines.some((line) => line.actual_unit_price_minor !== line.po_unit_price_minor_snapshot)) await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, approver_user_id: hasSignificantVariance ? ctx.user.id : null, action: "purchase_receipt.price_variance", entity_type: "purchase_receipt", entity_id: String(receipt.id), reason: input.varianceReason ?? null, details: JSON.stringify(lines.filter((line) => line.actual_unit_price_minor !== line.po_unit_price_minor_snapshot).map((line) => ({ lineId: line.id, poPriceMinor: line.po_unit_price_minor_snapshot, actualPriceMinor: line.actual_unit_price_minor }))) });
       if (hasOverreceive) await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, approver_user_id: ctx.user.id, action: "purchase_receipt.overreceive", entity_type: "purchase_receipt", entity_id: String(receipt.id), reason: input.overreceiveReason });
       return { ...updated, lines };
+      });
     });
   }),
 
   reverse: protectedProcedure.input(branchInput.extend({ receiptId: z.number().int().positive(), reason: z.string().trim().min(3).max(500), idempotencyKey: z.string().trim().min(8).max(140) })).mutation(async ({ ctx, input }) => {
     await requireStaff(ctx.user.id, input.branchId, "purchase-receipt:reverse");
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Receipt reversal must use the paired device branch" });
+      const receiptMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_receipt", localId: input.receiptId }) : undefined;
+      return executeLocalCommand<typeof purchaseReceiptReversals.$inferSelect>(tx, {
+        actorId: ctx.user.id, domain: "receiving", action: "receipt_reverse", entityType: "purchase_receipt_reversal", localId: (row) => String(row.id), idempotencyKey: input.idempotencyKey,
+        dependsOnGlobalIds: () => [receiptMapping?.global_id].filter((id): id is string => Boolean(id)),
+        payload: (reversalGlobalId) => ({ reversalGlobalId, receiptGlobalId: receiptMapping?.global_id, baseRevision: receiptMapping?.server_revision ?? 0, reason: input.reason, idempotencyKey: input.idempotencyKey }),
+      }, async (tx) => {
       const duplicate = await tx.query.purchaseReceiptReversals.findFirst({ where: eq(purchaseReceiptReversals.idempotency_key, input.idempotencyKey) });
       if (duplicate) {
         if (duplicate.branch_id !== input.branchId) throw new TRPCError({ code: "CONFLICT", message: "Idempotency key is already used" });
@@ -366,6 +411,7 @@ export const receivingRouter = router({
       await tx.update(purchaseOrders).set({ receiving_status: full ? "fully_received" : any ? "partially_received" : "not_received", updated_at: new Date() }).where(eq(purchaseOrders.id, receipt.purchase_order_id));
       await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, approver_user_id: ctx.user.id, action: safe ? "purchase_receipt.reverse" : "purchase_receipt.needs_review", entity_type: "purchase_receipt", entity_id: String(receipt.id), reason: input.reason, details: JSON.stringify({ reversalId: reversal.id, status, reviewReason: safe ? null : reviewReason }) });
       return reversal;
+      });
     });
   }),
 });

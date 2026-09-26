@@ -303,6 +303,20 @@ export const procurementRouter = router({
       const resolved = await resolveLines(input.branchId, input.lines);
       const subtotal = purchaseOrderTotal(resolved);
       return db.transaction(async (tx) => {
+        const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+        const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+        if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Purchase orders must use the paired device branch" });
+        const supplierMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "supplier", localId: supplier.id }) : undefined;
+        const referenceMappings = device ? await Promise.all(resolved.flatMap((line) => [
+          ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient", localId: line.ingredient.id }),
+          ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "unit_of_measure", localId: line.unit.id }),
+          ...(line.packageConversion ? [ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient_package_conversion", localId: line.packageConversion.id })] : []),
+        ])) : [];
+        return executeLocalCommand<typeof purchaseOrders.$inferSelect>(tx, {
+          actorId: ctx.user.id, domain: "procurement", action: "purchase_order_create", entityType: "purchase_order", localId: (row) => String(row.id), idempotencyKey: input.idempotencyKey,
+          dependsOnGlobalIds: () => [supplierMapping?.global_id, ...referenceMappings.map((mapping) => mapping.global_id)].filter((id): id is string => Boolean(id)),
+          payload: (purchaseOrderGlobalId) => ({ purchaseOrderGlobalId, supplierGlobalId: supplierMapping?.global_id, poNumber: input.poNumber, expectedDate: input.expectedDate ?? null, notes: input.notes ?? null, supplierSnapshot: { code: supplier.code, nameEn: supplier.name_en, nameAr: supplier.name_ar }, lines: resolved.map((line) => ({ ingredientGlobalId: referenceMappings.find((mapping) => mapping.entity_type === "ingredient" && mapping.local_id === String(line.ingredient.id))?.global_id, unitGlobalId: referenceMappings.find((mapping) => mapping.entity_type === "unit_of_measure" && mapping.local_id === String(line.unit.id))?.global_id, packageConversionGlobalId: line.packageConversion ? referenceMappings.find((mapping) => mapping.entity_type === "ingredient_package_conversion" && mapping.local_id === String(line.packageConversion!.id))?.global_id ?? null : null, packageConversionCode: line.packageConversion?.code ?? null, quantityScaled: line.quantityScaled, unitPriceMinor: line.unitPriceMinor, notes: line.notes ?? null })) }),
+        }, async (tx) => {
         const [order] = await tx
           .insert(purchaseOrders)
           .values({
@@ -356,6 +370,7 @@ export const procurementRouter = router({
           }),
         });
         return order;
+        });
       });
     }),
 
@@ -378,6 +393,20 @@ export const procurementRouter = router({
           eq(purchaseOrders.status, "draft"),
         )).for("update");
         if (!lockedDraft) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Only draft purchase orders can be edited" });
+        const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+        const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1" ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }) : undefined;
+        if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Purchase orders must use the paired device branch" });
+        const orderMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "purchase_order", localId: order.id }) : undefined;
+        const referenceMappings = device ? await Promise.all(resolved.flatMap((line) => [
+          ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient", localId: line.ingredient.id }),
+          ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "unit_of_measure", localId: line.unit.id }),
+          ...(line.packageConversion ? [ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient_package_conversion", localId: line.packageConversion.id })] : []),
+        ])) : [];
+        return executeLocalCommand<typeof purchaseOrders.$inferSelect>(tx, {
+          actorId: ctx.user.id, domain: "procurement", action: "purchase_order_lines_update", entityType: "purchase_order", localId: (row) => String(row.id),
+          dependsOnGlobalIds: () => referenceMappings.map((mapping) => mapping.global_id),
+          payload: (purchaseOrderGlobalId, row) => ({ purchaseOrderGlobalId, baseRevision: orderMapping?.server_revision ?? 0, poNumber: row.po_number, lines: resolved.map((line) => ({ ingredientGlobalId: referenceMappings.find((mapping) => mapping.entity_type === "ingredient" && mapping.local_id === String(line.ingredient.id))?.global_id, unitGlobalId: referenceMappings.find((mapping) => mapping.entity_type === "unit_of_measure" && mapping.local_id === String(line.unit.id))?.global_id, packageConversionGlobalId: line.packageConversion ? referenceMappings.find((mapping) => mapping.entity_type === "ingredient_package_conversion" && mapping.local_id === String(line.packageConversion!.id))?.global_id ?? null : null, packageConversionCode: line.packageConversion?.code ?? null, quantityScaled: line.quantityScaled, unitPriceMinor: line.unitPriceMinor, notes: line.notes ?? null })) }),
+        }, async (tx) => {
         await tx.delete(purchaseOrderLines).where(eq(purchaseOrderLines.purchase_order_id, order.id));
         await tx.insert(purchaseOrderLines).values(
           resolved.map((line) => ({
@@ -419,6 +448,7 @@ export const procurementRouter = router({
           }),
         });
         return updated;
+        });
       });
     }),
 
