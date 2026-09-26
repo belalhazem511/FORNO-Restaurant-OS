@@ -1,9 +1,10 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { and, eq, or } from "drizzle-orm";
+import { and, eq, or, sql } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
-import { auditLogs, cashierShifts, customers, orderCancellations, orderCheckouts, orderItemModifiers, orderItems, orderPayments, orderStatusHistory, orders, paymentMethods, printJobs, products, registerPrintPreferences, restaurantTables, shiftCashMovements, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox, transactions } from "@/lib/db/schema";
+import { auditLogs, cashierShifts, customers, ingredients, inventoryLocations, orderCancellations, orderCheckouts, orderItemModifiers, orderItems, orderPayments, orderStatusHistory, orders, paymentMethods, printJobs, products, registerPrintPreferences, restaurantTables, shiftCashMovements, stockBalances, stockMovements, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOutbox, transactions } from "@/lib/db/schema";
+import { movingWeightedAverage } from "@/lib/inventory/exact";
 
 export const runtime = "nodejs";
 const customerSnapshot = z.object({ name: z.string(), email: z.string().email(), phone: z.string().nullable(), status: z.string().nullable() });
@@ -17,6 +18,7 @@ const printJobSnapshot = z.object({ orderGlobalId: z.string().uuid(), stationGlo
 const printPreferencesSnapshot = z.object({ registerGlobalId: z.string().uuid(), updatedByGlobalId: z.string().uuid(), paperWidth: z.union([z.literal(58), z.literal(80)]), language: z.enum(["ar", "en", "bilingual"]), receiptCopies: z.number().int().min(1).max(5), kotCopies: z.number().int().min(1).max(5), updatedAt: z.string().datetime() });
 const checkoutSnapshot = z.object({ orderGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), idempotencyKey: z.string(), subtotalAmount: z.number().int(), discountAmount: z.number().int(), payableAmount: z.number().int(), approvedByGlobalId: z.string().uuid().nullable(), createdAt: z.string().datetime(), payments: z.array(z.object({ paymentGlobalId: z.string().uuid(), transactionGlobalId: z.string().uuid(), methodCode: z.string(), amount: z.number().int(), tenderedAmount: z.number().int().nullable(), changeAmount: z.number().int(), createdAt: z.string().datetime() })) });
 const cancellationSnapshot = z.object({ orderGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid().nullable(), actorGlobalId: z.string().uuid(), idempotencyKey: z.string(), reason: z.string(), wasPaid: z.boolean(), inventoryDisposition: z.enum(["returned_unused", "prepared_discarded"]).nullable(), createdAt: z.string().datetime(), refunds: z.array(z.object({ refundGlobalId: z.string().uuid(), originalPaymentGlobalId: z.string().uuid(), transactionGlobalId: z.string().uuid(), methodCode: z.string(), amount: z.number().int(), createdAt: z.string().datetime() })) });
+const stockMovementSnapshot = z.object({ ingredientGlobalId: z.string().uuid(), locationGlobalId: z.string().uuid(), actorGlobalId: z.string().uuid(), movementType: z.enum(["opening_balance", "manual_positive", "manual_negative", "negative_override"]), direction: z.union([z.literal(-1), z.literal(1)]), quantityBase: z.number().int().positive(), unitCostMicros: z.number().int().nonnegative(), totalCostAmount: z.number().int().nonnegative(), sourceType: z.literal("inventory_adjustment"), sourceId: z.string(), idempotencyKey: z.string(), reason: z.string().nullable(), createdAt: z.string().datetime() });
 const changeSchema = z.object({ cursor: z.number().int().positive(), domain: z.string(), entityType: z.string(), entityGlobalId: z.string().uuid(), action: z.string(), revision: z.number().int().positive(), snapshot: z.unknown().nullable() });
 
 function authorized(request: NextRequest) {
@@ -52,18 +54,22 @@ export async function POST(request: NextRequest) {
         const isPrintPreferences = change.domain === "printing" && change.entityType === "register_print_preferences";
         const isCheckout = change.domain === "checkout" && change.entityType === "order_checkout";
         const isCancellation = change.domain === "checkout" && change.entityType === "order_cancellation";
-        if (!isCustomer && !isProduct && !isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation) continue;
+        const isStockMovement = change.domain === "inventory" && change.entityType === "stock_movement";
+        if (!isCustomer && !isProduct && !isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement) continue;
         const isDelete = change.action === "delete" && change.snapshot === null;
-        if (!isDelete && !change.snapshot) continue;
+        if (!isDelete && !change.snapshot) {
+          if (isStockMovement) throw new Error("An authoritative stock movement arrived without its required snapshot.");
+          continue;
+        }
         const isShiftClose = isShift && change.action === "close";
-        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShiftClose ? shiftCloseSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : isCashMovement ? cashMovementSnapshot.safeParse(change.snapshot) : isOrder ? orderSnapshot.safeParse(change.snapshot) : isPrintJob ? printJobSnapshot.safeParse(change.snapshot) : isPrintPreferences ? printPreferencesSnapshot.safeParse(change.snapshot) : isCheckout ? checkoutSnapshot.safeParse(change.snapshot) : cancellationSnapshot.safeParse(change.snapshot);
+        const parsedSnapshot = isDelete ? null : isCustomer ? customerSnapshot.safeParse(change.snapshot) : isProduct ? productSnapshot.safeParse(change.snapshot) : isShiftClose ? shiftCloseSnapshot.safeParse(change.snapshot) : isShift ? shiftSnapshot.safeParse(change.snapshot) : isCashMovement ? cashMovementSnapshot.safeParse(change.snapshot) : isOrder ? orderSnapshot.safeParse(change.snapshot) : isPrintJob ? printJobSnapshot.safeParse(change.snapshot) : isPrintPreferences ? printPreferencesSnapshot.safeParse(change.snapshot) : isCheckout ? checkoutSnapshot.safeParse(change.snapshot) : isCancellation ? cancellationSnapshot.safeParse(change.snapshot) : stockMovementSnapshot.safeParse(change.snapshot);
         if (parsedSnapshot && !parsedSnapshot.success) throw new Error("A typed domain snapshot is invalid.");
         const snapshot = parsedSnapshot?.success ? parsedSnapshot.data : null;
         const entityType = change.entityType;
         const mapping = await tx.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, entityType), eq(syncEntityMappings.global_id, change.entityGlobalId)) });
         if (mapping) {
           const queuedCommands = await tx.select().from(syncOutbox).where(and(eq(syncOutbox.device_id, device.id), eq(syncOutbox.state, "pending")));
-          const globalKey = isShift ? "shiftGlobalId" : isCashMovement ? "cashMovementGlobalId" : isPrintJob ? "jobGlobalId" : isPrintPreferences ? "preferenceGlobalId" : isCheckout ? "checkoutGlobalId" : isCancellation ? "cancellationGlobalId" : `${entityType}GlobalId`;
+          const globalKey = isShift ? "shiftGlobalId" : isCashMovement ? "cashMovementGlobalId" : isPrintJob ? "jobGlobalId" : isPrintPreferences ? "preferenceGlobalId" : isCheckout ? "checkoutGlobalId" : isCancellation ? "cancellationGlobalId" : isStockMovement ? "movementGlobalId" : `${entityType}GlobalId`;
           const queued = queuedCommands.find((item) => item.domain === change.domain && item.payload[globalKey] === change.entityGlobalId);
           if (queued) {
             const operationId = randomUUID();
@@ -173,6 +179,34 @@ export async function POST(request: NextRequest) {
           await tx.update(syncEntityMappings).set({ server_revision: change.revision, local_revision: mapping.local_revision + 1, updated_at: new Date() }).where(eq(syncEntityMappings.id, mapping.id));
         } else {
           if (isDelete) continue;
+          if (isStockMovement) {
+            const movement = snapshot as z.infer<typeof stockMovementSnapshot>;
+            const [ingredientMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "ingredient"), eq(syncEntityMappings.global_id, movement.ingredientGlobalId))).limit(1);
+            const [locationMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "inventory_location"), eq(syncEntityMappings.global_id, movement.locationGlobalId))).limit(1);
+            const [actorMapping] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "user"), eq(syncEntityMappings.global_id, movement.actorGlobalId))).limit(1);
+            if (!ingredientMapping || !locationMapping || !actorMapping) throw new Error("Pulled stock movement references an unmapped ingredient, location, or actor.");
+            if (movement.sourceType !== "inventory_adjustment") throw new Error("This stock movement importer only accepts inventory adjustment history.");
+            await tx.execute(sql`select id from stock_balances where ingredient_id = ${Number(ingredientMapping.local_id)} and location_id = ${Number(locationMapping.local_id)} for update`);
+            let balance = await tx.query.stockBalances.findFirst({ where: and(eq(stockBalances.branch_id, device.branch_id), eq(stockBalances.ingredient_id, Number(ingredientMapping.local_id)), eq(stockBalances.location_id, Number(locationMapping.local_id))) });
+            if (!balance && movement.direction < 0) throw new Error("A stock deduction cannot be imported without its authoritative balance.");
+            const nextQuantity = (balance?.quantity_base ?? 0) + movement.direction * movement.quantityBase;
+            if (nextQuantity < 0) throw new Error("Pulled stock movement would create a negative local balance.");
+            const nextAverage = movement.direction > 0
+              ? movingWeightedAverage({ existingQuantity: balance?.quantity_base ?? 0, existingUnitCostMicros: balance?.average_unit_cost_micros ?? 0, addedQuantity: movement.quantityBase, addedUnitCostMicros: movement.unitCostMicros })
+              : balance?.average_unit_cost_micros ?? 0;
+            if (!balance) {
+              [balance] = await tx.insert(stockBalances).values({ branch_id: device.branch_id, location_id: Number(locationMapping.local_id), ingredient_id: Number(ingredientMapping.local_id), quantity_base: nextQuantity, average_unit_cost_micros: nextAverage }).returning();
+            } else {
+              [balance] = await tx.update(stockBalances).set({ quantity_base: nextQuantity, average_unit_cost_micros: nextAverage, updated_at: new Date() }).where(eq(stockBalances.id, balance.id)).returning();
+            }
+            if (movement.direction > 0) await tx.update(ingredients).set({ average_unit_cost_micros: nextAverage, updated_by: actorMapping.local_id, updated_at: new Date() }).where(eq(ingredients.id, Number(ingredientMapping.local_id)));
+            const [created] = await tx.insert(stockMovements).values({ branch_id: device.branch_id, location_id: Number(locationMapping.local_id), ingredient_id: Number(ingredientMapping.local_id), movement_type: movement.movementType as "opening_balance" | "manual_positive" | "manual_negative" | "negative_override", direction: movement.direction, quantity_base: movement.quantityBase, unit_cost_micros: movement.unitCostMicros, total_cost_amount: movement.totalCostAmount, source_type: movement.sourceType, source_id: movement.sourceId, idempotency_key: `sync:${change.entityGlobalId}`, actor_user_id: actorMapping.local_id, reason: movement.reason, created_at: new Date(movement.createdAt) }).returning();
+            const localId = String(created!.id);
+            await tx.insert(syncEntityMappings).values({ organization_id: device.organization_id, device_id: device.id, branch_id: device.branch_id, entity_type: "stock_movement", global_id: change.entityGlobalId, local_id: localId, local_revision: 1, server_revision: change.revision });
+            await tx.insert(syncGlobalEntities).values({ organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "stock_movement", global_id: change.entityGlobalId, local_id: localId, server_revision: change.revision });
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actorMapping.local_id, action: "sync.inventory.adjustment_imported", entity_type: "stock_movement", entity_id: change.entityGlobalId, reason: movement.reason, details: JSON.stringify({ cursor: change.cursor, direction: movement.direction, quantityBase: movement.quantityBase }) });
+            continue;
+          }
           if (isCancellation) {
             const cancellation = snapshot as z.infer<typeof cancellationSnapshot>;
             const [orderIdentity] = await tx.select().from(syncEntityMappings).where(and(eq(syncEntityMappings.device_id, device.id), eq(syncEntityMappings.entity_type, "order"), eq(syncEntityMappings.global_id, cancellation.orderGlobalId))).limit(1);

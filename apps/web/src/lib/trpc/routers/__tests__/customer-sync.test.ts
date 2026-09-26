@@ -3,7 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { createTestDb, makeUser, SCHEMA_DDL } from "./helpers";
 import { NextRequest } from "next/server";
 import { executeLocalCommand } from "@/lib/sync/local-command";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, paymentMethods, products, registerPrintPreferences, shiftCashMovements, staffAssignments, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, transactions, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, paymentMethods, products, registerPrintPreferences, shiftCashMovements, staffAssignments, stockBalances, stockMovements, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, syncOutbox, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
 
 const { pg, db } = createTestDb();
 mock.module("@/lib/db", () => ({ db, pglite: pg }));
@@ -11,12 +11,14 @@ const { customersRouter } = await import("../customers");
 const { productsRouter } = await import("../products");
 const { shiftsRouter } = await import("../shifts");
 const { printingRouter } = await import("../printing");
+const { inventoryRouter } = await import("../inventory");
 const { createCallerFactory } = await import("../../init");
 const { POST: applyChanges } = await import("@/app/api/desktop/sync/apply/route");
 const caller = createCallerFactory(customersRouter)({ user: makeUser("local-owner") });
 const productCaller = createCallerFactory(productsRouter)({ user: makeUser("local-owner") });
 const shiftCaller = createCallerFactory(shiftsRouter)({ user: makeUser("local-owner") });
 const printingCaller = createCallerFactory(printingRouter)({ user: makeUser("local-owner") });
+const inventoryCaller = createCallerFactory(inventoryRouter)({ user: makeUser("local-owner") });
 const deviceId = "b2d90704-052a-4a37-a0fc-0464bf8c9e0a";
 const organizationId = "ce9b25aa-39de-41c8-8d07-6c4ad0b5b967";
 const branchGlobalId = "8fb88e82-24a4-483e-b931-e5d23e4f8d0c";
@@ -169,13 +171,60 @@ describe("desktop customer command boundary", () => {
     expect((await db.select().from(products).where(eq(products.id, created.id))).length).toBe(0);
   });
 
+  it("commits an opening stock movement, global references, audit, and sync command atomically", async () => {
+    const branch = await db.query.branches.findFirst({ where: eq(branches.code, "LOCAL") });
+    await db.insert(staffAssignments).values({ user_id: "local-owner", branch_id: branch!.id, role: "owner", is_active: true }).onConflictDoNothing();
+    const [location] = await db.insert(inventoryLocations).values({ branch_id: branch!.id, code: "SYNC-STOCK", name_en: "Stock", name_ar: "مخزون", is_active: true }).returning();
+    const [category] = await db.insert(ingredientCategories).values({ branch_id: branch!.id, code: "SYNC-STOCK", name_en: "Stock", name_ar: "مخزون", is_active: true }).returning();
+    const [unit] = await db.insert(unitsOfMeasure).values({ code: "SYNC-COUNT", name_en: "Each", name_ar: "قطعة", dimension: "count", base_numerator: 1, base_denominator: 1 }).returning();
+    const [ingredient] = await db.insert(ingredients).values({ branch_id: branch!.id, category_id: category!.id, sku: "SYNC-STOCK-1", name_en: "Stock Ingredient", name_ar: "مكون", base_unit_id: unit!.id, dimension: "count", default_location_id: location!.id, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, allow_negative: false, average_unit_cost_micros: 0, created_by: "local-owner", updated_by: "local-owner" }).returning();
+    await pg.exec("ALTER TABLE audit_logs ADD CONSTRAINT test_sync_stock_outbox_failure CHECK (action <> 'sync.inventory.adjust.queued')");
+    await expect(inventoryCaller.adjust({ branchId: branch!.id, ingredientId: ingredient!.id, locationId: location!.id, quantityBase: 7, unitCostMicros: 250, direction: "positive", opening: true, idempotencyKey: "local-stock-outbox-fail", reason: "Opening count verified" })).rejects.toThrow();
+    expect((await db.select().from(stockMovements).where(eq(stockMovements.ingredient_id, ingredient!.id))).length).toBe(0);
+    expect((await db.select().from(syncOutbox).where(eq(syncOutbox.idempotency_key, "local-stock-outbox-fail"))).length).toBe(0);
+    expect(await db.query.stockBalances.findFirst({ where: eq(stockBalances.ingredient_id, ingredient!.id) })).toBeUndefined();
+    await pg.exec("ALTER TABLE audit_logs DROP CONSTRAINT test_sync_stock_outbox_failure");
+    const movement = await inventoryCaller.adjust({ branchId: branch!.id, ingredientId: ingredient!.id, locationId: location!.id, quantityBase: 7, unitCostMicros: 250, direction: "positive", opening: true, idempotencyKey: "local-stock-outbox-001", reason: "Opening count verified" });
+    const [command] = await db.select().from(syncOutbox).where(eq(syncOutbox.idempotency_key, "local-stock-outbox-001"));
+    const ingredientMapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "ingredient"), eq(syncEntityMappings.local_id, String(ingredient!.id))) });
+    const locationMapping = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "inventory_location"), eq(syncEntityMappings.local_id, String(location!.id))) });
+    expect(movement).toMatchObject({ direction: 1, quantity_base: 7, unit_cost_micros: 250, movement_type: "opening_balance" });
+    expect((await db.query.stockBalances.findFirst({ where: eq(stockBalances.ingredient_id, ingredient!.id) }))?.quantity_base).toBe(7);
+    expect(command?.domain).toBe("inventory");
+    expect(command?.action).toBe("adjust");
+    expect(command?.payload).toMatchObject({ ingredientGlobalId: ingredientMapping?.global_id, locationGlobalId: locationMapping?.global_id, movementGlobalId: expect.any(String), quantityBase: 7, unitCostMicros: 250, opening: true });
+    expect((await db.select().from(stockMovements).where(eq(stockMovements.idempotency_key, "local-stock-outbox-001"))).length).toBe(1);
+  });
+
+  it("imports an authoritative stock movement with local IDs and exact weighted-average valuation", async () => {
+    const branch = await db.query.branches.findFirst({ where: eq(branches.code, "LOCAL") });
+    const ingredient = await db.query.ingredients.findFirst({ where: eq(ingredients.sku, "SYNC-STOCK-1") });
+    const location = await db.query.inventoryLocations.findFirst({ where: eq(inventoryLocations.code, "SYNC-STOCK") });
+    const movementGlobalId = "f4900ba2-e67c-4a1d-babd-cac8f0eab048";
+    const response = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
+      body: JSON.stringify({ changes: [{ cursor: 44, domain: "inventory", entityType: "stock_movement", entityGlobalId: movementGlobalId, action: "adjust", revision: 1, snapshot: { ingredientGlobalId: (await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "ingredient"), eq(syncEntityMappings.local_id, String(ingredient!.id))) }))!.global_id, locationGlobalId: (await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "inventory_location"), eq(syncEntityMappings.local_id, String(location!.id))) }))!.global_id, actorGlobalId, movementType: "manual_positive", direction: 1, quantityBase: 3, unitCostMicros: 1_000, totalCostAmount: 0, sourceType: "inventory_adjustment", sourceId: "remote-adjustment-1", idempotencyKey: "remote-adjustment-key-1", reason: "Remote verified count", createdAt: new Date().toISOString() } }], nextCursor: 44 }),
+    }));
+    expect(response.status).toBe(200);
+    const balance = await db.query.stockBalances.findFirst({ where: eq(stockBalances.ingredient_id, ingredient!.id) });
+    const movement = await db.query.stockMovements.findFirst({ where: eq(stockMovements.idempotency_key, `sync:${movementGlobalId}`) });
+    const identity = await db.query.syncEntityMappings.findFirst({ where: and(eq(syncEntityMappings.device_id, deviceId), eq(syncEntityMappings.entity_type, "stock_movement"), eq(syncEntityMappings.global_id, movementGlobalId)) });
+    expect(balance).toMatchObject({ quantity_base: 10, average_unit_cost_micros: 475 });
+    expect(movement).toMatchObject({ ingredient_id: ingredient!.id, location_id: location!.id, direction: 1, quantity_base: 3, actor_user_id: "local-owner" });
+    expect(movement).toBeDefined();
+    expect(Number(identity?.local_id)).toBe(movement!.id);
+    expect((await db.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) }))?.last_pulled_cursor).toBe(44);
+    expect(branch?.id).toBe(location?.branch_id);
+  });
+
   it("imports product snapshots by global UUID while retaining a device-local integer key", async () => {
     const response = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
       method: "POST",
       headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
       body: JSON.stringify({
-        changes: [{ cursor: 44, domain: "products", entityType: "product", entityGlobalId: pulledProductGlobalId, action: "create", revision: 1, snapshot: { name: "Remote Product", description: null, price: 700, in_stock: 5, category: null, imageKey: "media/opaque.webp" } }],
-        nextCursor: 44,
+        changes: [{ cursor: 45, domain: "products", entityType: "product", entityGlobalId: pulledProductGlobalId, action: "create", revision: 1, snapshot: { name: "Remote Product", description: null, price: 700, in_stock: 5, category: null, imageKey: "media/opaque.webp" } }],
+        nextCursor: 45,
       }),
     }));
     expect(response.status).toBe(200);
@@ -232,10 +281,10 @@ describe("desktop customer command boundary", () => {
         method: "POST",
         headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
         body: JSON.stringify({ changes: [
-          { cursor: 1, domain: "shifts", entityType: "cashier_shift", entityGlobalId: mapping!.global_id, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 1200, openedAt: shift.opened_at.toISOString() } },
-          { cursor: 2, domain: "shifts", entityType: "cash_movement", entityGlobalId: movementCommand!.payload.cashMovementGlobalId, action: "drawer_adjust", revision: 1, snapshot: { shiftGlobalId: mapping!.global_id, actorGlobalId, type: movement.type, amount: movement.amount, reason: movement.reason, createdAt: movement.created_at.toISOString() } },
-          { cursor: 3, domain: "printing", entityType: "register_print_preferences", entityGlobalId: "2b2cfdce-82c6-468b-a1b0-cbaaf83e2659", action: "settings_update", revision: 1, snapshot: { registerGlobalId, updatedByGlobalId: actorGlobalId, paperWidth: 58, language: "ar", receiptCopies: 2, kotCopies: 3, updatedAt: new Date().toISOString() } },
-        ], nextCursor: 3 }),
+          { cursor: 46, domain: "shifts", entityType: "cashier_shift", entityGlobalId: mapping!.global_id, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 1200, openedAt: shift.opened_at.toISOString() } },
+          { cursor: 47, domain: "shifts", entityType: "cash_movement", entityGlobalId: movementCommand!.payload.cashMovementGlobalId, action: "drawer_adjust", revision: 1, snapshot: { shiftGlobalId: mapping!.global_id, actorGlobalId, type: movement.type, amount: movement.amount, reason: movement.reason, createdAt: movement.created_at.toISOString() } },
+          { cursor: 48, domain: "printing", entityType: "register_print_preferences", entityGlobalId: "2b2cfdce-82c6-468b-a1b0-cbaaf83e2659", action: "settings_update", revision: 1, snapshot: { registerGlobalId, updatedByGlobalId: actorGlobalId, paperWidth: 58, language: "ar", receiptCopies: 2, kotCopies: 3, updatedAt: new Date().toISOString() } },
+        ], nextCursor: 48 }),
       }));
       importedStatus = imported.status;
       importError = (await imported.json()).error;
@@ -255,7 +304,7 @@ describe("desktop customer command boundary", () => {
     const applied = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
       method: "POST",
       headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
-      body: JSON.stringify({ changes: [{ cursor: 45, domain: "shifts", entityType: "cashier_shift", entityGlobalId: remoteShiftGlobalId, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 900, openedAt: new Date().toISOString() } }], nextCursor: 45 }),
+      body: JSON.stringify({ changes: [{ cursor: 49, domain: "shifts", entityType: "cashier_shift", entityGlobalId: remoteShiftGlobalId, action: "open", revision: 1, snapshot: { registerGlobalId, actorGlobalId, openingFloat: 900, openedAt: new Date().toISOString() } }], nextCursor: 49 }),
     }));
     expect(applied.status).toBe(200);
     expect((await db.select().from(cashierShifts).where(and(eq(cashierShifts.branch_id, branch!.id), eq(cashierShifts.status, "open")))).length).toBe(1);
@@ -274,7 +323,7 @@ describe("desktop customer command boundary", () => {
       const closeImport = await applyChanges(new NextRequest("http://localhost/api/desktop/sync/apply", {
         method: "POST",
         headers: { "content-type": "application/json", "x-forno-desktop-setup": "test-setup-token" },
-        body: JSON.stringify({ changes: [{ cursor: 46, domain: "shifts", entityType: "cashier_shift", entityGlobalId: mapping!.global_id, action: "close", revision: 2, snapshot: { closedByGlobalId: actorGlobalId, expectedCash: 1700, closingCash: 1750, variance: 50, closedAt: closed.closed_at!.toISOString() } }], nextCursor: 46 }),
+      body: JSON.stringify({ changes: [{ cursor: 50, domain: "shifts", entityType: "cashier_shift", entityGlobalId: mapping!.global_id, action: "close", revision: 2, snapshot: { closedByGlobalId: actorGlobalId, expectedCash: 1700, closingCash: 1750, variance: 50, closedAt: closed.closed_at!.toISOString() } }], nextCursor: 50 }),
       }));
       closeImportStatus = closeImport.status;
     } finally {

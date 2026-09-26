@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, gt, inArray, or } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { db } from "@/lib/db";
@@ -34,12 +34,18 @@ import {
   printJobs,
   registerPrintPreferences,
   transactions,
+  ingredients,
+  inventoryLocations,
+  stockBalances,
+  stockMovements,
 } from "@/lib/db/schema";
 import { createOrder } from "@/lib/trpc/routers/orders/create";
 import { payOrder } from "@/lib/trpc/routers/checkout/payment";
 import { assertOrderTransition } from "@/lib/orders/lifecycle";
 import { issueOrderInventory } from "@/lib/inventory/service";
 import { cancelOrder } from "@/lib/trpc/routers/checkout/cancellation";
+import { postStockIncrease } from "@/lib/inventory/service";
+import { costMinorForQuantity } from "@/lib/inventory/exact";
 
 export const runtime = "nodejs";
 
@@ -57,6 +63,7 @@ const payloadSchemas = {
   "products.create": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.update": z.object({ productGlobalId: z.string().uuid(), values: productValuesSchema }),
   "products.delete": z.object({ productGlobalId: z.string().uuid() }),
+  "inventory.adjust": z.object({ movementGlobalId: z.string().uuid(), ingredientGlobalId: z.string().uuid(), locationGlobalId: z.string().uuid(), direction: z.enum(["positive", "negative"]), opening: z.boolean(), quantityBase: z.number().int().positive(), unitCostMicros: z.number().int().nonnegative(), reason: z.string().trim().min(3).max(500), override: z.boolean(), idempotencyKey: z.string().trim().min(8).max(140) }),
   "shifts.open": z.object({ shiftGlobalId: z.string().uuid(), registerGlobalId: z.string().uuid(), openingFloat: z.number().int().nonnegative(), openedAt: z.string().datetime() }),
   "shifts.close": z.object({ shiftGlobalId: z.string().uuid(), expectedCash: z.number().int(), closingCash: z.number().int().nonnegative(), closedAt: z.string().datetime() }),
   "shifts.drawer_adjust": z.object({ cashMovementGlobalId: z.string().uuid(), shiftGlobalId: z.string().uuid(), type: z.enum(["cash_in", "cash_out"]), amount: z.number().int().positive(), reason: z.string().trim().min(3).max(500), createdAt: z.string().datetime() }),
@@ -88,6 +95,7 @@ export const SYNC_COMMAND_REGISTRY = {
   "products.create": { schema: payloadSchemas["products.create"], permission: "product:manage", handler: "mutateProduct", importer: "product" },
   "products.update": { schema: payloadSchemas["products.update"], permission: "product:manage", handler: "mutateProduct", importer: "product" },
   "products.delete": { schema: payloadSchemas["products.delete"], permission: "product:manage", handler: "mutateProduct", importer: "product" },
+  "inventory.adjust": { schema: payloadSchemas["inventory.adjust"], permission: "inventory:adjust", handler: "adjustStock", importer: "stock_movement" },
 } as const satisfies Record<keyof typeof payloadSchemas, { schema: z.ZodType; permission: string | null; handler: string; importer: string }>;
 const commandSchema = z.object({
   operationId: z.string().uuid(),
@@ -96,8 +104,8 @@ const commandSchema = z.object({
   branchGlobalId: z.string().uuid(),
   registerGlobalId: z.string().uuid(),
   actorGlobalId: z.string().uuid(),
-  domain: z.enum(["customers", "products", "shifts", "orders", "checkout", "printing"]),
-  action: z.enum(["create", "update", "delete", "open", "drawer_adjust", "close", "pay", "cancel", "request", "transition", "settings_update"]),
+  domain: z.enum(["customers", "products", "shifts", "orders", "checkout", "printing", "inventory"]),
+  action: z.enum(["create", "update", "delete", "open", "drawer_adjust", "close", "pay", "cancel", "request", "transition", "settings_update", "adjust"]),
   schemaVersion: z.literal(1),
   payload: z.record(z.string(), z.unknown()),
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -578,6 +586,43 @@ export async function POST(request: NextRequest) {
           await tx.update(syncDevices).set({ last_seen_at: new Date(), last_synchronized_at: new Date() }).where(eq(syncDevices.id, device.id));
           return { operationId: command.operationId, status: "accepted", result };
         }
+        if (command.domain === "inventory" && command.action === "adjust") {
+          const adjustment = payload.data as z.infer<typeof payloadSchemas["inventory.adjust"]>;
+          if (!hasPermission(assignment.role, "inventory:adjust") || adjustment.override && !hasPermission(assignment.role, "inventory:override")) {
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, action: "sync.permission_denied", entity_type: "stock_movement", entity_id: adjustment.movementGlobalId, reason: adjustment.override ? "inventory:override" : "inventory:adjust", details: JSON.stringify({ sourceOperationId: command.operationId }) });
+            return { operationId: command.operationId, status: "rejected", error: "Actor lacks stock adjustment permission." };
+          }
+          const [ingredientIdentity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "ingredient"), eq(syncGlobalEntities.global_id, adjustment.ingredientGlobalId), eq(syncGlobalEntities.branch_id, device.branch_id))).limit(1);
+          const [locationIdentity] = await tx.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "inventory_location"), eq(syncGlobalEntities.global_id, adjustment.locationGlobalId), eq(syncGlobalEntities.branch_id, device.branch_id))).limit(1);
+          const ingredientId = ingredientIdentity ? Number(ingredientIdentity.local_id) : 0;
+          const locationId = locationIdentity ? Number(locationIdentity.local_id) : 0;
+          const ingredient = ingredientId ? await tx.query.ingredients.findFirst({ where: and(eq(ingredients.id, ingredientId), eq(ingredients.branch_id, device.branch_id), eq(ingredients.is_active, true)) }) : undefined;
+          const location = locationId ? await tx.query.inventoryLocations.findFirst({ where: and(eq(inventoryLocations.id, locationId), eq(inventoryLocations.branch_id, device.branch_id), eq(inventoryLocations.is_active, true)) }) : undefined;
+          const priorMovement = await tx.query.stockMovements.findFirst({ where: eq(stockMovements.idempotency_key, adjustment.idempotencyKey) });
+          if (priorMovement) return { operationId: command.operationId, status: "rejected", error: "Stock adjustment idempotency key already exists outside this command." };
+          if (!ingredient || !location) return { operationId: command.operationId, status: "rejected", error: "Ingredient or inventory location is not available in this branch." };
+          const [inbox] = await tx.insert(syncCommandInbox).values({ organization_id: device.organization_id, device_id: device.id, operation_id: command.operationId, branch_id: device.branch_id, actor_global_id: command.actorGlobalId, domain: command.domain, action: command.action, schema_version: command.schemaVersion, payload: command.payload, payload_hash: command.payloadHash, idempotency_key: command.idempotencyKey, state: "accepted" }).returning();
+          let movement;
+          if (adjustment.direction === "positive") {
+            movement = await postStockIncrease(tx, { branchId: device.branch_id, locationId, ingredientId, quantityBase: adjustment.quantityBase, unitCostMicros: adjustment.unitCostMicros, actorUserId: actor.local_id, idempotencyKey: adjustment.idempotencyKey, movementType: adjustment.opening ? "opening_balance" : "manual_positive", reason: adjustment.reason });
+          } else {
+            await tx.execute(sql`select id from stock_balances where ingredient_id = ${ingredientId} and location_id = ${locationId} for update`);
+            const balance = await tx.query.stockBalances.findFirst({ where: and(eq(stockBalances.branch_id, device.branch_id), eq(stockBalances.location_id, locationId), eq(stockBalances.ingredient_id, ingredientId)) });
+            if (!balance) throw new Error("Stock balance is unavailable centrally.");
+            if (balance.quantity_base < adjustment.quantityBase && (!adjustment.override || !ingredient.allow_negative)) throw new Error("Negative stock override is not permitted for this ingredient.");
+            const [createdMovement] = await tx.insert(stockMovements).values({ branch_id: device.branch_id, location_id: locationId, ingredient_id: ingredientId, movement_type: balance.quantity_base < adjustment.quantityBase ? "negative_override" : "manual_negative", direction: -1, quantity_base: adjustment.quantityBase, unit_cost_micros: balance.average_unit_cost_micros, total_cost_amount: costMinorForQuantity(adjustment.quantityBase, balance.average_unit_cost_micros), source_type: "inventory_adjustment", source_id: adjustment.idempotencyKey, idempotency_key: adjustment.idempotencyKey, actor_user_id: actor.local_id, reason: adjustment.reason }).returning();
+            await tx.update(stockBalances).set({ quantity_base: balance.quantity_base - adjustment.quantityBase, updated_at: new Date() }).where(eq(stockBalances.id, balance.id));
+            movement = createdMovement!;
+            await tx.insert(auditLogs).values({ branch_id: device.branch_id, actor_user_id: actor.local_id, approver_user_id: balance.quantity_base < adjustment.quantityBase ? actor.local_id : null, action: balance.quantity_base < adjustment.quantityBase ? "inventory.negative_override" : "inventory.adjustment", entity_type: "stock_movement", entity_id: String(movement.id), reason: adjustment.reason });
+          }
+          const movementValues = { organization_id: device.organization_id, branch_id: device.branch_id, entity_type: "stock_movement", global_id: adjustment.movementGlobalId, local_id: String(movement.id), server_revision: 1 };
+          await tx.insert(syncGlobalEntities).values(movementValues);
+          await tx.insert(syncEntityMappings).values({ ...movementValues, device_id: device.id, local_revision: 1 });
+          const result = { movementGlobalId: adjustment.movementGlobalId, revision: 1 };
+          await tx.update(syncCommandInbox).set({ result, processed_at: new Date() }).where(eq(syncCommandInbox.id, inbox!.id));
+          await tx.insert(syncChangeLog).values({ organization_id: device.organization_id, branch_id: device.branch_id, domain: "inventory", entity_type: "stock_movement", entity_global_id: adjustment.movementGlobalId, action: "adjust", server_revision: 1, source_operation_id: command.operationId });
+          return { operationId: command.operationId, status: "accepted", result };
+        }
         if (command.domain === "products") {
           const productPayload = payload.data as z.infer<typeof payloadSchemas["products.create"]>;
           const productGlobalId = productPayload.productGlobalId;
@@ -707,7 +752,8 @@ export async function GET(request: NextRequest) {
     const isPrintPreferences = change.domain === "printing" && change.entity_type === "register_print_preferences";
     const isCheckout = change.domain === "checkout" && change.entity_type === "order_checkout";
     const isCancellation = change.domain === "checkout" && change.entity_type === "order_cancellation";
-    if (!isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product"))) {
+    const isStockMovement = change.domain === "inventory" && change.entity_type === "stock_movement";
+    if (!isShift && !isCashMovement && !isOrder && !isPrintJob && !isPrintPreferences && !isCheckout && !isCancellation && !isStockMovement && ((change.domain !== "customers" && change.domain !== "products") || (change.entity_type !== "customer" && change.entity_type !== "product"))) {
       exported.push({ cursor: change.cursor, domain: change.domain, entityType: change.entity_type, entityGlobalId: change.entity_global_id, action: change.action, revision: change.server_revision, snapshot: null });
       continue;
     }
@@ -737,6 +783,17 @@ export async function GET(request: NextRequest) {
         const [shiftMapping] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "cashier_shift"), eq(syncGlobalEntities.local_id, String(movement.shift_id)))).limit(1);
         const [actor] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, movement.created_by))).limit(1);
         if (shiftMapping && actor) snapshot = { shiftGlobalId: shiftMapping.global_id, actorGlobalId: actor.global_id, type: movement.type, amount: movement.amount, reason: movement.reason, createdAt: movement.created_at.toISOString() };
+      }
+    }
+    else if (isStockMovement && mapping) {
+      const movement = await db.query.stockMovements.findFirst({ where: eq(stockMovements.id, Number(mapping.local_id)) });
+      if (!movement) throw new Error("A stock movement change has no authoritative ledger record.");
+      {
+        const [ingredient] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "ingredient"), eq(syncGlobalEntities.local_id, String(movement.ingredient_id)))).limit(1);
+        const [location] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "inventory_location"), eq(syncGlobalEntities.local_id, String(movement.location_id)))).limit(1);
+        const [actor] = await db.select().from(syncGlobalEntities).where(and(eq(syncGlobalEntities.organization_id, device.organization_id), eq(syncGlobalEntities.entity_type, "user"), eq(syncGlobalEntities.local_id, movement.actor_user_id))).limit(1);
+        if (!ingredient || !location || !actor) throw new Error("A stock movement change is missing a global ingredient, location, or actor mapping.");
+        snapshot = { ingredientGlobalId: ingredient.global_id, locationGlobalId: location.global_id, actorGlobalId: actor.global_id, movementType: movement.movement_type, direction: movement.direction, quantityBase: movement.quantity_base, unitCostMicros: movement.unit_cost_micros, totalCostAmount: movement.total_cost_amount, sourceType: movement.source_type, sourceId: movement.source_id, idempotencyKey: movement.idempotency_key, reason: movement.reason, createdAt: movement.created_at.toISOString() };
       }
     }
     else if (isOrder && mapping) {

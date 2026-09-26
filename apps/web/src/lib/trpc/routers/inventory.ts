@@ -17,12 +17,14 @@ import {
   stockBalances,
   stockMovements,
   staffAssignments,
+  syncDevices,
   unitsOfMeasure,
 } from "@/lib/db/schema";
 import { hasPermission, requireStaff } from "@/lib/permissions";
 import { protectedProcedure, router } from "../init";
 import { applyYieldLoss, convertScaledQuantity, costMinorForQuantity } from "@/lib/inventory/exact";
 import { menuAvailability, postStockIncrease } from "@/lib/inventory/service";
+import { executeLocalCommand, ensureLocalGlobalMapping } from "@/lib/sync/local-command";
 
 const branchInput = z.object({ branchId: z.number().int().positive() });
 const componentInput = z.object({
@@ -128,12 +130,37 @@ export const inventoryRouter = router({
     const assignment = await requireStaff(ctx.user.id, input.branchId, "inventory:adjust");
     const { ingredient, location } = await branchEntities(input.branchId, input);
     if (!ingredient || !location) throw new Error("Inventory entity unavailable");
-    if (input.direction === "positive") {
-      if (input.unitCostMicros == null) throw new TRPCError({ code: "BAD_REQUEST", message: "Positive stock requires an explicit trusted unit cost" });
-      const unitCostMicros = input.unitCostMicros;
-      return db.transaction((tx) => postStockIncrease(tx, { branchId: input.branchId, locationId: input.locationId, ingredientId: input.ingredientId, quantityBase: input.quantityBase, unitCostMicros, actorUserId: ctx.user.id, idempotencyKey: input.idempotencyKey, movementType: input.opening ? "opening_balance" : "manual_positive", reason: input.reason }));
-    }
+    if (input.direction === "positive" && input.unitCostMicros == null) throw new TRPCError({ code: "BAD_REQUEST", message: "Positive stock requires an explicit trusted unit cost" });
     return db.transaction(async (tx) => {
+      const deviceId = process.env.FORNO_DESKTOP_DEVICE_ID;
+      const device = deviceId && process.env.FORNO_DESKTOP_MODE === "1"
+        ? await tx.query.syncDevices.findFirst({ where: eq(syncDevices.id, deviceId) })
+        : undefined;
+      if (device && device.branch_id !== input.branchId) throw new TRPCError({ code: "FORBIDDEN", message: "Inventory adjustments must use the paired device branch" });
+      const ingredientMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "ingredient", localId: ingredient.id }) : undefined;
+      const locationMapping = device ? await ensureLocalGlobalMapping(tx, { organizationId: device.organization_id, deviceId: device.id, branchId: input.branchId, entityType: "inventory_location", localId: location.id }) : undefined;
+      return executeLocalCommand<typeof stockMovements.$inferSelect>(tx, {
+        actorId: ctx.user.id,
+        domain: "inventory",
+        action: "adjust",
+        entityType: "stock_movement",
+        localId: (movement) => String(movement.id),
+        idempotencyKey: input.idempotencyKey,
+        dependsOnGlobalIds: () => [ingredientMapping?.global_id, locationMapping?.global_id].filter((id): id is string => Boolean(id)),
+        payload: (movementGlobalId, movement) => ({
+          movementGlobalId,
+          ingredientGlobalId: ingredientMapping?.global_id ?? null,
+          locationGlobalId: locationMapping?.global_id ?? null,
+          direction: input.direction,
+          opening: Boolean(input.opening),
+          quantityBase: input.quantityBase,
+          unitCostMicros: input.direction === "positive" ? input.unitCostMicros! : movement.unit_cost_micros,
+          reason: input.reason,
+          override: Boolean(input.override),
+          idempotencyKey: input.idempotencyKey,
+        }),
+      }, async (tx) => {
+      if (input.direction === "positive") return postStockIncrease(tx, { branchId: input.branchId, locationId: input.locationId, ingredientId: input.ingredientId, quantityBase: input.quantityBase, unitCostMicros: input.unitCostMicros!, actorUserId: ctx.user.id, idempotencyKey: input.idempotencyKey, movementType: input.opening ? "opening_balance" : "manual_positive", reason: input.reason });
       const duplicate = await tx.query.stockMovements.findFirst({ where: eq(stockMovements.idempotency_key, input.idempotencyKey) });
       if (duplicate) return duplicate;
       await tx.execute(sql`select id from stock_balances where ingredient_id = ${input.ingredientId} and location_id = ${input.locationId} for update`);
@@ -146,6 +173,7 @@ export const inventoryRouter = router({
       await tx.update(stockBalances).set({ quantity_base: balance.quantity_base - input.quantityBase, updated_at: new Date() }).where(eq(stockBalances.id, balance.id));
       await tx.insert(auditLogs).values({ branch_id: input.branchId, actor_user_id: ctx.user.id, approver_user_id: negative ? ctx.user.id : null, action: negative ? "inventory.negative_override" : "inventory.adjustment", entity_type: "stock_movement", entity_id: String(movement.id), reason: input.reason });
       return movement;
+      });
     });
   }),
 

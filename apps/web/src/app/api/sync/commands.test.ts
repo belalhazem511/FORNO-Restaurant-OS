@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { NextRequest } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { createTestDb, SCHEMA_DDL } from "@/lib/trpc/routers/__tests__/helpers";
-import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, kitchenStations, menuCategories, menuItems, orderCancellations, orderCheckouts, orderPayments, orders, paymentMethods, printJobs, products, recipeComponents, recipeVersions, shiftCashMovements, staffAssignments, stockBalances, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
+import { auditLogs, branches, cashierRegisters, cashierShifts, customers, ingredientCategories, ingredients, inventoryLocations, kitchenStations, menuCategories, menuItems, orderCancellations, orderCheckouts, orderPayments, orders, paymentMethods, printJobs, products, recipeComponents, recipeVersions, shiftCashMovements, staffAssignments, stockBalances, stockMovements, syncChangeLog, syncCommandInbox, syncConflicts, syncDevices, syncEntityMappings, syncGlobalEntities, syncOrganizations, transactions, unitsOfMeasure, user } from "@/lib/db/schema";
 import { productImagePath } from "@/lib/media/product-images";
 
 const { pg, db } = createTestDb();
@@ -23,6 +23,8 @@ const customerGlobalId = "fa9ccdae-1358-46f9-9f89-4a675607c7a0";
 let centralBranchId = 0;
 const menuItemGlobalId = "5575a74a-9bbc-4b99-9847-0bce2095e6ef";
 const stationGlobalId = "c40f7ab8-d0db-4f6b-811e-837dc0ba8ce7";
+const ingredientGlobalId = "7447115b-e944-465d-a4c4-53e54a4f4a1d";
+const locationGlobalId = "ddcc591a-67e9-4af9-9b2c-d618f49b3bc3";
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -117,6 +119,11 @@ function makeCancellationCommand(input: { operationId: string; idempotencyKey: s
   return { operationId: input.operationId, deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "checkout", action: "cancel", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: input.idempotencyKey, baseRevision: 0, dependencies: input.dependencies, deviceTimestamp: new Date().toISOString() };
 }
 
+function makeStockAdjustmentCommand() {
+  const payload = { movementGlobalId: "8075f850-2853-4b90-a9f3-2d7294df0d0a", ingredientGlobalId, locationGlobalId, direction: "positive", opening: false, quantityBase: 2_500, unitCostMicros: 125, reason: "Offline supplier correction", override: false, idempotencyKey: "stock-adjustment-sync-001" };
+  return { operationId: "82867db8-c9a8-4c8e-85be-f5b99f2e6e55", deviceId, organizationId, branchGlobalId, registerGlobalId, actorGlobalId, domain: "inventory", action: "adjust", schemaVersion: 1, payload, payloadHash: createHash("sha256").update(stableJson(payload)).digest("hex"), idempotencyKey: "stock-adjustment-command-001", baseRevision: 0, dependencies: [], deviceTimestamp: new Date().toISOString() };
+}
+
 async function postCommands(commands: unknown[]) {
   return POST(new NextRequest("http://localhost/api/sync/commands", {
     method: "POST",
@@ -153,6 +160,14 @@ beforeAll(async () => {
   const [unit] = await db.insert(unitsOfMeasure).values({ code: "SYNC-G", name_en: "Gram", name_ar: "جرام", dimension: "mass", base_numerator: 1_000, base_denominator: 1 }).returning();
   const [ingredient] = await db.insert(ingredients).values({ branch_id: branch!.id, category_id: ingredientCategory!.id, sku: "SYNC-BASE", name_en: "Base", name_ar: "أساسي", base_unit_id: unit!.id, dimension: "mass", default_location_id: location!.id, is_active: true, is_tracked: true, reorder_level: 0, low_stock_threshold: 0, allow_negative: false, average_unit_cost_micros: 100, created_by: "central-owner", updated_by: "central-owner" }).returning();
   await db.insert(stockBalances).values({ branch_id: branch!.id, location_id: location!.id, ingredient_id: ingredient!.id, quantity_base: 100_000_000, average_unit_cost_micros: 100 });
+  await db.insert(syncGlobalEntities).values([
+    { organization_id: organizationId, branch_id: branch!.id, entity_type: "ingredient", global_id: ingredientGlobalId, local_id: String(ingredient!.id) },
+    { organization_id: organizationId, branch_id: branch!.id, entity_type: "inventory_location", global_id: locationGlobalId, local_id: String(location!.id) },
+  ]);
+  await db.insert(syncEntityMappings).values([
+    { organization_id: organizationId, device_id: deviceId, branch_id: branch!.id, entity_type: "ingredient", global_id: ingredientGlobalId, local_id: String(ingredient!.id) },
+    { organization_id: organizationId, device_id: deviceId, branch_id: branch!.id, entity_type: "inventory_location", global_id: locationGlobalId, local_id: String(location!.id) },
+  ]);
   const [recipe] = await db.insert(recipeVersions).values({ branch_id: branch!.id, menu_item_id: menuItem!.id, version: 1, status: "active", effective_at: new Date(), yield_loss_bps: 0, authored_by: "central-owner", approved_by: "central-owner", approved_at: new Date() }).returning();
   await db.insert(recipeComponents).values({ recipe_version_id: recipe!.id, ingredient_id: ingredient!.id, source_location_id: location!.id, unit_id: unit!.id, quantity_input_scaled: 100_000, quantity_base: 100_000_000 });
   await db.insert(syncGlobalEntities).values({ organization_id: organizationId, branch_id: branch!.id, entity_type: "menu_item", global_id: menuItemGlobalId, local_id: String(menuItem!.id) });
@@ -165,7 +180,7 @@ describe("paired customer command processing", () => {
   it("registers a validated handler and reconciliation importer for each supported command", () => {
     const commandNames = Object.keys(SYNC_COMMAND_REGISTRY).sort();
     expect(commandNames).toEqual([
-      "checkout.cancel", "checkout.pay", "customers.create", "customers.delete", "customers.update",
+      "checkout.cancel", "checkout.pay", "customers.create", "customers.delete", "customers.update", "inventory.adjust",
       "orders.create", "orders.transition", "orders.update", "printing.request", "printing.settings_update", "printing.transition",
       "products.create", "products.delete", "products.update", "shifts.close", "shifts.drawer_adjust", "shifts.open",
     ]);
@@ -174,6 +189,21 @@ describe("paired customer command processing", () => {
       expect(command.handler.length).toBeGreaterThan(0);
       expect(command.importer.length).toBeGreaterThan(0);
     }
+  });
+
+  it("applies a stock adjustment exactly once and exports an immutable typed movement snapshot", async () => {
+    const command = makeStockAdjustmentCommand();
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("accepted");
+    expect((await (await postCommands([command])).json()).results[0].status).toBe("already_applied");
+    const [movement] = await db.select().from(stockMovements).where(eq(stockMovements.idempotency_key, command.payload.idempotencyKey));
+    const [ingredient] = await db.select().from(ingredients).where(eq(ingredients.sku, "SYNC-BASE"));
+    const [balance] = await db.select().from(stockBalances).where(eq(stockBalances.ingredient_id, ingredient!.id));
+    expect(movement).toMatchObject({ direction: 1, quantity_base: 2_500, unit_cost_micros: 125, reason: "Offline supplier correction" });
+    expect(balance?.quantity_base).toBe(100_002_500);
+    expect((await db.select().from(stockMovements).where(eq(stockMovements.idempotency_key, command.payload.idempotencyKey))).length).toBe(1);
+    const response = await GET(new NextRequest("http://localhost/api/sync/commands?cursor=0", { headers: { authorization: `Bearer ${credential}`, "x-forno-device-id": deviceId } }));
+    const changes = (await response.json()).changes as Array<{ entityGlobalId: string; snapshot: Record<string, unknown> | null }>;
+    expect(changes.find((change) => change.entityGlobalId === command.payload.movementGlobalId)?.snapshot).toMatchObject({ ingredientGlobalId, locationGlobalId, direction: 1, quantityBase: 2_500, unitCostMicros: 125, sourceType: "inventory_adjustment" });
   });
 
   it("applies print-setting commands once and exports a typed register snapshot", async () => {
